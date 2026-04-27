@@ -286,7 +286,14 @@ func (c *clientImpl) doSingleShardDeleteRange(shardId int64, minKeyInclusive str
 }
 
 func (c *clientImpl) Get(key string, options ...GetOption) <-chan GetResult {
-	ch := make(chan GetResult)
+	// Buffered so the batch worker's response-delivery callback never
+	// blocks when the caller has timed out and stopped reading. Without
+	// this, a single ctx-cancel at the call site (250ms timeouts in
+	// nova/internal/server/owner_lookup.go are typical) leaves the
+	// per-shard batcher worker wedged in a chan-send forever, and every
+	// subsequent Add on that shard piles up — cascading into a global
+	// stall once the Add channel saturates.
+	ch := make(chan GetResult, 1)
 
 	opts := newGetOptions(options)
 	if opts.partitionKey == nil && //
