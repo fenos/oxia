@@ -17,6 +17,7 @@ package raft
 import (
 	"context"
 	"encoding/json"
+	stderrors "errors"
 	"log/slog"
 	"net"
 	"os"
@@ -203,6 +204,25 @@ func (mpr *Provider) Get() (cs *commonproto.ClusterStatus, version provider.Vers
 func (mpr *Provider) Store(cs *commonproto.ClusterStatus, expectedVersion provider.Version) (newVersion provider.Version, err error) {
 	mpr.Lock()
 	defer mpr.Unlock()
+
+	// During startup the FSM may still be replaying log entries while
+	// the metadata layer's first Store is in flight: Get() returned
+	// version N, but by the time our Apply lands the FSM is at N+k.
+	// The CAS mismatch is recoverable — callers (notably
+	// coordinator/metadata.persistStatusLocked) wrap Store in
+	// backoff.RetryNotify expecting an *error*, not a panic. Without
+	// this recover the process aborts mid-bootstrap and the cluster
+	// crash-loops once per redeploy.
+	defer func() {
+		if r := recover(); r != nil {
+			if perr, ok := r.(error); ok && stderrors.Is(perr, provider.ErrBadVersion) {
+				newVersion = provider.NotExists
+				err = perr
+				return
+			}
+			panic(r)
+		}
+	}()
 
 	if err = mpr.raft.VerifyLeader().Error(); err != nil {
 		return provider.NotExists, err

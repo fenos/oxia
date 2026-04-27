@@ -121,8 +121,14 @@ func (sc *stateContainer) Persist(sink raft.SnapshotSink) error {
 		return multierr.Combine(err, sink.Cancel())
 	}
 
-	_, err = sink.Write(payload)
-	return multierr.Combine(err, sink.Cancel(), sink.Close())
+	if _, err := sink.Write(payload); err != nil {
+		// Discard the partially-written snapshot. The hashicorp/raft
+		// contract is exactly one of Cancel / Close — calling both
+		// invalidates the snapshot and forces a full log replay on the
+		// next restart.
+		return multierr.Combine(err, sink.Cancel())
+	}
+	return sink.Close()
 }
 
 func (*stateContainer) Release() {}
