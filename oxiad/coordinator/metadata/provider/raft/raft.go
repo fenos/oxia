@@ -233,29 +233,56 @@ func (mpr *Provider) Store(cs *commonproto.ClusterStatus, expectedVersion provid
 		slog.Any("expected-version", expectedVersion),
 		slog.Any("current-version", mpr.sc.CurrentVersion))
 
-	cmd := raftOpCmd{
-		NewState:        mustMarshalClusterStatus(cs),
-		ExpectedVersion: fromVersion(expectedVersion),
+	// Retry up to a few times on CAS mismatch with a refreshed
+	// expectedVersion taken from the FSM's actual post-replay state.
+	//
+	// Why: only the elected raft leader can land here (VerifyLeader
+	// above), and raft serializes every Apply through the FSM, so we
+	// have exclusive write access — the CAS only ever fails when log
+	// replay (post-restart) advanced sc.CurrentVersion past the value
+	// the caller observed via Get. Upstream's
+	// coordinator/metadata.persistStatusLocked retries Store with the
+	// same stale m.currentVersionID, so without internal refresh it
+	// loops forever and stalls coordinator bootstrap. Refreshing once
+	// per retry inside Store breaks the bootstrap deadlock without
+	// undermining cross-cluster CAS protection (no concurrent writer
+	// can exist; retries are bounded).
+	const maxStoreRetries = 4
+	requestedExpected := fromVersion(expectedVersion)
+	currentExpected := requestedExpected
+	for attempt := 0; ; attempt++ {
+		cmd := raftOpCmd{
+			NewState:        mustMarshalClusterStatus(cs),
+			ExpectedVersion: currentExpected,
+		}
+		serializedCmd, err := json.Marshal(cmd)
+		if err != nil {
+			return provider.NotExists, err
+		}
+		future := mpr.raft.Apply(serializedCmd, 30*time.Second)
+		if err := future.Error(); err != nil {
+			return provider.NotExists, errors.Wrap(err, "failed to apply new cluster state")
+		}
+		applyRes, ok := future.Response().(*applyResult)
+		if !ok {
+			return provider.NotExists, errors.New("unexpected raft Apply response type")
+		}
+		if applyRes.changeApplied {
+			return toVersion(applyRes.newVersion), nil
+		}
+		if attempt >= maxStoreRetries {
+			return provider.NotExists, provider.ErrBadVersion
+		}
+		// CAS mismatch: caller's expectedVersion is stale relative to
+		// our FSM. Refresh from local state and retry. Log the gap so
+		// operators can spot a real concurrent-writer bug if this fires
+		// outside the bootstrap window.
+		newExpected := mpr.sc.CurrentVersion
+		mpr.log.Info("CAS mismatch, refreshing expectedVersion from FSM and retrying",
+			slog.Int64("requested-expected", requestedExpected),
+			slog.Int64("previous-expected", currentExpected),
+			slog.Int64("fsm-current", newExpected),
+			slog.Int("attempt", attempt+1))
+		currentExpected = newExpected
 	}
-
-	serializedCmd, err := json.Marshal(cmd)
-	if err != nil {
-		return provider.NotExists, err
-	}
-
-	future := mpr.raft.Apply(serializedCmd, 30*time.Second)
-	if err := future.Error(); err != nil {
-		return provider.NotExists, errors.Wrap(err, "failed to apply new cluster state")
-	}
-
-	applyRes, ok := future.Response().(*applyResult)
-	if !ok {
-		return provider.NotExists, errors.Wrap(err, "failed to apply new cluster state")
-	}
-
-	if !applyRes.changeApplied {
-		panic(provider.ErrBadVersion)
-	}
-
-	return toVersion(applyRes.newVersion), nil
 }
