@@ -134,6 +134,20 @@ func getRaftServers(bootstrapNodes []string) []raft.Server {
 }
 
 func (mpr *Provider) Close() error {
+	// Proactive leader handoff: if this node is currently the raft
+	// leader, transfer leadership to a peer before shutting raft down.
+	// Survivors get a leader immediately rather than waiting for
+	// heartbeat-timeout to trigger an election (~5s in our default
+	// config). Best-effort — if transfer fails (no eligible peer, all
+	// followers behind, etc.) we log and fall through to Shutdown.
+	if mpr.raft.State() == raft.Leader {
+		if err := mpr.raft.LeadershipTransfer().Error(); err != nil {
+			mpr.log.Warn("leadership transfer on close failed; falling back to shutdown",
+				slog.Any("error", err))
+		} else {
+			mpr.log.Info("leadership transferred on close")
+		}
+	}
 	return multierr.Combine(
 		mpr.raft.Shutdown().Error(),
 		mpr.store.Close(),
