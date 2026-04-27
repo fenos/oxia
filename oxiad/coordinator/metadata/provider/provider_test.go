@@ -67,7 +67,7 @@ var (
 			addr := freeAddress(t)
 			p, err := raft.NewProvider(addr, []string{addr}, filepath.Join(t.TempDir(), "raft"))
 			assert.NoError(t, err)
-			assert.NoError(t, p.WaitToBecomeLeader())
+			assert.NoError(t, p.WaitToBecomeLeader(t.Context()))
 			return p
 		},
 	}

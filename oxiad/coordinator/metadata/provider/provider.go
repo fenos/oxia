@@ -15,6 +15,7 @@
 package provider
 
 import (
+	"context"
 	"io"
 	"strconv"
 
@@ -56,5 +57,10 @@ type Provider interface {
 
 	Store(cs *commonproto.ClusterStatus, expectedVersion Version) (newVersion Version, err error)
 
-	WaitToBecomeLeader() error
+	// WaitToBecomeLeader blocks until this node wins a metadata leader
+	// election, returning ctx.Err() if ctx is cancelled first. Callers
+	// in library / embedded contexts (e.g. github.com/supabase/nova's
+	// embedoxia) need the cancel path so they can shut down standby
+	// nodes without leaking the goroutine.
+	WaitToBecomeLeader(ctx context.Context) error
 }

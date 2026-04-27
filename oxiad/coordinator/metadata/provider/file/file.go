@@ -15,13 +15,16 @@
 package file
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/juju/fslock"
-	"github.com/pkg/errors"
+	pkgerrors "github.com/pkg/errors"
 
 	"github.com/oxia-db/oxia/oxiad/coordinator/metadata/provider"
 
@@ -58,16 +61,28 @@ func (m *Provider) Close() error {
 	return nil
 }
 
-func (m *Provider) WaitToBecomeLeader() error {
+func (m *Provider) WaitToBecomeLeader(ctx context.Context) error {
 	if err := m.ensureParentDirectoryExists(); err != nil {
 		return err
 	}
 
-	if err := m.fileLock.Lock(); err != nil {
-		return errors.Wrapf(err, "failed to acquire lock on %s", m.path)
+	// Poll TryLock so we can honor ctx cancellation. In the common
+	// single-process case TryLock succeeds on the first attempt.
+	const pollInterval = 25 * time.Millisecond
+	for {
+		err := m.fileLock.TryLock()
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, fslock.ErrLocked) {
+			return pkgerrors.Wrapf(err, "failed to acquire lock on %s", m.path)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(pollInterval):
+		}
 	}
-
-	return nil
 }
 
 func (m *Provider) Get() (cs *commonproto.ClusterStatus, version provider.Version, err error) {

@@ -190,7 +190,7 @@ func NewGrpcServer(parent context.Context, watchableOptions *commonoption.Watch[
 	}
 
 	slog.Info("Waiting to become leader", slog.String("component", "coordinator"))
-	if err := metadataProvider.WaitToBecomeLeader(); err != nil {
+	if err := metadataProvider.WaitToBecomeLeader(parent); err != nil {
 		return nil, errors.Wrap(err, "failed to wait in becoming leader")
 	}
 	slog.Info("This coordinator is now leader", slog.String("component", "coordinator"))

@@ -184,7 +184,7 @@ func main() {
 		}
 
 		metadataProvider := file.NewProvider(filepath.Join(dataDir, "cluster-status.json"))
-		if err := metadataProvider.WaitToBecomeLeader(); err != nil {
+		if err := metadataProvider.WaitToBecomeLeader(context.Background()); err != nil {
 			slog.Error(
 				"failed to wait for coordinator metadata leadership",
 				slog.Any("error", err),

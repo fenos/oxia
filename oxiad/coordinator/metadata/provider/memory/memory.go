@@ -15,6 +15,7 @@
 package memory
 
 import (
+	"context"
 	"sync"
 
 	gproto "google.golang.org/protobuf/proto"
@@ -32,7 +33,7 @@ type Provider struct {
 	version provider.Version
 }
 
-func (*Provider) WaitToBecomeLeader() error {
+func (*Provider) WaitToBecomeLeader(_ context.Context) error {
 	return nil
 }
 

@@ -152,7 +152,7 @@ func (m *Provider) Store(status *commonproto.ClusterStatus, expectedVersion prov
 	return version, nil
 }
 
-func (m *Provider) WaitToBecomeLeader() error {
+func (m *Provider) WaitToBecomeLeader(ctx context.Context) error {
 	m.Lock()
 	defer m.Unlock()
 
@@ -214,7 +214,18 @@ func (m *Provider) WaitToBecomeLeader() error {
 		close(m.closeCh)
 	})
 
-	return wg.Wait(m.ctx)
+	// Wait until either the elector signals "started leading" OR the
+	// caller's ctx / our internal ctx is cancelled.
+	waitCtx, waitCancel := context.WithCancel(ctx)
+	defer waitCancel()
+	go func() {
+		select {
+		case <-m.ctx.Done():
+			waitCancel()
+		case <-waitCtx.Done():
+		}
+	}()
+	return wg.Wait(waitCtx)
 }
 
 func (m *Provider) Close() error {

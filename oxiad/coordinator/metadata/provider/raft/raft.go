@@ -15,6 +15,7 @@
 package raft
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net"
@@ -42,9 +43,13 @@ type Provider struct {
 	log   *slog.Logger
 }
 
-func (mpr *Provider) WaitToBecomeLeader() error {
-	<-mpr.raft.LeaderCh()
-	return nil
+func (mpr *Provider) WaitToBecomeLeader(ctx context.Context) error {
+	select {
+	case <-mpr.raft.LeaderCh():
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func NewProvider(
