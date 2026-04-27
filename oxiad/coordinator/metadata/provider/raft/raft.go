@@ -42,6 +42,17 @@ type Provider struct {
 	raft  *raft.Raft
 	store *kvRaftStore
 	log   *slog.Logger
+
+	// fsmReadyOnce gates the FSM-catchup wait inside Get. hashicorp/raft
+	// restores state asynchronously after NewRaft returns: a Get fired
+	// before the restore finishes sees sc.State==nil, which lets
+	// coordinator/metadata.persistStatusLocked believe the cluster is
+	// fresh and mint a new InstanceId — overwriting the previously
+	// persisted one and breaking dataserver↔coord handshakes that
+	// authenticate by InstanceId. We block the first Get on
+	// AppliedIndex catching up to LastIndex; subsequent Gets are
+	// immediate (sync.Once short-circuits after the initial wait).
+	fsmReadyOnce sync.Once
 }
 
 func (mpr *Provider) WaitToBecomeLeader(ctx context.Context) error {
@@ -192,6 +203,8 @@ func fromVersion(v provider.Version) int64 {
 }
 
 func (mpr *Provider) Get() (cs *commonproto.ClusterStatus, version provider.Version, err error) {
+	mpr.fsmReadyOnce.Do(mpr.waitFSMReady)
+
 	mpr.Lock()
 	defer mpr.Unlock()
 
@@ -199,6 +212,46 @@ func (mpr *Provider) Get() (cs *commonproto.ClusterStatus, version provider.Vers
 		slog.Any("cluster-status", mpr.sc.State),
 		slog.Any("current-version", mpr.sc.CurrentVersion))
 	return mpr.sc.State, toVersion(mpr.sc.CurrentVersion), nil
+}
+
+// waitFSMReady blocks until raft has applied every persisted log
+// entry to the FSM, capped at 30 s. Called once via fsmReadyOnce so
+// only the first Get pays the wait — every subsequent Get is a plain
+// in-memory read.
+//
+// The cap exists to handle pathological "follower never catches up"
+// scenarios gracefully; in those cases the caller (typically
+// coordinator/metadata.doStatusRecovery) proceeds with the current
+// state, and Store's CAS-with-refresh handles whatever drift remains.
+//
+// Lock note: this method does NOT take mpr.Lock — sleeping while
+// holding it would block Apply. Apply itself doesn't take Provider's
+// mutex (it operates on stateContainer), so leaving the lock free
+// here is correct.
+func (mpr *Provider) waitFSMReady() {
+	const (
+		readyWaitBudget = 30 * time.Second
+		readyPollEvery  = 20 * time.Millisecond
+	)
+	deadline := time.Now().Add(readyWaitBudget)
+	for {
+		applied := mpr.raft.AppliedIndex()
+		last := mpr.raft.LastIndex()
+		if applied >= last {
+			mpr.log.Info("FSM caught up with raft log",
+				slog.Uint64("applied-index", applied),
+				slog.Uint64("last-index", last))
+			return
+		}
+		if time.Now().After(deadline) {
+			mpr.log.Warn("FSM still behind raft log after wait budget — proceeding anyway",
+				slog.Uint64("applied-index", applied),
+				slog.Uint64("last-index", last),
+				slog.Duration("budget", readyWaitBudget))
+			return
+		}
+		time.Sleep(readyPollEvery)
+	}
 }
 
 func (mpr *Provider) Store(cs *commonproto.ClusterStatus, expectedVersion provider.Version) (newVersion provider.Version, err error) {
