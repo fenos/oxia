@@ -69,10 +69,37 @@ func NewProvider(
 		return nil, errors.Wrap(err, "failed to create data dir")
 	}
 
-	// Setup Raft configuration
+	// Setup Raft configuration. The four timeouts below MUST stay in
+	// the relative ratio hashicorp/raft expects:
+	//
+	//   CommitTimeout < LeaderLeaseTimeout <= HeartbeatTimeout < ElectionTimeout
+	//
+	// LeaderLeaseTimeout is the only one that controls the
+	// "failed to contact" leader-lease WARN: the leader logs it
+	// whenever a follower's last-contact gap exceeds the lease.
+	// hashicorp's default (500 ms) was paired with the default 1 s
+	// HeartbeatTimeout — bumping HeartbeatTimeout to 5 s without
+	// bumping the lease leaves the lease only ~1 heartbeat away from
+	// any normal jitter, so cross-AZ / 6PN-mesh networks (~ tens of
+	// ms but with occasional bursts) keep tripping the warning even
+	// though the cluster is perfectly healthy. Raise the lease in
+	// proportion (heartbeat / 2 = 2.5 s) so the warning fires only
+	// on a genuine multi-heartbeat stall, and bump CommitTimeout
+	// (heartbeat batch interval) in the same proportion.
 	config := raft.DefaultConfig()
 	config.HeartbeatTimeout = 5 * time.Second
 	config.ElectionTimeout = 10 * time.Second
+	config.LeaderLeaseTimeout = 2500 * time.Millisecond
+	config.CommitTimeout = 250 * time.Millisecond
+	// Snapshot more aggressively than the upstream defaults
+	// (SnapshotInterval=120s, SnapshotThreshold=8192). The coord-raft
+	// log carries small JSON cluster-status diffs, but on every cluster
+	// restart the new leader replays the full log forward — followers
+	// re-apply hundreds of entries and every replay logs a line. With
+	// a 30s/1024-entry snapshot cadence the replay window stays bounded
+	// and restarts are quiet + fast.
+	config.SnapshotInterval = 30 * time.Second
+	config.SnapshotThreshold = 1024
 	config.LocalID = raft.ServerID(nodeId)
 	config.LogLevel = "INFO"
 	levelVar := &slog.LevelVar{}

@@ -75,7 +75,13 @@ func (sc *stateContainer) Apply(logEntry *raft.Log) any {
 	sc.State = newState
 	sc.CurrentVersion++
 
-	sc.log.Info("Applied raft log entry",
+	// DEBUG: this fires once per applied entry per node, which is very
+	// noisy on cluster restarts (the new raft leader replays its full
+	// log forward, and every follower re-applies). The information is
+	// only useful for low-level coord-raft debugging — leave it at
+	// DEBUG so production logs stay readable, and operators can flip
+	// the log level when investigating metadata-replication issues.
+	sc.log.Debug("Applied raft log entry",
 		slog.Int64("new-version", sc.CurrentVersion))
 	return &applyResult{changeApplied: true, newVersion: sc.CurrentVersion}
 }
