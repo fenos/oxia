@@ -63,6 +63,7 @@ func NewBatcherFactory(
 
 func (b *BatcherFactory) NewWriteBatcher(ctx context.Context, shardId *int64, maxWriteBatchSize int) batch2.Batcher {
 	return b.newBatcher(ctx, shardId, "write", writeBatchFactory{
+		namespace:      b.Namespace,
 		execute:        b.Executor.ExecuteWrite,
 		shardExists:    b.ShardExists,
 		reroute:        b.WriteRerouter,
@@ -74,6 +75,7 @@ func (b *BatcherFactory) NewWriteBatcher(ctx context.Context, shardId *int64, ma
 
 func (b *BatcherFactory) NewReadBatcher(ctx context.Context, shardId *int64) batch2.Batcher {
 	return b.newBatcher(ctx, shardId, "read", readBatchFactory{
+		namespace:      b.Namespace,
 		execute:        b.Executor.ExecuteRead,
 		shardExists:    b.ShardExists,
 		reroute:        b.ReadRerouter,
