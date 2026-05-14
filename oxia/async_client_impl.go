@@ -449,7 +449,14 @@ func (c *clientImpl) listFromShard(ctx context.Context, minKeyInclusive string, 
 		}
 	})
 	if err != nil {
-		ch <- ListResult{Err: err}
+		// Send the terminal error, but yield to ctx cancellation so we
+		// never block on a channel whose reader has already returned —
+		// and never panic on a channel the multi-shard closer (List)
+		// has already closed after its own ctx-aware Wait returned.
+		select {
+		case ch <- ListResult{Err: err}:
+		case <-ctx.Done():
+		}
 	}
 }
 
@@ -477,7 +484,15 @@ func (c *clientImpl) doList(ctx context.Context, request *proto.ListRequest, hin
 			return backoff.Permanent(err)
 		}
 
-		ch <- ListResult{Keys: response.Keys}
+		// Yield to ctx cancellation: the closer in clientImpl.List
+		// awaits worker termination unconditionally, so we MUST exit
+		// here if the parent ctx is dead — otherwise a slow reader
+		// after ctx cancel would block this goroutine forever.
+		select {
+		case ch <- ListResult{Keys: response.Keys}:
+		case <-ctx.Done():
+			return backoff.Permanent(ctx.Err())
+		}
 		dataSent = true
 	}
 }
@@ -508,7 +523,18 @@ func (c *clientImpl) List(ctx context.Context, minKeyInclusive string, maxKeyExc
 		}
 
 		go func() {
-			_ = wg.Wait(ctx)
+			// Wait UNCONDITIONALLY for every worker to terminate
+			// before closing ch. Using the parent ctx here was a bug:
+			// on ctx cancellation, Wait(ctx) returns early and
+			// close(ch) fires while workers are still inside their
+			// `ch <- ListResult{...}` send → `send on closed channel`
+			// panic that crashed the client process.
+			//
+			// Workers themselves now react to ctx via `select` on the
+			// send, so they exit promptly even when the reader is
+			// gone. This goroutine just has to make sure they're all
+			// done before closing.
+			_ = wg.Wait(context.Background())
 			close(ch)
 		}()
 	}
@@ -547,7 +573,15 @@ func (c *clientImpl) rangeScanFromShard(ctx context.Context, minKeyInclusive str
 		}
 	})
 	if err != nil {
-		ch <- GetResult{Err: err}
+		// Yield to ctx — see listFromShard for the same reasoning.
+		// Even with the per-shard channel pattern (each shard owns
+		// its own ch and closes it below) the caller may abandon the
+		// channel on ctx cancel, leaving this goroutine blocked on a
+		// send with no reader.
+		select {
+		case ch <- GetResult{Err: err}:
+		case <-ctx.Done():
+		}
 	}
 
 	close(ch)
@@ -578,7 +612,11 @@ func (c *clientImpl) doRangeScan(ctx context.Context, request *proto.RangeScanRe
 		}
 
 		for _, record := range response.Records {
-			ch <- toGetResult(record, "", nil)
+			select {
+			case ch <- toGetResult(record, "", nil):
+			case <-ctx.Done():
+				return backoff.Permanent(ctx.Err())
+			}
 		}
 		dataSent = true
 	}
