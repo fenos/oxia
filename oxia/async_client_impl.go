@@ -274,7 +274,14 @@ func (c *clientImpl) doSingleShardDeleteRange(shardId int64, minKeyInclusive str
 }
 
 func (c *clientImpl) Get(key string, options ...GetOption) <-chan GetResult {
-	ch := make(chan GetResult)
+	// Buffered so the completion callback never blocks if the caller has
+	// abandoned the channel (the sync wrapper returns on ctx.Done without
+	// draining it). An unbuffered send here parks the batcher's Run
+	// goroutine forever, wedging every subsequent read on the shard.
+	// The write path (Put/Delete) already buffers for the same reason.
+	// Both read paths send at most once: single-shard invokes one
+	// callback; multi-shard guards the shared channel with its counter.
+	ch := make(chan GetResult, 1)
 
 	opts := newGetOptions(options)
 	if opts.partitionKey == nil && //
