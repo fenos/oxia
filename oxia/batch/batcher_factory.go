@@ -23,7 +23,20 @@ import (
 	"github.com/oxia-db/oxia/common/process"
 )
 
-var batcherChannelBufferSize = runtime.GOMAXPROCS(-1)
+// batcherChannelBufferFloor is the minimum inbox capacity of a batcher.
+// The inbox is sized from the batch capacity (two full batches) so that
+// producers stay decoupled from the in-flight request's round trip: the
+// Run loop executes each batch synchronously, and with a smaller inbox
+// every Add issued during that round trip blocks its caller.
+var batcherChannelBufferFloor = runtime.GOMAXPROCS(-1)
+
+func (b *BatcherFactory) channelBufferSize() int {
+	if size := 2 * b.MaxRequestsPerBatch; size > batcherChannelBufferFloor {
+		return size
+	}
+
+	return batcherChannelBufferFloor
+}
 
 type BatcherFactory struct {
 	Linger              time.Duration
@@ -33,7 +46,7 @@ type BatcherFactory struct {
 func (b *BatcherFactory) NewBatcher(ctx context.Context, shard int64, batcherType string, batchFactory func() Batch) Batcher {
 	batcher := &batcherImpl{
 		batchFactory:        batchFactory,
-		callC:               make(chan any, batcherChannelBufferSize),
+		callC:               make(chan any, b.channelBufferSize()),
 		closeC:              make(chan bool),
 		linger:              b.Linger,
 		maxRequestsPerBatch: b.MaxRequestsPerBatch,

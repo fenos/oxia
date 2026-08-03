@@ -157,6 +157,22 @@ func WithMaxRequestsPerBatch(maxRequestsPerBatch int) ClientOption {
 	})
 }
 
+// WithMaxBatchSize defines the maximum total value size, in bytes, of a single
+// batched write request. Larger batches amortize the per-request round trip
+// over more operations — with one batch in flight per shard, a bursty producer
+// otherwise pays one round trip per DefaultMaxBatchSize worth of values. The
+// value must be greater than zero and should stay comfortably below the gRPC
+// message limit.
+func WithMaxBatchSize(maxBatchSize int) ClientOption {
+	return clientOptionFunc(func(options clientOptions) (clientOptions, error) {
+		if maxBatchSize <= 0 {
+			return options, ErrInvalidOptionMaxBatchSize
+		}
+		options.maxBatchSize = maxBatchSize
+		return options, nil
+	})
+}
+
 func WithRequestTimeout(requestTimeout time.Duration) ClientOption {
 	return clientOptionFunc(func(options clientOptions) (clientOptions, error) {
 		if requestTimeout <= 0 {

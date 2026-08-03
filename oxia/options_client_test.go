@@ -53,3 +53,15 @@ func TestWithDialResolver_EmptyScheme(t *testing.T) {
 	_, err := newClientOptions("localhost:6648", WithDialResolver(&mockResolver{scheme: ""}))
 	assert.ErrorContains(t, err, "must not be empty")
 }
+
+func TestWithMaxBatchSize(t *testing.T) {
+	options, err := newClientOptions("localhost:6648", WithMaxBatchSize(1024*1024))
+	require.NoError(t, err)
+	assert.Equal(t, 1024*1024, options.maxBatchSize)
+
+	_, err = newClientOptions("localhost:6648", WithMaxBatchSize(0))
+	assert.ErrorIs(t, err, ErrInvalidOptionMaxBatchSize)
+
+	_, err = newClientOptions("localhost:6648", WithMaxBatchSize(-1))
+	assert.ErrorIs(t, err, ErrInvalidOptionMaxBatchSize)
+}
