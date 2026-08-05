@@ -72,32 +72,9 @@ func (b *batcherImpl) pipelined() bool {
 	return b.maxBatchesInFlight > 1
 }
 
-// dispatch hands a full (or lingered) batch onward. A pipelining batcher
-// transmits it and queues the join without waiting for the outcome,
-// blocking only while the in-flight window is exhausted — that block is
-// the backpressure. Otherwise the batch completes inline. Returns false
-// when the batcher shut down instead of dispatching; the batch is failed.
-func (b *batcherImpl) dispatch(batch Batch) bool {
-	if b.pipelined() {
-		if sender, ok := batch.(Sender); ok {
-			select {
-			case b.slots <- struct{}{}:
-			case <-b.closeC:
-				batch.Fail(ErrShuttingDown)
-				return false
-			}
-			// Never blocks: joinC's capacity equals the window, and the
-			// completion goroutine takes a join before freeing its slot.
-			b.joinC <- sender.Send()
-			return true
-		}
-	}
-	batch.Complete()
-	return true
-}
-
 func (b *batcherImpl) Run() { //nolint:revive
-	var batch Batch
+	var open Batch    // accumulating operations
+	var ready []Batch // finished, parked awaiting window slots; oldest first
 	var timer *time.Timer
 	var timeout <-chan time.Time
 
@@ -116,47 +93,112 @@ func (b *batcherImpl) Run() { //nolint:revive
 	}
 
 	newBatch := func() {
-		batch = b.batchFactory()
+		open = b.batchFactory()
 		if b.linger > 0 {
 			timer = time.NewTimer(b.linger)
 			timeout = timer.C
 		}
 	}
-	dispatchBatch := func() {
+
+	// send transmits on an already-acquired slot. It never blocks: joinC's
+	// capacity equals the window, and the completion goroutine takes a
+	// join before freeing its slot.
+	send := func(sender Sender) {
+		b.joinC <- sender.Send()
+	}
+
+	// place hands a finished batch onward. Pipelined batches take a free
+	// slot immediately, or park in a FIFO — bounded by the window depth —
+	// while the window is exhausted, letting the next batch keep
+	// accumulating: a saturated server gets fewer, fatter batches instead
+	// of a fixed-size dribble. With the parking full too, place blocks
+	// until a slot frees — that block is the batcher's backpressure.
+	// Returns false on shutdown; the batch has been failed.
+	place := func(batch Batch) bool {
 		if b.linger > 0 {
 			timer.Stop()
 		}
-		toSend := batch
-		batch = nil
-		b.dispatch(toSend)
+		if b.pipelined() {
+			if sender, ok := batch.(Sender); ok {
+				// The direct path is only for an empty parking queue: with
+				// older batches parked, a freed slot must never let this
+				// newer batch overtake them — dispatch order is the
+				// ordering the server observes.
+				if len(ready) == 0 {
+					select {
+					case b.slots <- struct{}{}:
+						send(sender)
+						return true
+					default:
+					}
+				}
+				if len(ready) < b.maxBatchesInFlight {
+					ready = append(ready, batch)
+					return true
+				}
+				select {
+				case b.slots <- struct{}{}:
+					send(ready[0].(Sender))
+					ready = append(ready[1:], batch)
+					return true
+				case <-b.closeC:
+					batch.Fail(ErrShuttingDown)
+					return false
+				}
+			}
+		}
+		batch.Complete()
+		return true
 	}
 
 	for {
+		// A parked batch dispatches the moment a slot frees; the case is
+		// disabled (nil channel) while nothing is parked.
+		var slotC chan<- struct{}
+		if len(ready) > 0 {
+			slotC = b.slots
+		}
+
 		select {
+		case slotC <- struct{}{}:
+			send(ready[0].(Sender))
+			ready = ready[1:]
+
 		case call := <-b.callC:
-			if batch == nil {
+			if open == nil {
 				newBatch()
 			}
-			canAdd := batch.CanAdd(call)
-			if !canAdd {
-				dispatchBatch()
+			if !open.CanAdd(call) {
+				full := open
+				open = nil
+				if !place(full) {
+					continue // shutting down; closeC case runs next
+				}
 				newBatch()
 			}
-			batch.Add(call)
-			if batch.Size() == b.maxRequestsPerBatch || b.linger == 0 {
-				dispatchBatch()
+			open.Add(call)
+			if open.Size() == b.maxRequestsPerBatch || b.linger == 0 {
+				full := open
+				open = nil
+				place(full)
 			}
 
 		case <-timeout:
-			if batch != nil {
-				dispatchBatch()
+			if open != nil {
+				lingered := open
+				open = nil
+				place(lingered)
 			}
 		case <-b.closeC:
-			if batch != nil {
+			if open != nil {
 				timer.Stop()
-				batch.Fail(ErrShuttingDown)
-				batch = nil
+				open.Fail(ErrShuttingDown)
+				open = nil
 			}
+			for _, parked := range ready {
+				parked.Fail(ErrShuttingDown)
+			}
+			ready = nil
 			for {
 				select {
 				case call := <-b.callC:
