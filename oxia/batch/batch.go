@@ -21,3 +21,17 @@ type Batch interface {
 	Complete()
 	Fail(error)
 }
+
+// Sender is implemented by batches whose transmission can be decoupled
+// from their completion: Send transmits the batch without waiting for the
+// response and returns a join that finishes it — waiting for the outcome
+// and running the callbacks — exactly once when invoked.
+//
+// A batcher configured with a batches-in-flight window above one pipelines
+// such batches: it keeps forming and transmitting new batches while up to
+// that many joins are outstanding, instead of blocking on Complete after
+// every batch. Batches that do not implement Sender always complete
+// inline, one at a time.
+type Sender interface {
+	Send() func()
+}

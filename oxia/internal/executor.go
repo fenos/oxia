@@ -22,6 +22,12 @@ import (
 
 type Executor interface {
 	ExecuteWrite(ctx context.Context, request *proto.WriteRequest) (*proto.WriteResponse, error)
+
+	// ExecuteWriteAsync transmits the request without waiting for the
+	// response; the returned join blocks until the outcome is known and
+	// reports it exactly once. Requests transmitted by consecutive calls
+	// reach their shard in call order, including across stream failures.
+	ExecuteWriteAsync(ctx context.Context, request *proto.WriteRequest) func() (*proto.WriteResponse, error)
 	ExecuteRead(ctx context.Context, request *proto.ReadRequest) (*proto.ReadResponse, error)
 	ExecuteList(ctx context.Context, request *proto.ListRequest, listResponseConsumer func(*proto.ListResponse)) error
 	ExecuteRangeScan(ctx context.Context, request *proto.RangeScanRequest, rangeScanResponseConsumer func(*proto.RangeScanResponse)) error

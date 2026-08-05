@@ -32,7 +32,7 @@ var ErrRequestTooLarge = errors.New("put request is too large")
 
 type writeBatchFactory struct {
 	namespace      string
-	execute        func(context.Context, *proto.WriteRequest) (*proto.WriteResponse, error)
+	executeAsync   func(context.Context, *proto.WriteRequest) func() (*proto.WriteResponse, error)
 	reroute        func([]model.PutCall, []model.DeleteCall, []model.DeleteRangeCall)
 	metrics        *metrics.Metrics
 	requestTimeout time.Duration
@@ -43,7 +43,7 @@ func (b writeBatchFactory) newBatch(shardId *int64) batch.Batch {
 	return &writeBatch{
 		namespace:      b.namespace,
 		shardId:        shardId,
-		execute:        b.execute,
+		executeAsync:   b.executeAsync,
 		reroute:        b.reroute,
 		puts:           make([]model.PutCall, 0),
 		deletes:        make([]model.DeleteCall, 0),
@@ -59,7 +59,7 @@ func (b writeBatchFactory) newBatch(shardId *int64) batch.Batch {
 type writeBatch struct {
 	namespace      string
 	shardId        *int64
-	execute        func(context.Context, *proto.WriteRequest) (*proto.WriteResponse, error)
+	executeAsync   func(context.Context, *proto.WriteRequest) func() (*proto.WriteResponse, error)
 	reroute        func([]model.PutCall, []model.DeleteCall, []model.DeleteRangeCall)
 	puts           []model.PutCall
 	deletes        []model.DeleteCall
@@ -95,33 +95,44 @@ func (b *writeBatch) Size() int {
 }
 
 func (b *writeBatch) Complete() {
+	b.Send()()
+}
+
+// Send transmits the batch without waiting for the response and returns
+// the join that finishes it: waiting for the outcome, then completing,
+// failing, or rerouting the batched operations exactly as Complete would.
+func (b *writeBatch) Send() func() {
 	if b.Size() == 0 {
-		return
+		return func() {}
 	}
 	executionStart := time.Now()
 	request := b.toProto()
 
 	ctx, cancel := context.WithTimeout(context.Background(), b.requestTimeout)
-	defer cancel()
+	join := b.executeAsync(ctx, request)
 
-	response, err := b.execute(ctx, request)
-	if errors.Is(err, constant.ErrShardNotFound) && b.reroute != nil {
-		slog.Info("Shard was split/merged, re-routing write batch operations",
-			slog.Int64("shard", *b.shardId),
-			slog.Int("puts", len(b.puts)),
-			slog.Int("deletes", len(b.deletes)),
-			slog.Int("delete-ranges", len(b.deleteRanges)),
-		)
-		b.reroute(b.puts, b.deletes, b.deleteRanges)
-		return
-	}
+	return func() {
+		defer cancel()
 
-	b.callback(executionStart, request, response, err)
+		response, err := join()
+		if errors.Is(err, constant.ErrShardNotFound) && b.reroute != nil {
+			slog.Info("Shard was split/merged, re-routing write batch operations",
+				slog.Int64("shard", *b.shardId),
+				slog.Int("puts", len(b.puts)),
+				slog.Int("deletes", len(b.deletes)),
+				slog.Int("delete-ranges", len(b.deleteRanges)),
+			)
+			b.reroute(b.puts, b.deletes, b.deleteRanges)
+			return
+		}
 
-	if err != nil {
-		b.Fail(err)
-	} else {
-		b.handle(response)
+		b.callback(executionStart, request, response, err)
+
+		if err != nil {
+			b.Fail(err)
+		} else {
+			b.handle(response)
+		}
 	}
 }
 

@@ -36,6 +36,11 @@ type BatcherFactory struct {
 	Metrics        *metrics.Metrics
 	WriteRerouter  WriteRerouter
 	ReadRerouter   ReadRerouter
+
+	// MaxWriteBatchesInFlight bounds the per-shard pipeline of write
+	// batches awaiting their response; one means no pipelining. Reads
+	// are not pipelined.
+	MaxWriteBatchesInFlight int
 }
 
 func NewBatcherFactory(
@@ -59,12 +64,12 @@ func NewBatcherFactory(
 
 func (b *BatcherFactory) NewWriteBatcher(ctx context.Context, shardId *int64, maxWriteBatchSize int) batch2.Batcher {
 	return b.newBatcher(ctx, shardId, "write", writeBatchFactory{
-		execute:        b.Executor.ExecuteWrite,
+		executeAsync:   b.Executor.ExecuteWriteAsync,
 		reroute:        b.WriteRerouter,
 		metrics:        b.Metrics,
 		requestTimeout: b.RequestTimeout,
 		maxByteSize:    maxWriteBatchSize,
-	}.newBatch)
+	}.newBatch, b.MaxWriteBatchesInFlight)
 }
 
 func (b *BatcherFactory) NewReadBatcher(ctx context.Context, shardId *int64) batch2.Batcher {
@@ -73,11 +78,11 @@ func (b *BatcherFactory) NewReadBatcher(ctx context.Context, shardId *int64) bat
 		reroute:        b.ReadRerouter,
 		metrics:        b.Metrics,
 		requestTimeout: b.RequestTimeout,
-	}.newBatch)
+	}.newBatch, 1)
 }
 
-func (b *BatcherFactory) newBatcher(ctx context.Context, shardId *int64, batcherType string, batchFactory func(shardId *int64) batch2.Batch) batch2.Batcher {
+func (b *BatcherFactory) newBatcher(ctx context.Context, shardId *int64, batcherType string, batchFactory func(shardId *int64) batch2.Batch, maxBatchesInFlight int) batch2.Batcher {
 	return b.NewBatcher(ctx, *shardId, batcherType, func() batch2.Batch {
 		return batchFactory(shardId)
-	})
+	}, maxBatchesInFlight)
 }
