@@ -227,3 +227,87 @@ func TestBatcherCloseFinishesInFlightJoins(t *testing.T) {
 	assert.Equal(t, b1.id, (<-joinedC).id)
 	assert.Equal(t, b2.id, (<-joinedC).id)
 }
+
+// TestBatcherAccumulatesWhileWindowExhausted: with the window exhausted,
+// the batcher must keep ACCEPTING operations — filling the open batch and
+// parking finished ones (up to the window depth) — rather than freeze and
+// later emit inbox-sized slivers. A saturated server gets fewer, fatter
+// batches; hard backpressure starts only when parking is full too.
+func TestBatcherAccumulatesWhileWindowExhausted(t *testing.T) {
+	savedBuf := batcherChannelBufferSize
+	batcherChannelBufferSize = 2
+	defer func() { batcherChannelBufferSize = savedBuf }()
+
+	sentC := make(chan *sendableBatch, 32)
+	joinedC := make(chan *sendableBatch, 32)
+	failC := make(chan error, 32)
+
+	nextID := 0
+	batchFactory := func() Batch {
+		nextID++
+		return &sendableBatch{
+			id:      nextID,
+			sentC:   sentC,
+			joinedC: joinedC,
+			release: make(chan struct{}),
+			failC:   failC,
+		}
+	}
+
+	factory := &BatcherFactory{
+		Linger:              1 * time.Hour,
+		MaxRequestsPerBatch: 3,
+	}
+	batcher := factory.NewBatcher(context.Background(), 1, "test-write", batchFactory, 2)
+	defer batcher.Close()
+
+	// Two batches fill and take both window slots.
+	for i := 1; i <= 6; i++ {
+		batcher.Add(i)
+	}
+	b1, b2 := <-sentC, <-sentC
+	assert.Equal(t, 3, b1.count)
+	assert.Equal(t, 3, b2.count)
+
+	// Window exhausted: 9 more ops must still be accepted — two full
+	// batches park (window depth) and the open batch plus inbox hold the
+	// rest. The frozen batcher accepts only inbox+open and blocks.
+	const burst = 9
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < burst; i++ {
+			batcher.Add(100 + i)
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("adds blocked while the window was exhausted — accumulation is frozen")
+	}
+
+	// Nothing transmits while both slots are held.
+	select {
+	case b := <-sentC:
+		t.Fatalf("batch %d transmitted with the window exhausted", b.id)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Freeing slots drains everything, oldest first, as full batches.
+	close(b1.release)
+	close(b2.release)
+	assert.Equal(t, b1.id, (<-joinedC).id)
+	assert.Equal(t, b2.id, (<-joinedC).id)
+
+	got := 0
+	prev := 0
+	for got < burst {
+		b := <-sentC
+		got += b.count
+		assert.Greater(t, b.id, prev, "parked batches must dispatch oldest first")
+		prev = b.id
+		close(b.release)
+		assert.Equal(t, b.id, (<-joinedC).id)
+	}
+	assert.Equal(t, burst, got)
+}
