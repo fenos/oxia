@@ -36,6 +36,16 @@ type batcherImpl struct {
 	closed              atomic.Bool
 	linger              time.Duration
 	maxRequestsPerBatch int
+
+	// maxBatchesInFlight bounds how many dispatched batches may be
+	// awaiting their outcome at once. Above one, batches implementing
+	// Sender are pipelined: slots is the window occupancy, joinC carries
+	// their joins to the completion goroutine in dispatch order, so
+	// callbacks fire in the order the batches were transmitted.
+	maxBatchesInFlight int
+	slots              chan struct{}
+	joinC              chan func()
+	joinsDone          chan struct{}
 }
 
 func (b *batcherImpl) Close() error {
@@ -58,10 +68,52 @@ func (b *batcherImpl) failCall(call any, err error) {
 	batch.Fail(err)
 }
 
+func (b *batcherImpl) pipelined() bool {
+	return b.maxBatchesInFlight > 1
+}
+
+// dispatch hands a full (or lingered) batch onward. A pipelining batcher
+// transmits it and queues the join without waiting for the outcome,
+// blocking only while the in-flight window is exhausted — that block is
+// the backpressure. Otherwise the batch completes inline. Returns false
+// when the batcher shut down instead of dispatching; the batch is failed.
+func (b *batcherImpl) dispatch(batch Batch) bool {
+	if b.pipelined() {
+		if sender, ok := batch.(Sender); ok {
+			select {
+			case b.slots <- struct{}{}:
+			case <-b.closeC:
+				batch.Fail(ErrShuttingDown)
+				return false
+			}
+			// Never blocks: joinC's capacity equals the window, and the
+			// completion goroutine takes a join before freeing its slot.
+			b.joinC <- sender.Send()
+			return true
+		}
+	}
+	batch.Complete()
+	return true
+}
+
 func (b *batcherImpl) Run() { //nolint:revive
 	var batch Batch
 	var timer *time.Timer
 	var timeout <-chan time.Time
+
+	if b.pipelined() {
+		b.slots = make(chan struct{}, b.maxBatchesInFlight)
+		b.joinC = make(chan func(), b.maxBatchesInFlight)
+		b.joinsDone = make(chan struct{})
+
+		go func() {
+			defer close(b.joinsDone)
+			for join := range b.joinC {
+				join()
+				<-b.slots
+			}
+		}()
+	}
 
 	newBatch := func() {
 		batch = b.batchFactory()
@@ -70,12 +122,13 @@ func (b *batcherImpl) Run() { //nolint:revive
 			timeout = timer.C
 		}
 	}
-	completeBatch := func() {
+	dispatchBatch := func() {
 		if b.linger > 0 {
 			timer.Stop()
 		}
-		batch.Complete()
+		toSend := batch
 		batch = nil
+		b.dispatch(toSend)
 	}
 
 	for {
@@ -86,19 +139,17 @@ func (b *batcherImpl) Run() { //nolint:revive
 			}
 			canAdd := batch.CanAdd(call)
 			if !canAdd {
-				completeBatch()
+				dispatchBatch()
 				newBatch()
 			}
 			batch.Add(call)
 			if batch.Size() == b.maxRequestsPerBatch || b.linger == 0 {
-				completeBatch()
+				dispatchBatch()
 			}
 
 		case <-timeout:
 			if batch != nil {
-				timer.Stop()
-				batch.Complete()
-				batch = nil
+				dispatchBatch()
 			}
 		case <-b.closeC:
 			if batch != nil {
@@ -111,6 +162,12 @@ func (b *batcherImpl) Run() { //nolint:revive
 				case call := <-b.callC:
 					b.failCall(call, ErrShuttingDown)
 				default:
+					// In-flight batches still finish: their joins run to
+					// completion before the batcher's goroutines exit.
+					if b.pipelined() {
+						close(b.joinC)
+						<-b.joinsDone
+					}
 					return
 				}
 			}

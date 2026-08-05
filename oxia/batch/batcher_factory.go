@@ -30,13 +30,21 @@ type BatcherFactory struct {
 	MaxRequestsPerBatch int
 }
 
-func (b *BatcherFactory) NewBatcher(ctx context.Context, shard int64, batcherType string, batchFactory func() Batch) Batcher {
+// NewBatcher runs a batcher goroutine for one shard. maxBatchesInFlight
+// bounds how many dispatched batches may await their outcome at once; above
+// one, batches implementing Sender are pipelined within that window.
+func (b *BatcherFactory) NewBatcher(ctx context.Context, shard int64, batcherType string, batchFactory func() Batch, maxBatchesInFlight int) Batcher {
+	if maxBatchesInFlight < 1 {
+		maxBatchesInFlight = 1
+	}
+
 	batcher := &batcherImpl{
 		batchFactory:        batchFactory,
 		callC:               make(chan any, batcherChannelBufferSize),
 		closeC:              make(chan bool),
 		linger:              b.Linger,
 		maxRequestsPerBatch: b.MaxRequestsPerBatch,
+		maxBatchesInFlight:  maxBatchesInFlight,
 	}
 
 	go process.DoWithLabels(ctx, map[string]string{
