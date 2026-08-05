@@ -75,6 +75,7 @@ type streamWrapper struct {
 
 	stream       proto.OxiaClient_WriteStreamClient // nil while broken/recovering
 	streamCancel context.CancelFunc
+	everOpened   bool // distinguishes the first open from a true recovery
 	inflight     []*inflightWrite
 	hint         constant.ErrorMetadata
 
@@ -338,6 +339,8 @@ func (sw *streamWrapper) reconnect(hint constant.ErrorMetadata) error {
 	sw.stream = stream
 	sw.streamCancel = cancel
 	pending := len(sw.inflight)
+	recovered := sw.everOpened
+	sw.everOpened = true
 	sw.Unlock()
 
 	go process.DoWithLabels(sw.ctx, map[string]string{
@@ -345,9 +348,15 @@ func (sw *streamWrapper) reconnect(hint constant.ErrorMetadata) error {
 		"shard": fmt.Sprintf("%d", sw.shard),
 	}, func() { sw.readLoop(stream) })
 
-	slog.Info("Write stream recovered; replayed inflight writes",
-		slog.Int64("shard", sw.shard),
-		slog.Int("pendingWrites", pending))
+	if recovered {
+		slog.Info("Write stream recovered; replayed inflight writes",
+			slog.Int64("shard", sw.shard),
+			slog.Int("pendingWrites", pending))
+	} else {
+		slog.Debug("Write stream opened",
+			slog.Int64("shard", sw.shard),
+			slog.Int("pendingWrites", pending))
+	}
 	return nil
 }
 
