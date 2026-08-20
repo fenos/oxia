@@ -145,6 +145,20 @@ func WithBatchLinger(batchLinger time.Duration) ClientOption {
 	})
 }
 
+// WithMaxBatchSize defines how many bytes a write batch can contain before the
+// batched request is sent, whatever its request count. The value must be
+// greater than zero. Deep write fans with large values benefit from a larger
+// batch: fewer round trips per shard at the same per-shard ordering.
+func WithMaxBatchSize(maxBatchSize int) ClientOption {
+	return clientOptionFunc(func(options clientOptions) (clientOptions, error) {
+		if maxBatchSize <= 0 {
+			return options, ErrInvalidOptionMaxBatchSize
+		}
+		options.maxBatchSize = maxBatchSize
+		return options, nil
+	})
+}
+
 // WithMaxRequestsPerBatch defines how many individual requests a batch can contain before the batched request is sent.
 // The value must be greater than zero. A value of one will effectively disable batching.
 func WithMaxRequestsPerBatch(maxRequestsPerBatch int) ClientOption {
