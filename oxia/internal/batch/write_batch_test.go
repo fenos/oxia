@@ -157,9 +157,9 @@ func TestWriteBatchComplete(t *testing.T) {
 		}
 
 		factory := &writeBatchFactory{
-			execute:     execute,
-			metrics:     metrics.NewMetrics(noop.NewMeterProvider()),
-			maxByteSize: 1024,
+			executeAsync: syncExecute(execute),
+			metrics:      metrics.NewMetrics(noop.NewMeterProvider()),
+			maxByteSize:  1024,
 		}
 		batch := factory.newBatch(&shardId)
 
@@ -235,7 +235,7 @@ func TestWriteBatchRerouteOnShardDeleted(t *testing.T) {
 	var reroutedDeleteRanges []model.DeleteRangeCall
 
 	factory := &writeBatchFactory{
-		execute: execute,
+		executeAsync: syncExecute(execute),
 		reroute: func(puts []model.PutCall, deletes []model.DeleteCall, deleteRanges []model.DeleteRangeCall) {
 			reroutedPuts = puts
 			reroutedDeletes = deletes
@@ -281,7 +281,7 @@ func TestWriteBatchNoRerouteOnOtherError(t *testing.T) {
 
 	rerouted := false
 	factory := &writeBatchFactory{
-		execute: execute,
+		executeAsync: syncExecute(execute),
 		reroute: func([]model.PutCall, []model.DeleteCall, []model.DeleteRangeCall) {
 			rerouted = true
 		},
@@ -338,5 +338,13 @@ func TestWriteBatchCanAdd(t *testing.T) {
 
 			assert.Equal(t, item.expectCanAdd, canAdd)
 		})
+	}
+}
+
+// syncExecute adapts a synchronous execute into the executeAsync shape the
+// batch factory takes: transmission and waiting collapse into the join.
+func syncExecute(execute func(context.Context, *proto.WriteRequest) (*proto.WriteResponse, error)) func(context.Context, *proto.WriteRequest) func() (*proto.WriteResponse, error) {
+	return func(ctx context.Context, request *proto.WriteRequest) func() (*proto.WriteResponse, error) {
+		return func() (*proto.WriteResponse, error) { return execute(ctx, request) }
 	}
 }

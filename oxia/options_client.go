@@ -38,6 +38,10 @@ const (
 	DefaultRequestTimeout      = 30 * time.Second
 	DefaultSessionTimeout      = 15 * time.Second
 	DefaultNamespace           = constant.DefaultNamespace
+
+	// DefaultMaxWriteBatchesInFlight bounds the per-shard pipeline of
+	// write batches awaiting their response.
+	DefaultMaxWriteBatchesInFlight = 4
 )
 
 var (
@@ -50,6 +54,8 @@ var (
 	ErrInvalidOptionNamespace           = errors.New("Namespace cannot be empty")
 	ErrInvalidOptionTLS                 = errors.New("Tls cannot be empty")
 	ErrInvalidOptionAuthentication      = errors.New("Authentication cannot be empty")
+
+	ErrInvalidOptionMaxWriteBatchesInFlight = errors.New("MaxWriteBatchesInFlight must be greater than zero")
 )
 
 // clientOptions contains options for the Oxia client.
@@ -68,6 +74,8 @@ type clientOptions struct {
 	sessionKeepAliveTicker time.Duration
 	failureInjection       *hashset.Set[Failure]
 	resolver               ServiceResolver
+
+	maxWriteBatchesInFlight int
 }
 
 func defaultIdentity() string {
@@ -88,16 +96,17 @@ type ClientOption interface {
 
 func newClientOptions(serviceAddress string, opts ...ClientOption) (clientOptions, error) {
 	options := clientOptions{
-		serviceAddress:      serviceAddress,
-		namespace:           constant.DefaultNamespace,
-		batchLinger:         DefaultBatchLinger,
-		maxRequestsPerBatch: DefaultMaxRequestsPerBatch,
-		maxBatchSize:        DefaultMaxBatchSize,
-		requestTimeout:      DefaultRequestTimeout,
-		meterProvider:       noop.NewMeterProvider(),
-		sessionTimeout:      DefaultSessionTimeout,
-		identity:            defaultIdentity(),
-		failureInjection:    hashset.New[Failure](),
+		serviceAddress:          serviceAddress,
+		namespace:               constant.DefaultNamespace,
+		batchLinger:             DefaultBatchLinger,
+		maxRequestsPerBatch:     DefaultMaxRequestsPerBatch,
+		maxBatchSize:            DefaultMaxBatchSize,
+		requestTimeout:          DefaultRequestTimeout,
+		maxWriteBatchesInFlight: DefaultMaxWriteBatchesInFlight,
+		meterProvider:           noop.NewMeterProvider(),
+		sessionTimeout:          DefaultSessionTimeout,
+		identity:                defaultIdentity(),
+		failureInjection:        hashset.New[Failure](),
 	}
 	var errs error
 	var err error
@@ -145,6 +154,20 @@ func WithBatchLinger(batchLinger time.Duration) ClientOption {
 	})
 }
 
+// WithMaxBatchSize defines how many bytes a write batch can contain before the
+// batched request is sent, whatever its request count. The value must be
+// greater than zero. Deep write fans with large values benefit from a larger
+// batch: fewer round trips per shard at the same per-shard ordering.
+func WithMaxBatchSize(maxBatchSize int) ClientOption {
+	return clientOptionFunc(func(options clientOptions) (clientOptions, error) {
+		if maxBatchSize <= 0 {
+			return options, ErrInvalidOptionMaxBatchSize
+		}
+		options.maxBatchSize = maxBatchSize
+		return options, nil
+	})
+}
+
 // WithMaxRequestsPerBatch defines how many individual requests a batch can contain before the batched request is sent.
 // The value must be greater than zero. A value of one will effectively disable batching.
 func WithMaxRequestsPerBatch(maxRequestsPerBatch int) ClientOption {
@@ -163,6 +186,24 @@ func WithRequestTimeout(requestTimeout time.Duration) ClientOption {
 			return options, ErrInvalidOptionRequestTimeout
 		}
 		options.requestTimeout = requestTimeout
+		return options, nil
+	})
+}
+
+// WithMaxWriteBatchesInFlight bounds how many write batches per shard may
+// be awaiting their response at once. Above one, the client pipelines
+// batches on the shard's write stream — forming and transmitting new
+// batches while earlier ones are still outstanding — which raises
+// per-shard throughput without giving up ordering: batches reach the
+// server in submission order, including across stream failures, where
+// in-flight batches are replayed in order on the recovered stream. A
+// value of one disables pipelining.
+func WithMaxWriteBatchesInFlight(maxWriteBatchesInFlight int) ClientOption {
+	return clientOptionFunc(func(options clientOptions) (clientOptions, error) {
+		if maxWriteBatchesInFlight <= 0 {
+			return options, ErrInvalidOptionMaxWriteBatchesInFlight
+		}
+		options.maxWriteBatchesInFlight = maxWriteBatchesInFlight
 		return options, nil
 	})
 }

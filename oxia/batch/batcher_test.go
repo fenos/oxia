@@ -79,7 +79,7 @@ func TestBatcher(t *testing.T) {
 				Linger:              item.linger,
 				MaxRequestsPerBatch: item.maxSize,
 			}
-			batcher := factory.NewBatcher(context.Background(), 1, "test-write", batchFactory)
+			batcher := factory.NewBatcher(context.Background(), 1, "test-write", batchFactory, 1)
 			batcher.Add(1)
 
 			if item.closeImmediately {
@@ -95,4 +95,219 @@ func TestBatcher(t *testing.T) {
 			}
 		})
 	}
+}
+
+// sendableBatch implements Sender: its join blocks until the test releases
+// it, letting the test hold the window open and observe dispatch order.
+type sendableBatch struct {
+	id      int
+	count   int
+	sentC   chan *sendableBatch
+	joinedC chan *sendableBatch
+	release chan struct{}
+	failC   chan error
+}
+
+func (b *sendableBatch) CanAdd(any) bool { return true }
+func (b *sendableBatch) Add(any)         { b.count++ }
+func (b *sendableBatch) Size() int       { return b.count }
+func (b *sendableBatch) Complete()       { b.Send()() }
+func (b *sendableBatch) Fail(err error)  { b.failC <- err }
+
+func (b *sendableBatch) Send() func() {
+	b.sentC <- b
+	return func() {
+		<-b.release
+		b.joinedC <- b
+	}
+}
+
+func TestBatcherPipelinesWithinWindow(t *testing.T) {
+	sentC := make(chan *sendableBatch, 16)
+	joinedC := make(chan *sendableBatch, 16)
+	failC := make(chan error, 16)
+
+	nextID := 0
+	batchFactory := func() Batch {
+		nextID++
+		return &sendableBatch{
+			id:      nextID,
+			sentC:   sentC,
+			joinedC: joinedC,
+			release: make(chan struct{}),
+			failC:   failC,
+		}
+	}
+
+	factory := &BatcherFactory{
+		Linger:              1 * time.Hour, // dispatch on size only
+		MaxRequestsPerBatch: 1,
+	}
+	batcher := factory.NewBatcher(context.Background(), 1, "test-write", batchFactory, 3)
+	defer batcher.Close()
+
+	for i := 0; i < 5; i++ {
+		batcher.Add(i)
+	}
+
+	// Three batches transmit without any outcome delivered — the window —
+	// and they transmit in submission order.
+	var inFlight []*sendableBatch
+	for i := 0; i < 3; i++ {
+		select {
+		case b := <-sentC:
+			inFlight = append(inFlight, b)
+		case <-time.After(10 * time.Second):
+			t.Fatalf("batch %d never transmitted", i+1)
+		}
+	}
+	assert.Equal(t, []int{1, 2, 3}, []int{inFlight[0].id, inFlight[1].id, inFlight[2].id})
+
+	// The fourth waits for a slot.
+	select {
+	case b := <-sentC:
+		t.Fatalf("batch %d transmitted beyond the window", b.id)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Releasing the head frees one slot: exactly one more transmits, and
+	// the released batch joins first — completion follows dispatch order.
+	close(inFlight[0].release)
+	assert.Equal(t, 1, (<-joinedC).id)
+	b4 := <-sentC
+	assert.Equal(t, 4, b4.id)
+
+	// Drain the rest: joins complete in dispatch order throughout.
+	close(inFlight[1].release)
+	close(inFlight[2].release)
+	assert.Equal(t, 2, (<-joinedC).id)
+	assert.Equal(t, 3, (<-joinedC).id)
+	b5 := <-sentC
+	assert.Equal(t, 5, b5.id)
+	close(b4.release)
+	close(b5.release)
+	assert.Equal(t, 4, (<-joinedC).id)
+	assert.Equal(t, 5, (<-joinedC).id)
+}
+
+func TestBatcherCloseFinishesInFlightJoins(t *testing.T) {
+	sentC := make(chan *sendableBatch, 16)
+	joinedC := make(chan *sendableBatch, 16)
+	failC := make(chan error, 16)
+
+	nextID := 0
+	batchFactory := func() Batch {
+		nextID++
+		return &sendableBatch{
+			id:      nextID,
+			sentC:   sentC,
+			joinedC: joinedC,
+			release: make(chan struct{}),
+			failC:   failC,
+		}
+	}
+
+	factory := &BatcherFactory{
+		Linger:              1 * time.Hour,
+		MaxRequestsPerBatch: 1,
+	}
+	batcher := factory.NewBatcher(context.Background(), 1, "test-write", batchFactory, 2)
+
+	batcher.Add(1)
+	batcher.Add(2)
+
+	b1 := <-sentC
+	b2 := <-sentC
+
+	// Close with both joins outstanding: they must still run to
+	// completion — their callers get real outcomes, not silence.
+	assert.NoError(t, batcher.Close())
+	close(b1.release)
+	close(b2.release)
+	assert.Equal(t, b1.id, (<-joinedC).id)
+	assert.Equal(t, b2.id, (<-joinedC).id)
+}
+
+// TestBatcherAccumulatesWhileWindowExhausted: with the window exhausted,
+// the batcher must keep ACCEPTING operations — filling the open batch and
+// parking finished ones (up to the window depth) — rather than freeze and
+// later emit inbox-sized slivers. A saturated server gets fewer, fatter
+// batches; hard backpressure starts only when parking is full too.
+func TestBatcherAccumulatesWhileWindowExhausted(t *testing.T) {
+	savedBuf := batcherChannelBufferSize
+	batcherChannelBufferSize = 2
+	defer func() { batcherChannelBufferSize = savedBuf }()
+
+	sentC := make(chan *sendableBatch, 32)
+	joinedC := make(chan *sendableBatch, 32)
+	failC := make(chan error, 32)
+
+	nextID := 0
+	batchFactory := func() Batch {
+		nextID++
+		return &sendableBatch{
+			id:      nextID,
+			sentC:   sentC,
+			joinedC: joinedC,
+			release: make(chan struct{}),
+			failC:   failC,
+		}
+	}
+
+	factory := &BatcherFactory{
+		Linger:              1 * time.Hour,
+		MaxRequestsPerBatch: 3,
+	}
+	batcher := factory.NewBatcher(context.Background(), 1, "test-write", batchFactory, 2)
+	defer batcher.Close()
+
+	// Two batches fill and take both window slots.
+	for i := 1; i <= 6; i++ {
+		batcher.Add(i)
+	}
+	b1, b2 := <-sentC, <-sentC
+	assert.Equal(t, 3, b1.count)
+	assert.Equal(t, 3, b2.count)
+
+	// Window exhausted: 9 more ops must still be accepted — two full
+	// batches park (window depth) and the open batch plus inbox hold the
+	// rest. The frozen batcher accepts only inbox+open and blocks.
+	const burst = 9
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < burst; i++ {
+			batcher.Add(100 + i)
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("adds blocked while the window was exhausted — accumulation is frozen")
+	}
+
+	// Nothing transmits while both slots are held.
+	select {
+	case b := <-sentC:
+		t.Fatalf("batch %d transmitted with the window exhausted", b.id)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Freeing slots drains everything, oldest first, as full batches.
+	close(b1.release)
+	close(b2.release)
+	assert.Equal(t, b1.id, (<-joinedC).id)
+	assert.Equal(t, b2.id, (<-joinedC).id)
+
+	got := 0
+	prev := 0
+	for got < burst {
+		b := <-sentC
+		got += b.count
+		assert.Greater(t, b.id, prev, "parked batches must dispatch oldest first")
+		prev = b.id
+		close(b.release)
+		assert.Equal(t, b.id, (<-joinedC).id)
+	}
+	assert.Equal(t, burst, got)
 }

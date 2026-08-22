@@ -20,8 +20,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/cenkalti/backoff/v4"
 	"google.golang.org/grpc"
@@ -52,25 +52,34 @@ type rpcProvider struct {
 	shardManagerSupplier func() ShardManager
 	writeStreamsMutex    sync.RWMutex
 	writeStreams         map[int64]*streamWrapper
+	requestTimeout       time.Duration
 
 	ctx       context.Context
 	namespace string
 }
 
 func NewRpcProvider(ctx context.Context, namespace string, tlsConf *tls.Config, authentication auth.Authentication,
-	serviceAddress string, shardManagerSupplier func() ShardManager, dialOptions ...grpc.DialOption,
+	serviceAddress string, requestTimeout time.Duration, shardManagerSupplier func() ShardManager, dialOptions ...grpc.DialOption,
 ) RpcProvider {
 	return &rpcProvider{
 		ctx:                  ctx,
 		namespace:            namespace,
 		clientPool:           rpc.NewClientPool(tlsConf, authentication, dialOptions...),
 		serviceAddress:       serviceAddress,
+		requestTimeout:       requestTimeout,
 		shardManagerSupplier: shardManagerSupplier,
 		writeStreams:         make(map[int64]*streamWrapper),
 	}
 }
 
 func (p *rpcProvider) Close() error {
+	p.writeStreamsMutex.Lock()
+	for shard, sw := range p.writeStreams {
+		delete(p.writeStreams, shard)
+		sw.closeWith(fmt.Errorf("oxia: client closed: %w", constant.ErrResourceUnavailable))
+	}
+	p.writeStreamsMutex.Unlock()
+
 	return p.clientPool.Close()
 }
 
@@ -100,51 +109,70 @@ func (p *rpcProvider) getTargetByShard(shardId *int64, hint constant.ErrorMetada
 	return shardManager.Leader(*shardId), nil
 }
 
-func (p *rpcProvider) ExecuteWrite(ctx context.Context, request *proto.WriteRequest) (*proto.WriteResponse, error) {
-	return executeWithRetry(ctx, func(hint constant.ErrorMetadata) (*proto.WriteResponse, error) {
-		shardId := request.Shard
-		if _, err := p.getTargetByShard(shardId, hint); err != nil {
-			return nil, err
-		}
-		p.writeStreamsMutex.RLock()
+// getWriteStreamWrapper returns the shard's live stream wrapper, creating
+// one — or replacing a closed one — on demand. The wrapper owns leader
+// (re)resolution and stream recovery through the opener it is given.
+func (p *rpcProvider) getWriteStreamWrapper(shardId int64) *streamWrapper {
+	p.writeStreamsMutex.RLock()
+	sw, ok := p.writeStreams[shardId]
+	p.writeStreamsMutex.RUnlock()
 
-		sw, ok := p.writeStreams[*shardId]
-		hintShard, _, hasLeaderHint := hint.GetLeaderHint()
-		if ok && !sw.failed.Load() && (!hasLeaderHint || hintShard != *shardId) {
-			p.writeStreamsMutex.RUnlock()
-			return sw.Send(ctx, request)
-		}
+	if ok && !sw.isClosed() {
+		return sw
+	}
 
-		p.writeStreamsMutex.RUnlock()
+	p.writeStreamsMutex.Lock()
+	defer p.writeStreamsMutex.Unlock()
 
-		streamCtx := metadata.AppendToOutgoingContext(p.ctx, constant.MetadataNamespace, p.namespace)
-		streamCtx = metadata.AppendToOutgoingContext(streamCtx, constant.MetadataShardId, fmt.Sprintf("%d", *shardId))
-		target, err := p.getTargetByShard(shardId, hint)
+	if sw, ok = p.writeStreams[shardId]; ok && !sw.isClosed() {
+		return sw
+	}
+
+	open := func(hint constant.ErrorMetadata) (proto.OxiaClient_WriteStreamClient, context.CancelFunc, error) {
+		target, err := p.getTargetByShard(&shardId, hint)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
+		streamCtx, cancel := context.WithCancel(p.ctx)
+		streamCtx = metadata.AppendToOutgoingContext(streamCtx, constant.MetadataNamespace, p.namespace)
+		streamCtx = metadata.AppendToOutgoingContext(streamCtx, constant.MetadataShardId, fmt.Sprintf("%d", shardId))
 		stream, err := p.getWriteStream(streamCtx, target)
 		if err != nil {
-			return nil, err
+			cancel()
+			return nil, nil, err
 		}
+		return stream, cancel, nil
+	}
 
-		sw = newStreamWrapper(*shardId, stream) //nolint:contextcheck // The wrapper uses the stream context owned by the RPC.
+	sw = newStreamWrapper(p.ctx, shardId, open, p.requestTimeout)
+	p.writeStreams[shardId] = sw
+	return sw
+}
 
-		p.writeStreamsMutex.Lock()
-		defer p.writeStreamsMutex.Unlock()
-
-		if old, ok := p.writeStreams[*shardId]; ok {
-			old.failed.Store(true)
-			if err := old.stream.CloseSend(); err != nil {
-				slog.Warn("failed to close old write stream",
-					slog.Int64("shard", *shardId),
-					slog.Any("error", err),
-				)
-			}
-		}
-		p.writeStreams[*shardId] = sw
-		return sw.Send(ctx, request)
+func (p *rpcProvider) ExecuteWrite(ctx context.Context, request *proto.WriteRequest) (*proto.WriteResponse, error) {
+	return executeWithRetry(ctx, func(constant.ErrorMetadata) (*proto.WriteResponse, error) {
+		// Leader hints and stream recovery are the wrapper's business; a
+		// closed wrapper surfaces a retryable error, and the retry finds
+		// a fresh one here.
+		return p.getWriteStreamWrapper(*request.Shard).Send(ctx, request) //nolint:contextcheck // Streams are tied to the client's lifetime context, not one request's.
 	})
+}
+
+// ExecuteWriteAsync transmits the request without waiting for the
+// response and returns a join that does the waiting. Requests transmitted
+// by consecutive calls reach the shard in call order; the wrapper keeps
+// that order across stream failures by replaying in-flight requests on
+// the recovered stream.
+func (p *rpcProvider) ExecuteWriteAsync(ctx context.Context, request *proto.WriteRequest) func() (*proto.WriteResponse, error) {
+	f, err := p.getWriteStreamWrapper(*request.Shard).SendAsync(request) //nolint:contextcheck // Streams are tied to the client's lifetime context, not one request's.
+	if err != nil {
+		// The wrapper closed concurrently; a fresh one takes this send.
+		f, err = p.getWriteStreamWrapper(*request.Shard).SendAsync(request) //nolint:contextcheck // See above.
+	}
+	if err != nil {
+		return func() (*proto.WriteResponse, error) { return nil, err }
+	}
+	return func() (*proto.WriteResponse, error) { return f.Wait(ctx) }
 }
 
 func (p *rpcProvider) ExecuteRead(ctx context.Context, request *proto.ReadRequest) (*proto.ReadResponse, error) {
