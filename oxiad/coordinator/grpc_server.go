@@ -52,6 +52,7 @@ type serverOptions struct {
 	// onLeadershipLost is the embedder's handler; nil selects the default,
 	// which terminates the process.
 	onLeadershipLost     func()
+	onMetadata           func(*coordmetadata.Factory)
 	initialClusterConfig *proto.ClusterConfiguration
 }
 
@@ -73,6 +74,12 @@ func (so *serverOptions) validate() error {
 		return fmt.Errorf("invalid initial cluster configuration: %w", err)
 	}
 	return nil
+}
+
+func (so *serverOptions) handMetadata(metadataFactory *coordmetadata.Factory) {
+	if so.onMetadata != nil {
+		so.onMetadata(metadataFactory)
+	}
 }
 
 func (so *serverOptions) seedClusterConfig(metadataFactory *coordmetadata.Factory) error {
@@ -117,6 +124,15 @@ func WithOnLeadershipLost(handler func()) ServerOption {
 func WithInitialClusterConfiguration(config *proto.ClusterConfiguration) ServerOption {
 	return func(so *serverOptions) {
 		so.initialClusterConfig = config
+	}
+}
+
+// WithOnMetadata hands the metadata factory to handler as soon as it
+// exists — before the wait for leadership, so a follower's caller can
+// read the raft membership too. A nil handler is ignored.
+func WithOnMetadata(handler func(*coordmetadata.Factory)) ServerOption {
+	return func(so *serverOptions) {
+		so.onMetadata = handler
 	}
 }
 
@@ -229,6 +245,7 @@ func NewGrpcServer(parent context.Context, optionsWatch *commonwatch.Watch[*opti
 	if err != nil {
 		return nil, err
 	}
+	so.handMetadata(metadataFactory)
 	// The metadata retries its status writes until they succeed or its
 	// context is canceled: deriving it from the server context lets Close stop
 	// the retries before closing the runtime, which waits for its controllers.
