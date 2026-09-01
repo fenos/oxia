@@ -18,6 +18,7 @@ import (
 	"context"
 	"net"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -118,7 +119,11 @@ func TestNewHandsTheMetadataFactoryToTheHook(t *testing.T) {
 	options.Metadata.Raft.DataDir = filepath.Join(t.TempDir(), "raft")
 
 	handed := make(chan *coordmetadata.Factory, 1)
-	server, err := New(t.Context(), options, WithOnMetadata(func(f *coordmetadata.Factory) { handed <- f }))
+	server, err := New(t.Context(), options,
+		WithOnMetadata(func(f *coordmetadata.Factory) { handed <- f }),
+		WithInitialClusterConfiguration(&proto.ClusterConfiguration{
+			Servers: []*proto.DataServerIdentity{{Name: ptr("seeded-server"), Public: "127.0.0.1:1", Internal: "127.0.0.1:2"}},
+		}))
 	require.NoError(t, err)
 	defer func() { require.NoError(t, server.Close()) }()
 
@@ -135,4 +140,18 @@ func TestNewHandsTheMetadataFactoryToTheHook(t *testing.T) {
 		members, err := membership.Members()
 		return err == nil && len(members) == 1 && members[0].Address == self && members[0].Voter && membership.LeaderID() == self
 	}, 30*time.Second, 100*time.Millisecond)
+
+	// The documents come back in the configmap provider's encoding and
+	// under its keys: the seeded namespace is in the configuration, and
+	// the status is a document of its own.
+	require.Eventually(t, func() bool {
+		docs, err := factory.Documents()
+		return err == nil && strings.Contains(string(docs.Config), "seeded-server") && len(docs.Status) > 0
+	}, 30*time.Second, 100*time.Millisecond)
+	docs, err := factory.Documents()
+	require.NoError(t, err)
+	require.Equal(t, "config.yaml", docs.ConfigKey)
+	require.Equal(t, "status", docs.StatusKey)
 }
+
+func ptr[T any](v T) *T { return &v }

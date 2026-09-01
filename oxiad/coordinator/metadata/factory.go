@@ -45,6 +45,43 @@ type Factory struct {
 	raftInterceptor raft.Interceptor
 }
 
+// Documents is the plane's metadata as the configmap provider stores it:
+// the cluster configuration and the status, each under the ConfigMap
+// data key that provider reads them from. What an embedder exports to
+// hand the plane to a configmap-provider coordinator.
+type Documents struct {
+	ConfigKey, StatusKey string
+	Config, Status       []byte
+}
+
+// ErrMetadataNotLoaded reports documents asked for before this node has
+// loaded any: a raft follower that has not caught up yet.
+var ErrMetadataNotLoaded = errors.New("metadata not loaded yet")
+
+// Documents renders both documents from this node's own copy — on the
+// raft provider, whatever it has applied, leader or follower.
+func (f *Factory) Documents() (Documents, error) {
+	config := f.configProvider.Watch().Load()
+	status := f.statusProvider.Watch().Load()
+	if config.Value == nil || status.Value == nil {
+		return Documents{}, ErrMetadataNotLoaded
+	}
+	configYAML, err := metadatacodec.ClusterConfigCodec.MarshalYAML(config.Value)
+	if err != nil {
+		return Documents{}, fmt.Errorf("encode cluster configuration: %w", err)
+	}
+	statusYAML, err := metadatacodec.ClusterStatusCodec.MarshalYAML(status.Value)
+	if err != nil {
+		return Documents{}, fmt.Errorf("encode cluster status: %w", err)
+	}
+	return Documents{
+		ConfigKey: metadatacommon.ClusterConfigConfigMapDataKey,
+		StatusKey: metadatacommon.ClusterStatusConfigMapDataKey,
+		Config:    configYAML,
+		Status:    statusYAML,
+	}, nil
+}
+
 // Membership is the raft group behind this coordinator's metadata, on the
 // raft provider; false on every other provider.
 func (f *Factory) Membership() (raft.Membership, bool) {
