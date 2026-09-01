@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"sync"
@@ -162,16 +163,12 @@ func NewGrpcServer(parent context.Context, optionsWatch *commonwatch.Watch[*opti
 			return
 		}
 
-		if metricsServer != nil { // a typed nil would pass CloseIfNotNil's check and be closed
-			err = multierr.Append(err, metricsServer.Close())
-		}
+		err = multierr.Append(err, closePointer(metricsServer))
 		err = multierr.Append(err, commonio.CloseIfNotNil(managementGrpcServer))
 		err = multierr.Append(err, commonio.CloseIfNotNil(reconciler))
 		err = multierr.Append(err, commonio.CloseIfNotNil(runtime))
 		err = multierr.Append(err, commonio.CloseIfNotNil(metadata))
-		if metadataFactory != nil { // a pointer, like the metrics server: check it as one
-			err = multierr.Append(err, metadataFactory.Close())
-		}
+		err = multierr.Append(err, closePointer(metadataFactory))
 		err = multierr.Append(err, commonio.CloseIfNotNil(grpcServer))
 	}()
 
@@ -367,4 +364,17 @@ func (s *GrpcServer) Close() error {
 		err = multierr.Append(err, s.metrics.Close())
 	}
 	return err
+}
+
+// closePointer closes p unless it is nil. A nil pointer wrapped in an
+// io.Closer passes CloseIfNotNil's check and is then dereferenced; the
+// parts NewGrpcServer holds as pointers are closed through this instead.
+func closePointer[T any, P interface {
+	*T
+	io.Closer
+}](p P) error {
+	if p == nil {
+		return nil
+	}
+	return p.Close()
 }
