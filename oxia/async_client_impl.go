@@ -146,6 +146,9 @@ func (c *clientImpl) Close() error {
 		c.sessions.Close(),
 		c.writeBatchManager.Close(),
 		c.readBatchManager.Close(),
+		// The shard manager owns the assignments stream and its retry loop;
+		// left open it would retry the closed provider forever.
+		c.shardManager.Close(),
 		c.rpcProvider.Close(),
 	)
 	c.cancel()
