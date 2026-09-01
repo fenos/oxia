@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 
 	"go.uber.org/multierr"
@@ -246,9 +245,9 @@ func (mpo ProviderOptions) Validate() error {
 		if len(mpo.Raft.Peers) > 0 && len(mpo.Raft.BootstrapNodes) > 0 {
 			return errors.New("raft peers and bootstrapNodes are mutually exclusive")
 		}
-		if len(mpo.Raft.Peers) > 0 && !slices.Contains(mpo.Raft.Peers, mpo.Raft.Address) {
-			return errors.New("raft address must be one of the peers")
-		}
+		// An address absent from its own peer list is a retiring node: it
+		// founds nothing, joins nothing, and hands leadership to a listed
+		// voter whenever it holds it.
 	case metadataconstant.NameFile:
 		if mpo.File.StatusPath() == "" {
 			return errors.New("metadata.file status path must be set with metadata=file")
