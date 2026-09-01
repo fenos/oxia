@@ -36,6 +36,7 @@ type Raft struct {
 	transport   *hashicorpraft.NetworkTransport
 	logger      *slog.Logger
 	interceptor Interceptor
+	membership  *membership // nil unless the configuration lists peers
 
 	// Raft blocks writing leadership transitions to notifyCh: it must always
 	// have a consumer (waitToBecomeLeader, then the loss drainer)
@@ -48,12 +49,12 @@ type Raft struct {
 
 const raftDataDirMode = 0o755
 
-func New(
-	raftAddress string,
-	raftBootstrapNodes []string,
-	raftDataDir string,
-	interceptor Interceptor,
-) (_ *Raft, err error) {
+// New starts one node of the coordinator's raft group as cfg describes.
+func New(cfg Config, interceptor Interceptor) (_ *Raft, err error) {
+	if err := cfg.validate(); err != nil {
+		return nil, err
+	}
+	raftAddress, raftDataDir := cfg.Address, cfg.DataDir
 	metadataRaft := &Raft{
 		logger:      slog.With(slog.String("component", "metadata-provider-raft")),
 		interceptor: interceptor,
@@ -113,16 +114,25 @@ func New(
 		return nil, errors.Wrap(err, "failed to create raft node")
 	}
 
-	if hasState, err := hashicorpraft.HasExistingState(metadataRaft.store, metadataRaft.store, snapshotStore); err != nil {
+	hasState, err := hashicorpraft.HasExistingState(metadataRaft.store, metadataRaft.store, snapshotStore)
+	if err != nil {
 		return nil, errors.Wrap(err, "failed to check existing state")
-	} else if !hasState {
-		configuration := hashicorpraft.Configuration{
-			Servers: getRaftServers(raftBootstrapNodes),
-		}
-		future := metadataRaft.node.BootstrapCluster(configuration)
+	}
+	switch {
+	case hasState:
+		// The group's configuration is in the log already.
+	case cfg.founds():
+		future := metadataRaft.node.BootstrapCluster(cfg.initialConfiguration())
 		if err := future.Error(); err != nil {
 			return nil, errors.Wrap(err, "failed to create raft node")
 		}
+	default:
+		metadataRaft.logger.Info("Waiting for the leader to add this node to the raft group",
+			slog.String("address", raftAddress), slog.String("founder", cfg.Peers[0]))
+	}
+
+	if len(cfg.Peers) > 0 {
+		metadataRaft.membership = startMembership(metadataRaft.node, cfg, config.HeartbeatTimeout, metadataRaft.logger)
 	}
 
 	return metadataRaft, nil
@@ -209,6 +219,10 @@ func drainLeadershipNotifications(notifyCh <-chan bool, shutdownCh <-chan struct
 // order: the node first, then the store and the transport it was using.
 func (r *Raft) release() error {
 	var err error
+	if r.membership != nil {
+		r.membership.close()
+		r.membership = nil
+	}
 	if r.node != nil {
 		err = multierr.Append(err, r.node.Shutdown().Error())
 	}

@@ -79,7 +79,13 @@ func (mpr *Provider[T]) WaitToBecomeLeader() (<-chan struct{}, error) {
 	return mpr.raft.waitToBecomeLeader()
 }
 
-func (*Provider[T]) GetLeaderName() (string, error) {
+// GetLeaderName is the leader's raft identity — its address, which a peer
+// list names it by — or ErrCoordinatorLeaderUnavailable while the group
+// has no leader.
+func (mpr *Provider[T]) GetLeaderName() (string, error) {
+	if id := mpr.raft.LeaderID(); id != "" {
+		return id, nil
+	}
 	return "", provider.ErrCoordinatorLeaderUnavailable
 }
 

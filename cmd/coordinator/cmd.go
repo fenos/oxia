@@ -64,6 +64,7 @@ func init() {
 	Cmd.Flags().StringVar(&meta.File.StatusName, "file-clusters-status-path", "data/cluster-status.json", "Cluster status file name or full path when using the 'file' provider; a full path is allowed when no metadata file directory is configured")
 
 	Cmd.Flags().StringSliceVar(&meta.Raft.BootstrapNodes, "raft-bootstrap-nodes", meta.Raft.BootstrapNodes, "Raft bootstrap nodes")
+	Cmd.Flags().StringSliceVar(&meta.Raft.Peers, "raft-peers", meta.Raft.Peers, "Raft addresses of the whole coordinator group, in one shared order; the first founds the group and the leader keeps the membership equal to the list (exclusive with raft-bootstrap-nodes)")
 	Cmd.Flags().StringVar(&meta.Raft.Address, "raft-address", "", "Raft address")
 	Cmd.Flags().StringVar(&meta.Raft.DataDir, "raft-data-dir", "data/raft", "Raft address")
 

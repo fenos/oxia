@@ -87,7 +87,7 @@ func New(ctx context.Context, options *option.Options) (*Factory, error) {
 			return nil, err
 		}
 	case metadatacommon.NameRaft:
-		if factory.raft, err = raft.New(meta.Raft.Address, meta.Raft.BootstrapNodes, meta.Raft.DataDir, factory); err != nil {
+		if factory.raft, err = raft.New(raft.Config{Address: meta.Raft.Address, Peers: meta.Raft.Peers, BootstrapNodes: meta.Raft.BootstrapNodes, DataDir: meta.Raft.DataDir}, factory); err != nil {
 			return nil, fmt.Errorf("failed to create raft metadata provider: %w", err)
 		}
 		factory.configProvider = raft.NewProvider(ctx, factory.raft, metadatacodec.ClusterConfigCodec, metadatacommon.WatchEnabled)

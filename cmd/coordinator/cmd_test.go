@@ -399,3 +399,12 @@ metadata:
 	assert.Equal(t, "0.0.0.0:8080", coordinatorOptions.Observability.Metric.BindAddress)
 	assert.Equal(t, "memory", coordinatorOptions.Metadata.ProviderName)
 }
+
+// The flag parses a list; other tests rebind coordinatorOptions, so the
+// value is read back through the flag rather than the options.
+func TestCoordinator_RaftPeersFlag(t *testing.T) {
+	require.NoError(t, Cmd.ParseFlags([]string{"--raft-peers=node1:6645,node2:6645,node3:6645"}))
+	peers, err := Cmd.Flags().GetStringSlice("raft-peers")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"node1:6645", "node2:6645", "node3:6645"}, peers)
+}

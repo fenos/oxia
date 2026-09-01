@@ -74,7 +74,7 @@ var (
 			t.Helper()
 
 			addr := freeAddress(t)
-			r, err := raft.New(addr, []string{addr}, filepath.Join(t.TempDir(), "raft"), nil)
+			r, err := raft.New(raft.Config{Address: addr, BootstrapNodes: []string{addr}, DataDir: filepath.Join(t.TempDir(), "raft")}, nil)
 			assert.NoError(t, err)
 			p := raft.NewProvider(t.Context(), r, metadatacodec.ClusterStatusCodec, metadatacommon.WatchDisabled)
 			_, err = p.WaitToBecomeLeader()
@@ -182,7 +182,7 @@ func TestProviderConfigResource(t *testing.T) {
 			t.Helper()
 
 			addr := freeAddress(t)
-			r, err := raft.New(addr, []string{addr}, filepath.Join(t.TempDir(), "raft"), nil)
+			r, err := raft.New(raft.Config{Address: addr, BootstrapNodes: []string{addr}, DataDir: filepath.Join(t.TempDir(), "raft")}, nil)
 			assert.NoError(t, err)
 			statusProvider := raft.NewProvider(t.Context(), r, metadatacodec.ClusterStatusCodec, metadatacommon.WatchDisabled)
 			configProvider := raft.NewProvider(t.Context(), r, metadatacodec.ClusterConfigCodec, metadatacommon.WatchDisabled)

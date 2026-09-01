@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"go.uber.org/multierr"
@@ -242,6 +243,12 @@ func (mpo ProviderOptions) Validate() error {
 		if mpo.Raft.Address == "" {
 			return errors.New("raft-address must be set with metadata=raft")
 		}
+		if len(mpo.Raft.Peers) > 0 && len(mpo.Raft.BootstrapNodes) > 0 {
+			return errors.New("raft peers and bootstrapNodes are mutually exclusive")
+		}
+		if len(mpo.Raft.Peers) > 0 && !slices.Contains(mpo.Raft.Peers, mpo.Raft.Address) {
+			return errors.New("raft address must be one of the peers")
+		}
 	case metadataconstant.NameFile:
 		if mpo.File.StatusPath() == "" {
 			return errors.New("metadata.file status path must be set with metadata=file")
@@ -423,6 +430,7 @@ func filePath(dir, name, defaultName string) string {
 }
 
 type RaftMetadata struct {
+	Peers          []string `yaml:"peers,omitempty" json:"peers,omitempty" jsonschema:"description=Raft addresses of the whole coordinator group in one shared order: the first founds the group and the leader keeps the membership equal to the list. Mutually exclusive with bootstrapNodes,example=coordinator-0:8080"`
 	BootstrapNodes []string `yaml:"bootstrapNodes" json:"bootstrapNodes" jsonschema:"description=List of bootstrap nodes for Raft cluster initialization"`
 	Address        string   `yaml:"address" json:"address" jsonschema:"description=Address of this node in the Raft cluster,example=localhost:8080"`
 	DataDir        string   `yaml:"dataDir" json:"dataDir" jsonschema:"description=Directory for Raft metadata storage,example=./data/raft"`
