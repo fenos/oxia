@@ -241,9 +241,10 @@ type GetResult struct {
 	Version Version
 
 	// SecondaryIndexKey is the record's key in the secondary index the
-	// operation read through, when it used one — the order a RangeScan
-	// over an index follows across shards. Empty otherwise.
-	SecondaryIndexKey string
+	// operation read through — the order a RangeScan over an index follows
+	// across shards. Nil when the operation used no index; a secondary key
+	// may itself be the empty string.
+	SecondaryIndexKey *string
 
 	// The error if the `Get` operation failed
 	Err error

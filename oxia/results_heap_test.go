@@ -18,6 +18,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	pb "google.golang.org/protobuf/proto"
 )
 
 func resultsChannel(results ...GetResult) chan GetResult {
@@ -42,20 +43,22 @@ func collectKeys(ch chan GetResult) []string {
 // record keys, which the index deliberately orders differently.
 func TestAggregateRangeScanAcrossShardsOrdersByIndexKey(t *testing.T) {
 	// Each shard yields its own results already in index order.
+	// The empty secondary key is legal and sorts before every other.
 	shard1 := resultsChannel(
-		GetResult{Key: "c", SecondaryIndexKey: "idx/1"},
-		GetResult{Key: "a", SecondaryIndexKey: "idx/3"},
+		GetResult{Key: "c", SecondaryIndexKey: pb.String("idx/1")},
+		GetResult{Key: "a", SecondaryIndexKey: pb.String("idx/3")},
 	)
 	shard2 := resultsChannel(
-		GetResult{Key: "b", SecondaryIndexKey: "idx/2"},
-		GetResult{Key: "d", SecondaryIndexKey: "idx/3"},
+		GetResult{Key: "e", SecondaryIndexKey: pb.String("")},
+		GetResult{Key: "b", SecondaryIndexKey: pb.String("idx/2")},
+		GetResult{Key: "d", SecondaryIndexKey: pb.String("idx/3")},
 	)
 
 	out := make(chan GetResult)
 	go aggregateAndSortRangeScanAcrossShards([]chan GetResult{shard1, shard2}, out)
 
-	assert.Equal(t, []string{"c", "b", "a", "d"}, collectKeys(out),
-		"secondary key ascending, ties by record key")
+	assert.Equal(t, []string{"e", "c", "b", "a", "d"}, collectKeys(out),
+		"secondary key ascending, the empty key first, ties by record key")
 }
 
 // Without an index, record keys order the merge as before.

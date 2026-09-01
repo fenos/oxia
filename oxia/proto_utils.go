@@ -56,7 +56,7 @@ func toGetResult(r *proto.GetResponse, originalKey string, err error) GetResult 
 	gr := GetResult{
 		Value:             r.Value,
 		Version:           toVersion(r.Version),
-		SecondaryIndexKey: r.GetSecondaryIndexKey(),
+		SecondaryIndexKey: r.SecondaryIndexKey,
 	}
 
 	if r.Key != nil {
