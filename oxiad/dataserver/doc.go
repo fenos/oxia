@@ -50,4 +50,9 @@
 //
 // Unlike the command, a StandaloneConfig leaves notifications disabled unless
 // NotificationsEnabled is set, and clients subscribing to them then fail.
+//
+// [StandaloneConfig.Namespaces] gives it several namespaces, each with its own
+// key sorting, laid out on disk exactly as a coordinator would lay them out —
+// so a standalone data directory can later be adopted by a coordinated
+// cluster.
 package dataserver
