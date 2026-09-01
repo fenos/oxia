@@ -14,6 +14,31 @@
 
 package raft
 
+import "sync"
+
 type Interceptor interface {
 	OnApplied(key string, data []byte, version int64)
+}
+
+// Interceptors fans every applied entry out to several interceptors: the
+// providers of one node, which are created after the node itself and added
+// here once they exist. Safe to add to while entries are being applied.
+type Interceptors struct {
+	mu   sync.RWMutex
+	list []Interceptor
+}
+
+// Add registers interceptors; later entries reach them too.
+func (i *Interceptors) Add(interceptors ...Interceptor) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	i.list = append(i.list, interceptors...)
+}
+
+func (i *Interceptors) OnApplied(key string, data []byte, version int64) {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	for _, interceptor := range i.list {
+		interceptor.OnApplied(key, data, version)
+	}
 }

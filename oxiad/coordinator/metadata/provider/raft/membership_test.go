@@ -23,8 +23,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	commonproto "github.com/oxia-db/oxia/common/proto"
 	metadatacommon "github.com/oxia-db/oxia/oxiad/coordinator/metadata/common"
 	metadatacodec "github.com/oxia-db/oxia/oxiad/coordinator/metadata/common/codec"
+	"github.com/oxia-db/oxia/oxiad/coordinator/metadata/provider"
 )
 
 func freeAddresses(t *testing.T, n int) []string {
@@ -223,4 +225,49 @@ func TestUnreachablePeerIsNeverPromoted(t *testing.T) {
 		assert.Equal(t, []string{peers[0]}, voters(members), "only the founder votes")
 		time.Sleep(200 * time.Millisecond)
 	}
+}
+
+// Every applied entry reaches every provider on every node: what the
+// leader stores as cluster status, a follower's status provider reports —
+// so a follower that later wins the election recovers from the latest
+// state instead of the empty one it started with.
+func TestFollowerSeesAppliedStatus(t *testing.T) {
+	peers := freeAddresses(t, 2)
+
+	nodes := make([]*Raft, len(peers))
+	statuses := make([]provider.Provider[*commonproto.ClusterStatus], len(peers))
+	for i, addr := range peers {
+		interceptors := &Interceptors{}
+		node, err := New(Config{
+			Address:        addr,
+			Peers:          peers,
+			DataDir:        filepath.Join(t.TempDir(), "raft"),
+			PromotionQuiet: 200 * time.Millisecond,
+		}, interceptors)
+		require.NoError(t, err)
+		t.Cleanup(func() { assert.NoError(t, node.Close()) })
+		nodes[i] = node
+
+		config := NewProvider(t.Context(), node, metadatacodec.ClusterConfigCodec, metadatacommon.WatchEnabled)
+		statuses[i] = NewProvider(t.Context(), node, metadatacodec.ClusterStatusCodec, metadatacommon.WatchDisabled)
+		interceptors.Add(config.(*Provider[*commonproto.ClusterConfiguration]), statuses[i].(*Provider[*commonproto.ClusterStatus]))
+	}
+
+	leader := leaderOf(t, nodes)
+	require.Eventually(t, func() bool {
+		members, err := nodes[leader].Members()
+		return err == nil && len(voters(members)) == 2
+	}, 30*time.Second, 100*time.Millisecond)
+
+	version, err := statuses[leader].Store(provider.Versioned[*commonproto.ClusterStatus]{
+		Value:   &commonproto.ClusterStatus{InstanceId: "instance-from-leader"},
+		Version: statuses[leader].Watch().Load().Version,
+	})
+	require.NoError(t, err)
+
+	follower := statuses[1-leader]
+	require.Eventually(t, func() bool {
+		latest := follower.Watch().Load()
+		return latest.Value.GetInstanceId() == "instance-from-leader" && latest.Version == version
+	}, 30*time.Second, 100*time.Millisecond, "the follower's status snapshot follows the log")
 }

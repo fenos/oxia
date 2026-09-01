@@ -91,15 +91,21 @@ func New(ctx context.Context, options *option.Options) (*Factory, error) {
 			return nil, fmt.Errorf("failed to create raft metadata provider: %w", err)
 		}
 		factory.configProvider = raft.NewProvider(ctx, factory.raft, metadatacodec.ClusterConfigCodec, metadatacommon.WatchEnabled)
-		// Raft apply callbacks only drive the config watch today.
-		// Status watch is intentionally unsupported; if we add it later,
-		// this needs to fan out to the status provider too.
+		factory.statusProvider = raft.NewProvider(ctx, factory.raft, metadatacodec.ClusterStatusCodec, metadatacommon.WatchDisabled)
+		// Every applied entry reaches both providers on every node, so a
+		// follower's snapshots follow the log and a follower that wins the
+		// election recovers from the latest state, not the one it started with.
 		configProvider, ok := factory.configProvider.(*raft.Provider[*commonproto.ClusterConfiguration])
 		if !ok {
 			return nil, errors.New("failed to create raft config provider")
 		}
-		factory.raftInterceptor = configProvider
-		factory.statusProvider = raft.NewProvider(ctx, factory.raft, metadatacodec.ClusterStatusCodec, metadatacommon.WatchDisabled)
+		statusProvider, ok := factory.statusProvider.(*raft.Provider[*commonproto.ClusterStatus])
+		if !ok {
+			return nil, errors.New("failed to create raft status provider")
+		}
+		interceptors := &raft.Interceptors{}
+		interceptors.Add(configProvider, statusProvider)
+		factory.raftInterceptor = interceptors
 	default:
 		return nil, errors.New(`must be one of "memory", "configmap", "raft" or "file"`)
 	}
