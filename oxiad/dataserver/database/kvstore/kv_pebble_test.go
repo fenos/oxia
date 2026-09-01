@@ -1280,9 +1280,17 @@ func TestCompareWithDataset(t *testing.T) {
 // invariant builds (the race detector enables them), so the range must
 // be judged before pebble sees it.
 func TestPebbleRangeScanInvertedBoundsIsEmpty(t *testing.T) {
+	for _, sorting := range []proto.KeySortingType{proto.KeySortingType_HIERARCHICAL, proto.KeySortingType_NATURAL} {
+		t.Run(sorting.String(), func(t *testing.T) {
+			testRangeScanInvertedBoundsIsEmpty(t, sorting)
+		})
+	}
+}
+
+func testRangeScanInvertedBoundsIsEmpty(t *testing.T, sorting proto.KeySortingType) {
 	factory, err := NewPebbleKVFactory(NewFactoryOptionsForTest(t))
 	assert.NoError(t, err)
-	kv, err := factory.NewKV(constant.DefaultNamespace, 1, proto.KeySortingType_HIERARCHICAL)
+	kv, err := factory.NewKV(constant.DefaultNamespace, 1, sorting)
 	assert.NoError(t, err)
 
 	wb := kv.NewWriteBatch()
