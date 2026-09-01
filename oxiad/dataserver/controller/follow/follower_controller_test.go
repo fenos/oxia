@@ -347,7 +347,7 @@ func TestFollower_NewTerm(t *testing.T) {
 	// We cannot fence with earlier term
 	fr, err := fc.NewTerm(&proto.NewTermRequest{Term: 0})
 	assert.Nil(t, fr)
-	assert.Equal(t, constant.ErrInvalidTerm, err)
+	assert.ErrorIs(t, err, constant.ErrInvalidTerm)
 	assert.Equal(t, proto.ServingStatus_FENCED, fc.Status())
 	assert.EqualValues(t, 1, fc.Term())
 
@@ -728,7 +728,7 @@ func TestFollowerController_RejectEntriesWithDifferentTerm(t *testing.T) {
 	// Follower will reject the entry because it's from an earlier term
 	err = fc.AppendEntries(stream)
 	assert.Error(t, err)
-	assert.Equal(t, constant.ErrInvalidTerm, err)
+	assert.ErrorIs(t, err, constant.ErrInvalidTerm)
 	assert.Equal(t, proto.ServingStatus_FENCED, fc.Status())
 	assert.EqualValues(t, 5, fc.Term())
 	stream.Cancel()
@@ -758,7 +758,7 @@ func TestFollowerController_RejectEntriesWithDifferentTerm(t *testing.T) {
 	stream.AddRequest(createAddRequest(t, 6, 0, map[string]string{"a": "2", "b": "2"}, wal.InvalidOffset))
 	err = fc.AppendEntries(stream)
 	stream.Cancel()
-	assert.Equal(t, constant.ErrInvalidTerm, err)
+	assert.ErrorIs(t, err, constant.ErrInvalidTerm)
 	assert.Equal(t, proto.ServingStatus_FENCED, fc.Status())
 	assert.EqualValues(t, 5, fc.Term())
 
@@ -794,7 +794,7 @@ func TestFollower_RejectTruncateInvalidTerm(t *testing.T) {
 		},
 	})
 	assert.Nil(t, truncateResp)
-	assert.Equal(t, constant.ErrInvalidTerm, err)
+	assert.ErrorIs(t, err, constant.ErrInvalidTerm)
 	assert.Equal(t, proto.ServingStatus_FENCED, fc.Status())
 	assert.EqualValues(t, 5, fc.Term())
 
@@ -807,7 +807,7 @@ func TestFollower_RejectTruncateInvalidTerm(t *testing.T) {
 		},
 	})
 	assert.Nil(t, truncateResp)
-	assert.Equal(t, constant.ErrInvalidTerm, err)
+	assert.ErrorIs(t, err, constant.ErrInvalidTerm)
 	assert.Equal(t, proto.ServingStatus_FENCED, fc.Status())
 	assert.EqualValues(t, 5, fc.Term())
 }

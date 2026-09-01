@@ -601,6 +601,15 @@ func (e *Election) Start() *proto.DataServerIdentity {
 	}, oxiatime.NewBackOff(e.ctx), func(err error, duration time.Duration) {
 		e.leaderElectionsFailed.Inc()
 		term := e.mutableShardMetadata.GetTerm()
+		if hint, ok := highestTermHint(err); ok && hint > term {
+			// A server is ahead of the metadata — a standalone directory
+			// being adopted, or status lost — and said by how much: the
+			// next attempt fences at its term plus one instead of
+			// counting up.
+			e.logger.Info("Leader election moves to the term a data server reported",
+				slog.Int64("term", term), slog.Int64("reported-term", hint))
+			e.mutableShardMetadata.Term = hint
+		}
 		if errors.Is(err, constant.ErrNotInitialized) {
 			e.logger.Debug(
 				"Leader election is waiting for data server initialization",
@@ -682,4 +691,35 @@ func chooseCandidates(candidatesStatus map[*proto.DataServerIdentity]*proto.Entr
 		}
 	}
 	return candidates
+}
+
+// highestTermHint finds the highest term any rejecting server reported
+// inside err, which may combine one error per ensemble member.
+func highestTermHint(err error) (int64, bool) {
+	var (
+		highest int64
+		found   bool
+	)
+	var walk func(error)
+	walk = func(err error) {
+		if err == nil {
+			return
+		}
+		var invalidTerm constant.InvalidTermError
+		if errors.As(err, &invalidTerm) && (!found || invalidTerm.Current > highest) {
+			highest, found = invalidTerm.Current, true
+		}
+		switch unwrapped := err.(type) { //nolint:errorlint // walking the tree, not matching
+		case interface{ Unwrap() []error }:
+			for _, inner := range unwrapped.Unwrap() {
+				walk(inner)
+			}
+		case interface{ Unwrap() error }:
+			walk(unwrapped.Unwrap())
+		default:
+			// A leaf: nothing beneath it.
+		}
+	}
+	walk(err)
+	return highest, found
 }

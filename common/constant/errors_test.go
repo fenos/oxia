@@ -130,3 +130,23 @@ func TestIsRetryable(t *testing.T) {
 	assert.False(t, IsRetryable(errors.New("other")))
 	assert.False(t, IsRetryable(IntoGrpcStatusError(ErrResourceUnavailable)))
 }
+
+// An invalid-term rejection carries the server's term across the wire, so
+// a caller that lost track of it can move there in one round; the typed
+// error still matches ErrInvalidTerm.
+func TestInvalidTermCarriesTheServersTerm(t *testing.T) {
+	wire := IntoGrpcStatusError(InvalidTermAt(7))
+	translated, metadata := FromGrpcError(wire)
+
+	assert.ErrorIs(t, translated, ErrInvalidTerm)
+	var invalidTerm InvalidTermError
+	assert.ErrorAs(t, translated, &invalidTerm)
+	assert.Equal(t, int64(7), invalidTerm.Current)
+	term, ok := metadata.GetTermHint()
+	assert.True(t, ok)
+	assert.Equal(t, int64(7), term)
+
+	bare, _ := FromGrpcError(IntoGrpcStatusError(ErrInvalidTerm))
+	assert.ErrorIs(t, bare, ErrInvalidTerm)
+	assert.False(t, errors.As(bare, &invalidTerm), "no hint, no typed error")
+}

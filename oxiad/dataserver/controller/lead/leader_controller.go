@@ -284,7 +284,7 @@ func (lc *leaderController) NewTerm(req *proto.NewTermRequest) (*proto.NewTermRe
 
 	currentTerm := lc.term.Load()
 	if req.Term < currentTerm {
-		return nil, constant.ErrInvalidTerm
+		return nil, constant.InvalidTermAt(currentTerm)
 	} else if req.Term == currentTerm && lc.status != proto.ServingStatus_FENCED {
 		// It's OK to receive a duplicate Fence request, for the same term, as long as we haven't moved
 		// out of the Fenced state for that term
