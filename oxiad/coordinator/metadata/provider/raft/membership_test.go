@@ -20,6 +20,8 @@ import (
 	"testing"
 	"time"
 
+	hashicorpraft "github.com/hashicorp/raft"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -270,4 +272,67 @@ func TestFollowerSeesAppliedStatus(t *testing.T) {
 		latest := follower.Watch().Load()
 		return latest.Value.GetInstanceId() == "instance-from-leader" && latest.Version == version
 	}, 30*time.Second, 100*time.Millisecond, "the follower's status snapshot follows the log")
+}
+
+// A leader whose own list no longer names it is retiring — the control
+// move's second roll, where an old peer is told the new group is the
+// externals alone while the others still list everyone. It hands
+// leadership to a listed voter instead of keeping it; whether the new
+// leader's list then removes it is that leader's own rule, so here the
+// stayers keep listing the retiree and the handoff alone is what shows.
+func TestLeaderAbsentFromItsListHandsOff(t *testing.T) {
+	peers := freeAddresses(t, 3)
+	dirs := make([]string, len(peers))
+	for i := range dirs {
+		dirs[i] = filepath.Join(t.TempDir(), "raft")
+	}
+
+	nodes := make([]*Raft, len(peers))
+	for i, addr := range peers {
+		node, err := New(Config{Address: addr, Peers: peers, DataDir: dirs[i], PromotionQuiet: 200 * time.Millisecond}, nil)
+		require.NoError(t, err)
+		nodes[i] = node
+	}
+	leader := leaderOf(t, nodes)
+	require.Eventually(t, func() bool {
+		members, err := nodes[leader].Members()
+		return err == nil && len(voters(members)) == 3
+	}, 30*time.Second, 100*time.Millisecond)
+	for _, node := range nodes {
+		require.NoError(t, node.Close())
+	}
+
+	// The first node restarts absent from its own list; the others still
+	// list everyone.
+	lists := [][]string{peers[1:], peers, peers}
+	restarted := make([]*Raft, len(peers))
+	for i, addr := range peers {
+		node, err := New(Config{Address: addr, Peers: lists[i], DataDir: dirs[i], PromotionQuiet: 200 * time.Millisecond}, nil)
+		require.NoError(t, err)
+		restarted[i] = node
+		t.Cleanup(func() { assert.NoError(t, node.Close()) })
+	}
+	leader = leaderOf(t, restarted)
+
+	// Force the retiring node to lead, so the handoff is what the
+	// assertion exercises.
+	if leader != 0 {
+		require.NoError(t, restarted[leader].node.LeadershipTransferToServer(
+			hashicorpraft.ServerID(peers[0]), hashicorpraft.ServerAddress(peers[0])).Error())
+	}
+	require.Eventually(t, func() bool { return restarted[0].node.State() == hashicorpraft.Leader }, 30*time.Second, 100*time.Millisecond)
+
+	require.Eventually(t, func() bool {
+		return restarted[0].node.State() != hashicorpraft.Leader &&
+			(restarted[1].node.State() == hashicorpraft.Leader || restarted[2].node.State() == hashicorpraft.Leader)
+	}, 30*time.Second, 100*time.Millisecond, "the retiring leader handed leadership to a listed voter")
+
+	// It handed over, it did not leave: the stayers still list it.
+	for _, i := range []int{1, 2} {
+		if restarted[i].node.State() == hashicorpraft.Leader {
+			members, err := restarted[i].Members()
+			require.NoError(t, err)
+			require.Len(t, voters(members), 3)
+		}
+	}
 }

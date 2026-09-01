@@ -16,7 +16,6 @@ package raft
 
 import (
 	"log/slog"
-	"slices"
 	"sync"
 	"time"
 
@@ -72,9 +71,9 @@ func (c Config) validate() error {
 	if len(c.Peers) > 0 && len(c.BootstrapNodes) > 0 {
 		return errors.New("raft peers and bootstrap nodes are mutually exclusive")
 	}
-	if len(c.Peers) > 0 && !slices.Contains(c.Peers, c.Address) {
-		return errors.Errorf("raft address %q is not among the peers", c.Address)
-	}
+	// A node absent from its own list is legal: it is retiring. It founds
+	// nothing and joins nothing, serves the group it already belongs to,
+	// and hands leadership to a listed voter whenever it holds it.
 	return nil
 }
 
@@ -196,6 +195,10 @@ func (m *membership) reconcile(now time.Time) {
 		present[s.ID] = s
 	}
 
+	if !listed[m.self] && m.handOff(servers, listed) {
+		return
+	}
+
 	for _, p := range m.peers {
 		id := hashicorpraft.ServerID(p)
 		if _, ok := present[id]; ok {
@@ -231,6 +234,25 @@ func (m *membership) reconcile(now time.Time) {
 			// A listed voter, or a listed non-voter still proving itself.
 		}
 	}
+}
+
+// handOff is the retiring leader's rule: a leader its own list disowns
+// hands leadership to a listed voter, whose list then removes it, and
+// reports whether it tried. Until a listed voter exists it keeps leading
+// — the listed peers still need adding and promoting, and reconcile
+// never removes the leader itself.
+func (m *membership) handOff(servers []hashicorpraft.Server, listed map[hashicorpraft.ServerID]bool) bool {
+	for _, s := range servers {
+		if s.ID == m.self || !listed[s.ID] || s.Suffrage != hashicorpraft.Voter {
+			continue
+		}
+		m.logger.Info("Handing leadership to a listed voter: this node is not in its own peer list", slog.String("to", string(s.ID)))
+		if err := m.node.LeadershipTransferToServer(s.ID, s.Address).Error(); err != nil {
+			m.logger.Warn("Failed to hand leadership over", slog.String("to", string(s.ID)), slog.Any("error", err))
+		}
+		return true
+	}
+	return false
 }
 
 // reachableSince reports whether id is old enough to promote and answers
