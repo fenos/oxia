@@ -33,5 +33,8 @@
 // [NewStandalone] starts a self-contained single-node server instead, with no
 // replication and no coordinator: the embedded equivalent of the
 // `oxia standalone` command, and the simplest option for tests and
-// single-process deployments.
+// single-process deployments. [StandaloneConfig.Namespaces] gives it several
+// namespaces, each with its own key sorting, laid out on disk exactly as a
+// coordinator would lay them out — so a standalone data directory can later
+// be adopted by a coordinated cluster.
 package dataserver

@@ -27,10 +27,10 @@ import (
 
 	"github.com/oxia-db/oxia/oxiad/common/metric"
 	rpc2 "github.com/oxia-db/oxia/oxiad/common/rpc"
+	"github.com/oxia-db/oxia/oxiad/common/sharding"
 
 	"github.com/oxia-db/oxia/oxiad/dataserver/assignment"
 	"github.com/oxia-db/oxia/oxiad/dataserver/controller"
-	"github.com/oxia-db/oxia/oxiad/dataserver/controller/lead"
 	"github.com/oxia-db/oxia/oxiad/dataserver/database/kvstore"
 	dataserverrpc "github.com/oxia-db/oxia/oxiad/dataserver/rpc"
 
@@ -45,9 +45,50 @@ import (
 type StandaloneConfig struct {
 	DataServerOptions dataserveroption.Options
 
+	// Namespaces to create, in order. Shard IDs are allocated from one
+	// counter across namespaces in this order, exactly as a coordinator
+	// allocates them, so a standalone data directory is a valid cluster
+	// layout. Empty means the single default namespace described by the
+	// fields below.
+	Namespaces []StandaloneNamespace
+
 	NumShards            uint32
 	NotificationsEnabled bool
 	KeySorting           proto.KeySortingType
+}
+
+// StandaloneNamespace describes one namespace of a standalone server.
+type StandaloneNamespace struct {
+	Name                 string
+	Shards               uint32
+	KeySorting           proto.KeySortingType
+	NotificationsEnabled bool
+}
+
+// namespaces resolves the configured namespaces, falling back to the
+// default namespace when none are listed.
+func (c StandaloneConfig) namespaces() []StandaloneNamespace {
+	if len(c.Namespaces) > 0 {
+		return c.Namespaces
+	}
+	return []StandaloneNamespace{{
+		Name:                 constant.DefaultNamespace,
+		Shards:               c.NumShards,
+		KeySorting:           c.KeySorting,
+		NotificationsEnabled: c.NotificationsEnabled,
+	}}
+}
+
+// shards allocates every namespace's shards from one ID counter, in
+// namespace order.
+func (c StandaloneConfig) shards() map[string][]sharding.Shard {
+	shards := make(map[string][]sharding.Shard)
+	var base int64
+	for _, ns := range c.namespaces() {
+		shards[ns.Name] = sharding.GenerateShards(base, ns.Shards)
+		base += int64(ns.Shards)
+	}
+	return shards
 }
 
 type Standalone struct {
@@ -118,11 +159,12 @@ func NewStandalone(config StandaloneConfig) (*Standalone, error) {
 
 	s.shardsDirector = controller.NewShardsDirector(&storageOptions, s.walFactory, s.kvFactory, newNoOpReplicationRpcProvider())
 
-	if err := s.initializeShards(config.NumShards); err != nil {
+	shards := config.shards()
+	if err := s.initializeShards(shards); err != nil {
 		return nil, err
 	}
 
-	s.shardAssignmentDispatcher = assignment.NewStandaloneShardAssignmentDispatcher(config.NumShards)
+	s.shardAssignmentDispatcher = assignment.NewStandaloneShardAssignmentDispatcher(shards)
 	s.healthServer = rpc2.NewClosableHealthServer(context.Background())
 	s.healthServer.SetServingStatus(rpc2.ReadinessProbeService, grpc_health_v1.HealthCheckResponse_SERVING)
 
@@ -152,41 +194,46 @@ func NewStandalone(config StandaloneConfig) (*Standalone, error) {
 	return s, nil
 }
 
-func (s *Standalone) initializeShards(numShards uint32) error {
-	var err error
-
-	newTermOptions := &proto.NewTermOptions{
-		EnableNotifications: s.config.NotificationsEnabled,
-		KeySorting:          s.config.KeySorting,
-	}
-
-	for i := int64(0); i < int64(numShards); i++ {
-		var lc lead.LeaderController
-		if lc, err = s.shardsDirector.GetOrCreateLeader(constant.DefaultNamespace, i, newTermOptions); err != nil {
-			return err
+func (s *Standalone) initializeShards(shards map[string][]sharding.Shard) error {
+	for _, ns := range s.config.namespaces() {
+		newTermOptions := &proto.NewTermOptions{
+			EnableNotifications: ns.NotificationsEnabled,
+			KeySorting:          ns.KeySorting,
 		}
-
-		newTerm := lc.Term() + 1
-
-		if _, err := lc.NewTerm(&proto.NewTermRequest{
-			Shard:   i,
-			Term:    newTerm,
-			Options: newTermOptions,
-		}); err != nil {
-			return err
-		}
-
-		if _, err := lc.BecomeLeader(context.Background(), &proto.BecomeLeaderRequest{
-			Shard:             i,
-			Term:              newTerm,
-			ReplicationFactor: 1,
-			FollowerMaps:      make(map[string]*proto.EntryId),
-		}); err != nil {
-			return err
+		for _, shard := range shards[ns.Name] {
+			if err := s.leadShard(ns.Name, shard.Id, newTermOptions); err != nil {
+				return err
+			}
 		}
 	}
-
 	return nil
+}
+
+// leadShard opens one shard and makes this server its leader for a fresh
+// term; with no replicas there is nobody to fence.
+func (s *Standalone) leadShard(namespace string, shard int64, newTermOptions *proto.NewTermOptions) error {
+	lc, err := s.shardsDirector.GetOrCreateLeader(namespace, shard, newTermOptions)
+	if err != nil {
+		return err
+	}
+
+	newTerm := lc.Term() + 1
+
+	if _, err := lc.NewTerm(&proto.NewTermRequest{
+		Shard:   shard,
+		Term:    newTerm,
+		Options: newTermOptions,
+	}); err != nil {
+		return err
+	}
+
+	_, err = lc.BecomeLeader(context.Background(), &proto.BecomeLeaderRequest{
+		Shard:             shard,
+		Term:              newTerm,
+		ReplicationFactor: 1,
+		FollowerMaps:      make(map[string]*proto.EntryId),
+	})
+	return err
 }
 
 func (s *Standalone) ServiceAddr() string {

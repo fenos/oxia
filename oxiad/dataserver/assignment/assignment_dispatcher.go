@@ -317,16 +317,20 @@ func NewShardAssignmentDispatcher(healthServer oxiadcommonrpc.HealthServer) Shar
 	return s
 }
 
-func NewStandaloneShardAssignmentDispatcher(numShards uint32) ShardAssignmentsDispatcher {
+// NewStandaloneShardAssignmentDispatcher serves a fixed assignment: every
+// shard of every namespace is led by this server, which is the whole
+// cluster.
+func NewStandaloneShardAssignmentDispatcher(namespaces map[string][]sharding.Shard) ShardAssignmentsDispatcher {
 	assignmentDispatcher := NewShardAssignmentDispatcher(oxiadcommonrpc.NewClosableHealthServer(context.Background())).(*shardAssignmentDispatcher) //nolint:revive
 	assignmentDispatcher.standalone = true
 	res := &proto.ShardAssignments{
-		Namespaces: map[string]*proto.NamespaceShardsAssignment{
-			constant.DefaultNamespace: {
-				ShardKeyRouter: proto.ShardKeyRouter_XXHASH3,
-				Assignments:    generateStandaloneShards(numShards),
-			},
-		},
+		Namespaces: make(map[string]*proto.NamespaceShardsAssignment, len(namespaces)),
+	}
+	for namespace, shards := range namespaces {
+		res.Namespaces[namespace] = &proto.NamespaceShardsAssignment{
+			ShardKeyRouter: proto.ShardKeyRouter_XXHASH3,
+			Assignments:    generateStandaloneShards(shards),
+		}
 	}
 
 	err := assignmentDispatcher.updateShardAssignment(res)
@@ -336,9 +340,8 @@ func NewStandaloneShardAssignmentDispatcher(numShards uint32) ShardAssignmentsDi
 	return assignmentDispatcher
 }
 
-func generateStandaloneShards(numShards uint32) []*proto.ShardAssignment {
-	shards := sharding.GenerateShards(0, numShards)
-	assignments := make([]*proto.ShardAssignment, numShards)
+func generateStandaloneShards(shards []sharding.Shard) []*proto.ShardAssignment {
+	assignments := make([]*proto.ShardAssignment, len(shards))
 	for i, shard := range shards {
 		assignments[i] = &proto.ShardAssignment{
 			Shard: shard.Id,
