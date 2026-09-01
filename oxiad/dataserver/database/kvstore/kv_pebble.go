@@ -681,6 +681,9 @@ func (p *Pebble) KeyRangeScanReverse(lowerBound, upperBound string, itOpts Itera
 	if upperBound != "" {
 		ub = p.keyEncoder.Encode(upperBound)
 	}
+	if invertedRange(lb, ub) {
+		return emptyIterator{}, nil
+	}
 	pbit, err := p.db.NewIter(newIterOptions(p.keyEncoder, itOpts, lb, ub))
 	if err != nil {
 		return nil, err
@@ -701,6 +704,9 @@ func (p *Pebble) RangeScan(lowerBound, upperBound string, itOpts IteratorOpts) (
 		ub = p.keyEncoder.Encode(upperBound)
 	}
 
+	if invertedRange(lb, ub) {
+		return emptyIterator{}, nil
+	}
 	pbit, err := p.db.NewIter(newIterOptions(p.keyEncoder, itOpts, lb, ub))
 	if err != nil {
 		return nil, err
@@ -1348,3 +1354,24 @@ func (s internalRegionSkipper) backward(it *pebble.Iterator) bool {
 	}
 	return it.SeekLT(s.start)
 }
+
+// invertedRange reports a bounded range that holds nothing: a lower bound
+// at or past the upper bound. Encoded keys order bytewise. Pebble leaves an
+// iterator with such bounds undefined and asserts on it in invariant builds,
+// so the range is judged here instead.
+func invertedRange(lowerBound, upperBound []byte) bool {
+	return lowerBound != nil && upperBound != nil && bytes.Compare(lowerBound, upperBound) >= 0
+}
+
+// emptyIterator is the scan of a range that holds nothing.
+type emptyIterator struct{}
+
+func (emptyIterator) Close() error           { return nil }
+func (emptyIterator) Valid() bool            { return false }
+func (emptyIterator) Key() string            { return "" }
+func (emptyIterator) Prev() bool             { return false }
+func (emptyIterator) Next() bool             { return false }
+func (emptyIterator) SeekGE(string) bool     { return false }
+func (emptyIterator) SeekLT(string) bool     { return false }
+func (emptyIterator) Error() error           { return nil }
+func (emptyIterator) Value() ([]byte, error) { return nil, ErrKeyNotFound }
