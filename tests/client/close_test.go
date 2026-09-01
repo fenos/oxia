@@ -28,11 +28,19 @@ import (
 	"github.com/oxia-db/oxia/oxiad/dataserver"
 )
 
-// goroutinesRunning reports whether any goroutine's stack mentions fn.
-func goroutinesRunning(fn string) bool {
+// goroutinesRunning counts the goroutines whose stack mentions fn. Other
+// tests' clients may be running in the same process, so callers compare
+// against a baseline rather than expecting zero.
+func goroutinesRunning(fn string) int {
 	var buf bytes.Buffer
-	_ = pprof.Lookup("goroutine").WriteTo(&buf, 1)
-	return strings.Contains(buf.String(), fn)
+	_ = pprof.Lookup("goroutine").WriteTo(&buf, 2)
+	n := 0
+	for _, stack := range strings.Split(buf.String(), "\n\n") {
+		if strings.Contains(stack, fn) {
+			n++
+		}
+	}
+	return n
 }
 
 // Closing a client ends its shard-assignment stream: the goroutine that
@@ -43,13 +51,14 @@ func TestCloseStopsShardAssignmentReceiver(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { assert.NoError(t, standalone.Close()) })
 
+	const receiver = "shardManagerImpl).receiveWithRecovery"
+	baseline := goroutinesRunning(receiver)
+
 	client, err := oxia.NewSyncClient(standalone.ServiceAddr())
 	require.NoError(t, err)
-
-	const receiver = "shardManagerImpl).receiveWithRecovery"
-	require.True(t, goroutinesRunning(receiver), "the receiver runs while the client is open")
+	require.Equal(t, baseline+1, goroutinesRunning(receiver), "the receiver runs while the client is open")
 
 	require.NoError(t, client.Close())
-	require.Eventually(t, func() bool { return !goroutinesRunning(receiver) },
+	require.Eventually(t, func() bool { return goroutinesRunning(receiver) == baseline },
 		5*time.Second, 50*time.Millisecond, "the receiver ends with the client")
 }
