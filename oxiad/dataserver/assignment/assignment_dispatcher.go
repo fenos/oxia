@@ -314,17 +314,28 @@ func NewShardAssignmentDispatcher(healthServer oxiadcommonrpc.HealthServer) Shar
 	return s
 }
 
-func NewStandaloneShardAssignmentDispatcher(numShards uint32, keySorting proto.KeySortingType) ShardAssignmentsDispatcher {
+// StandaloneNamespace is one namespace of a standalone assignment: its shards
+// and the order of the keys in them.
+type StandaloneNamespace struct {
+	KeySorting proto.KeySortingType
+	Shards     []sharding.Shard
+}
+
+// NewStandaloneShardAssignmentDispatcher serves a fixed assignment: every
+// shard of every namespace is led by this server, which is the whole
+// cluster.
+func NewStandaloneShardAssignmentDispatcher(namespaces map[string]StandaloneNamespace) ShardAssignmentsDispatcher {
 	assignmentDispatcher := NewShardAssignmentDispatcher(oxiadcommonrpc.NewClosableHealthServer(context.Background())).(*shardAssignmentDispatcher) //nolint:revive
 	assignmentDispatcher.standalone = true
 	res := &proto.ShardAssignments{
-		Namespaces: map[string]*proto.NamespaceShardsAssignment{
-			constant.DefaultNamespace: {
-				ShardKeyRouter: proto.ShardKeyRouter_XXHASH3,
-				KeySorting:     keySorting.ToKeySorting(),
-				Assignments:    generateStandaloneShards(numShards),
-			},
-		},
+		Namespaces: make(map[string]*proto.NamespaceShardsAssignment, len(namespaces)),
+	}
+	for name, namespace := range namespaces {
+		res.Namespaces[name] = &proto.NamespaceShardsAssignment{
+			ShardKeyRouter: proto.ShardKeyRouter_XXHASH3,
+			KeySorting:     namespace.KeySorting.ToKeySorting(),
+			Assignments:    generateStandaloneShards(namespace.Shards),
+		}
 	}
 
 	err := assignmentDispatcher.updateShardAssignment(res)
@@ -334,9 +345,8 @@ func NewStandaloneShardAssignmentDispatcher(numShards uint32, keySorting proto.K
 	return assignmentDispatcher
 }
 
-func generateStandaloneShards(numShards uint32) []*proto.ShardAssignment {
-	shards := sharding.GenerateShards(0, numShards)
-	assignments := make([]*proto.ShardAssignment, numShards)
+func generateStandaloneShards(shards []sharding.Shard) []*proto.ShardAssignment {
+	assignments := make([]*proto.ShardAssignment, len(shards))
 	for i, shard := range shards {
 		assignments[i] = &proto.ShardAssignment{
 			Shard: shard.Id,

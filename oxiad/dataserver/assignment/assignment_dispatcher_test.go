@@ -29,6 +29,7 @@ import (
 	pb "google.golang.org/protobuf/proto"
 
 	oxiadcommonrpc "github.com/oxia-db/oxia/oxiad/common/rpc"
+	"github.com/oxia-db/oxia/oxiad/common/sharding"
 
 	"github.com/oxia-db/oxia/common/constant"
 	"github.com/oxia-db/oxia/common/rpc"
@@ -47,7 +48,9 @@ func TestUninitializedAssignmentDispatcher(t *testing.T) {
 }
 
 func TestShardAssignmentDispatcher_StandaloneRegisterWithoutAuthority(t *testing.T) {
-	dispatcher := NewStandaloneShardAssignmentDispatcher(1, proto.KeySortingType_UNKNOWN)
+	dispatcher := NewStandaloneShardAssignmentDispatcher(map[string]StandaloneNamespace{
+		constant.DefaultNamespace: {Shards: sharding.GenerateShards(0, 1)},
+	})
 
 	// The standalone dispatcher sends the client's own authority as the leader,
 	// so it rejects a client stream that carries no authority
