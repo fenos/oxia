@@ -352,6 +352,9 @@ func (management *managementServer) PatchNamespace(_ context.Context, req *proto
 		return nil, grpcstatus.Errorf(codes.Internal, "failed to patch namespace %q: %v", req.Namespace.GetName(), err)
 	}
 
+	// A patched replication factor changes what its shards' ensembles should
+	// be; the balancer grows them on its next cycle, prompted now.
+	runtime.RecomputeAssignments()
 	return &proto.PatchNamespaceResponse{
 		Namespace: namespace,
 	}, nil

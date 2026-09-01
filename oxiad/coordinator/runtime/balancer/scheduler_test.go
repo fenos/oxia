@@ -23,6 +23,7 @@ import (
 
 	"github.com/emirpasic/gods/v2/sets/linkedhashset"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	commonobject "github.com/oxia-db/oxia/common/object"
 	"github.com/oxia-db/oxia/common/proto"
@@ -645,5 +646,71 @@ func TestBalanceHighestNodeDoesNotHangOnSelectorError(t *testing.T) {
 		// Success: rebalanceEnsemble completed
 	case <-time.After(3 * time.Second):
 		t.Fatal("rebalanceEnsemble hung due to infinite loop on selector error")
+	}
+}
+
+// pickFirstSelector takes the first candidate offered and keeps every
+// context it was asked with.
+type pickFirstSelector struct {
+	contexts []*single.Context
+}
+
+func (s *pickFirstSelector) Select(ctx *single.Context) (string, error) {
+	s.contexts = append(s.contexts, ctx)
+	values := ctx.Candidates.Values()
+	if len(values) == 0 {
+		return "", selector.ErrUnsatisfiedEnsembleReplicas
+	}
+	return values[0], nil
+}
+
+// A namespace whose replication factor exceeds its shards' ensembles grows
+// them: every steady, short ensemble gets one member per cycle, chosen
+// among the nodes it does not have yet; a shard mid-election is left alone.
+func TestGrowEnsemblesTowardTheReplicationFactor(t *testing.T) {
+	sv1, sv2, sv3 := dataServer("sv-1"), dataServer("sv-2"), dataServer("sv-3")
+	status := &proto.ClusterStatus{
+		Namespaces: map[string]*proto.NamespaceStatus{
+			"grow": {
+				ReplicationFactor: 1,
+				Shards: map[int64]*proto.ShardMetadata{
+					0: {Status: proto.ShardStatusSteadyState, Ensemble: []*proto.DataServerIdentity{sv1}},
+					1: {Status: proto.ShardStatusSteadyState, Ensemble: []*proto.DataServerIdentity{sv1, sv2}},
+					2: {Status: proto.ShardStatusElection, Ensemble: []*proto.DataServerIdentity{sv1}},
+				},
+			},
+		},
+	}
+	metadata := &mockMetadata{
+		status:    status,
+		nodes:     linkedhashset.New("sv-1", "sv-2", "sv-3"),
+		metadata:  map[string]*proto.DataServerMetadata{},
+		nsConfigs: map[string]*proto.Namespace{"grow": {Name: "grow", ReplicationFactor: 3}},
+		nodeMap:   map[string]*proto.DataServerIdentity{"sv-1": sv1, "sv-2": sv2, "sv-3": sv3},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	sel := &pickFirstSelector{}
+	b := newTestBalancer(ctx, cancel, metadata, sel)
+
+	group := &sync.WaitGroup{}
+	b.growEnsembles(group)
+
+	require.Len(t, b.actionCh, 2, "one growth per short steady shard")
+	grown := map[int64]string{}
+	for range 2 {
+		ac := <-b.actionCh
+		grow, ok := ac.(*action.ChangeEnsembleAction)
+		require.True(t, ok)
+		assert.Nil(t, grow.From, "growth removes nobody")
+		require.NotNil(t, grow.To)
+		grown[grow.Shard] = grow.To.GetNameOrDefault()
+		grow.Done(nil)
+	}
+	group.Wait()
+	assert.Equal(t, "sv-2", grown[0], "shard 0 has sv-1; the first node it lacks is sv-2")
+	assert.Equal(t, "sv-3", grown[1], "shard 1 has sv-1 and sv-2; only sv-3 is left")
+	for _, c := range sel.contexts {
+		assert.False(t, c.Candidates.Contains("sv-1"), "a member is never offered as the new member")
 	}
 }

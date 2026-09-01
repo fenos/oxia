@@ -412,20 +412,21 @@ func (s *controller) validateChangeEnsembleFeatures(changeEnsembleAction *action
 		"bug: shard metadata missing while validating change ensemble: namespace=", s.namespace, " shard=",
 		s.shard).UnsafeBorrow()
 
-	if changeEnsembleAction.From == nil {
-		return fmt.Errorf("%w: from data server is nil", ErrInvalidChangeEnsemble)
-	}
 	if changeEnsembleAction.To == nil {
 		return fmt.Errorf("%w: to data server is nil", ErrInvalidChangeEnsemble)
 	}
-	source := changeEnsembleAction.From.GetNameOrDefault()
 	target := changeEnsembleAction.To.GetNameOrDefault()
 	ensembleSize := len(shardMeta.Ensemble)
-	targetEnsemble := slices.DeleteFunc(slices.Clone(shardMeta.Ensemble), func(dataServer *proto.DataServerIdentity) bool {
-		return dataServer.GetNameOrDefault() == source
-	})
-	if len(targetEnsemble) != ensembleSize-1 {
-		return fmt.Errorf("%w: source data server %q must appear exactly once in the current ensemble", ErrInvalidChangeEnsemble, source)
+	// No source means growth: the target joins, nobody leaves.
+	targetEnsemble := slices.Clone(shardMeta.Ensemble)
+	if changeEnsembleAction.From != nil {
+		source := changeEnsembleAction.From.GetNameOrDefault()
+		targetEnsemble = slices.DeleteFunc(targetEnsemble, func(dataServer *proto.DataServerIdentity) bool {
+			return dataServer.GetNameOrDefault() == source
+		})
+		if len(targetEnsemble) != ensembleSize-1 {
+			return fmt.Errorf("%w: source data server %q must appear exactly once in the current ensemble", ErrInvalidChangeEnsemble, source)
+		}
 	}
 	ensembleWithoutTarget := slices.DeleteFunc(slices.Clone(shardMeta.Ensemble), func(dataServer *proto.DataServerIdentity) bool {
 		return dataServer.GetNameOrDefault() == target

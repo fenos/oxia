@@ -424,7 +424,7 @@ func (e *Election) fencingFailedFollowers(term int64, ensemble []*proto.DataServ
 func (e *Election) prepareIfChangeEnsemble(mutShardMeta *proto.ShardMetadata) {
 	from := e.changeEnsembleAction.From
 	to := e.changeEnsembleAction.To
-	if !slices.ContainsFunc(mutShardMeta.RemovedNodes, func(server *proto.DataServerIdentity) bool {
+	if from != nil && !slices.ContainsFunc(mutShardMeta.RemovedNodes, func(server *proto.DataServerIdentity) bool {
 		return server.GetNameOrDefault() == from.GetNameOrDefault()
 	}) {
 		mutShardMeta.RemovedNodes = append(mutShardMeta.RemovedNodes, from)
@@ -434,8 +434,9 @@ func (e *Election) prepareIfChangeEnsemble(mutShardMeta *proto.ShardMetadata) {
 	mutShardMeta.PendingDeleteShardNodes = slices.DeleteFunc(mutShardMeta.PendingDeleteShardNodes, func(dataServer *proto.DataServerIdentity) bool {
 		return dataServer.GetNameOrDefault() == to.GetNameOrDefault()
 	})
+	// No source means growth: the target joins, nobody leaves.
 	mutShardMeta.Ensemble = append(slices.DeleteFunc(mutShardMeta.Ensemble, func(dataServer *proto.DataServerIdentity) bool {
-		return dataServer.GetNameOrDefault() == from.GetNameOrDefault()
+		return from != nil && dataServer.GetNameOrDefault() == from.GetNameOrDefault()
 	}), to)
 	e.logger.Info(
 		"Changing ensemble",

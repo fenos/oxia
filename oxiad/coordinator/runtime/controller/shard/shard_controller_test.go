@@ -1208,7 +1208,6 @@ func TestController_ChangeEnsembleRejectsInvalidAction(t *testing.T) {
 		from *proto.DataServerIdentity
 		to   *proto.DataServerIdentity
 	}{
-		{name: "nil from", from: nil, to: s4},
 		{name: "nil to", from: s1, to: nil},
 		{name: "missing from", from: s4, to: s5},
 		{name: "duplicate to", from: s1, to: s2},
@@ -1412,6 +1411,55 @@ func TestController_ElectionMovesAboveAWrittenTerm(t *testing.T) {
 	}, 10*time.Second, 100*time.Millisecond)
 	assert.EqualValues(t, 1, shardTerm(metadata, constant.DefaultNamespace, shard), "one above the written term, never equal to it")
 	assertShardLeader(t, metadata, constant.DefaultNamespace, shard, s1)
+
+	assert.NoError(t, sc.Close())
+}
+
+// An ensemble change with no source grows the ensemble: the new member is
+// fenced into the next term alongside the old ones and the leader takes
+// the wider replication factor — how a namespace whose replication factor
+// was raised reaches it, one member at a time.
+func TestController_ChangeEnsembleWithoutSourceGrowsTheEnsemble(t *testing.T) {
+	var shard int64 = 5
+	rpc := mockutils.NewRpcProvider()
+	s1 := &proto.DataServerIdentity{Public: "s1:9091", Internal: "s1:8191"}
+	s2 := &proto.DataServerIdentity{Public: "s2:9091", Internal: "s2:8191"}
+	metadata := newTestMetadata(t, memory.NewProvider(metadatacodec.ClusterStatusCodec, metadatacommon.WatchDisabled, ""), &proto.ClusterConfiguration{})
+
+	sc := newTestController(t, metadata, constant.DefaultNamespace, shard, namespaceConfig, &proto.ShardMetadata{
+		Status:   proto.ShardStatusUnknown,
+		Term:     1,
+		Leader:   nil,
+		Ensemble: []*proto.DataServerIdentity{s1},
+	}, NoOpSupportedFeaturesSupplier, rpc, DefaultPeriodicTasksInterval)
+
+	rpc.GetNode(s1).NewTermResponse(1, 0, nil)
+	rpc.GetNode(s1).BecomeLeaderResponse(nil)
+	rpc.GetNode(s1).ExpectNewTermRequest(t, shard, 2, true)
+	rpc.GetNode(s1).ExpectBecomeLeaderRequest(t, shard, 2, 1)
+	assert.Eventually(t, func() bool {
+		return shardStatus(metadata, constant.DefaultNamespace, shard) == proto.ShardStatusSteadyState
+	}, 10*time.Second, 100*time.Millisecond)
+
+	rpc.GetNode(s1).NewTermResponse(2, 5, nil)
+	rpc.GetNode(s2).NewTermResponse(2, -1, nil)
+	rpc.GetNode(s1).BecomeLeaderResponse(nil)
+
+	grow := action.NewChangeEnsembleAction(shard, nil, s2)
+	sc.ChangeEnsemble(grow)
+
+	rpc.GetNode(s1).ExpectNewTermRequest(t, shard, 3, true)
+	rpc.GetNode(s2).ExpectNewTermRequest(t, shard, 3, true)
+	rpc.GetNode(s1).ExpectBecomeLeaderRequest(t, shard, 3, 2)
+
+	_, err := grow.Wait()
+	require.NoError(t, err)
+	assert.Eventually(t, func() bool {
+		return shardStatus(metadata, constant.DefaultNamespace, shard) == proto.ShardStatusSteadyState
+	}, 10*time.Second, 100*time.Millisecond)
+	borrowed, _ := metadata.GetShardStatus(constant.DefaultNamespace, shard)
+	assert.Len(t, borrowed.UnsafeBorrow().GetEnsemble(), 2, "the ensemble grew by the new member")
+	assert.Empty(t, borrowed.UnsafeBorrow().GetRemovedNodes(), "growth removes nobody")
 
 	assert.NoError(t, sc.Close())
 }

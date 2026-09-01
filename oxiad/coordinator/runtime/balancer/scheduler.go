@@ -142,6 +142,7 @@ func (r *nodeBasedBalancer) rebalanceEnsemble() bool {
 	}()
 
 	r.cleanDeletedNode(loadRatios, candidates, metadata, swapGroup)
+	r.growEnsembles(swapGroup)
 
 	if loadRatios.RatioGap() <= loadRatios.AvgShardLoadRatio() {
 		return true
@@ -569,4 +570,111 @@ func NewLoadBalancer(options Options) LoadBalancer {
 		shardQuarantineShardMap: &sync.Map{},
 		triggerCh:               make(chan any, 1),
 	}
+}
+
+// growEnsembles brings every steady shard whose ensemble is short of its
+// namespace's replication factor one member closer, one election per shard
+// per cycle: a raised replication factor reaches its shards through here.
+// The new member is placed the way a swap's target is — by the selector,
+// among the nodes the shard does not have yet.
+func (r *nodeBasedBalancer) growEnsembles(group *sync.WaitGroup) {
+	candidates, metadata := dataServersToCandidatesAndMetadata(r.metadata.ListDataServer())
+	for name, borrowedStatus := range r.metadata.ListNamespaceStatus() {
+		borrowedConfig, exist := r.metadata.GetNamespace(name)
+		if !exist {
+			continue
+		}
+		config := borrowedConfig.UnsafeBorrow()
+		for shardID, shard := range borrowedStatus.UnsafeBorrow().GetShards() {
+			if !shortOfReplicas(shard, int(config.GetReplicationFactor())) {
+				continue
+			}
+			if err := r.growShard(name, shardID, shard, config, candidates, metadata, group); err != nil {
+				r.logger.Warn("failed to grow the shard's ensemble",
+					slog.String("namespace", name), slog.Int64("shard", shardID), slog.Any("error", err))
+			}
+		}
+	}
+}
+
+// growRetryDelay spaces the cycles that follow a failed growth — a member
+// not ready to join yet — so a shard is not proposed in a tight loop.
+const growRetryDelay = time.Second
+
+// triggerAfter prompts a cycle after delay, unless the balancer is closing.
+func (r *nodeBasedBalancer) triggerAfter(delay time.Duration) {
+	time.AfterFunc(delay, func() {
+		if r.ctx.Err() == nil {
+			r.Trigger()
+		}
+	})
+}
+
+// shortOfReplicas reports a shard that can take another member: steady,
+// not splitting, and below the replication factor.
+func shortOfReplicas(shard *commonproto.ShardMetadata, replicationFactor int) bool {
+	return shard.GetStatusOrDefault() == commonproto.ShardStatusSteadyState &&
+		shard.GetSplit() == nil &&
+		len(shard.GetEnsemble()) < replicationFactor
+}
+
+func (r *nodeBasedBalancer) growShard(
+	namespace string,
+	shardID int64,
+	shard *commonproto.ShardMetadata,
+	config *commonproto.Namespace,
+	candidates *linkedhashset.Set[string],
+	metadata map[string]*commonproto.DataServerMetadata,
+	group *sync.WaitGroup,
+) error {
+	members := linkedhashset.New[string]()
+	for _, member := range shard.GetEnsemble() {
+		members.Add(member.GetNameOrDefault())
+	}
+	free := linkedhashset.New[string]()
+	for _, candidate := range candidates.Values() {
+		if !members.Contains(candidate) {
+			free.Add(candidate)
+		}
+	}
+	if free.Size() == 0 {
+		return nil // nobody to add yet; the next cycle will see new nodes
+	}
+	sContext := &single.Context{
+		Candidates:         free,
+		CandidatesMetadata: metadata,
+		AntiAffinities:     config.GetAntiAffinities(),
+		Namespace:          namespace,
+		Shard:              shardID,
+		LoadRatioSupplier:  func() *model.Ratio { return nil },
+	}
+	sContext.SetSelected(members)
+	targetNodeID, err := r.selector.Select(sContext)
+	if err != nil {
+		return err
+	}
+	borrowedTargetNode, exist := r.metadata.GetDataServer(targetNodeID)
+	if !exist {
+		return errors.New("target node does not exist")
+	}
+	targetNode := borrowedTargetNode.UnsafeBorrow().GetIdentity()
+	if targetNode == nil {
+		return errors.New("target node does not have identity")
+	}
+	r.logger.Info("propose to grow the shard's ensemble",
+		slog.String("namespace", namespace), slog.Int64("shard", shardID), slog.Any("to", targetNodeID))
+	group.Add(1)
+	r.actionCh <- action.NewChangeEnsembleActionWithCallback(shardID, nil, targetNode,
+		concurrent.NewOnce(func(_ any) {
+			// One member joined; the shard may still be short. Growth is
+			// one member per cycle, so ask for the next cycle now.
+			group.Done()
+			r.triggerAfter(0)
+		}, func(_ error) {
+			// Not ready to join yet — the new member has not handshaked, or
+			// the shard is between elections; try again shortly.
+			group.Done()
+			r.triggerAfter(growRetryDelay)
+		}))
+	return nil
 }
