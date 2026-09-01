@@ -17,6 +17,7 @@ package coordinator
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"sync"
@@ -161,12 +162,16 @@ func NewGrpcServer(parent context.Context, optionsWatch *commonwatch.Watch[*opti
 			return
 		}
 
-		err = multierr.Append(err, commonio.CloseIfNotNil(metricsServer))
+		if metricsServer != nil { // a typed nil would pass CloseIfNotNil's check and be closed
+			err = multierr.Append(err, metricsServer.Close())
+		}
 		err = multierr.Append(err, commonio.CloseIfNotNil(managementGrpcServer))
 		err = multierr.Append(err, commonio.CloseIfNotNil(reconciler))
 		err = multierr.Append(err, commonio.CloseIfNotNil(runtime))
 		err = multierr.Append(err, commonio.CloseIfNotNil(metadata))
-		err = multierr.Append(err, commonio.CloseIfNotNil(metadataFactory))
+		if metadataFactory != nil { // a pointer, like the metrics server: check it as one
+			err = multierr.Append(err, metadataFactory.Close())
+		}
 		err = multierr.Append(err, commonio.CloseIfNotNil(grpcServer))
 	}()
 
@@ -210,8 +215,16 @@ func NewGrpcServer(parent context.Context, optionsWatch *commonwatch.Watch[*opti
 		return nil, err
 	}
 
+	// Waiting for the leadership can last as long as another coordinator
+	// leads. The parent context bounds the start: cancelling it closes the
+	// metadata factory, which ends the wait with an error.
+	stopCancelWatch := context.AfterFunc(parent, func() { _ = metadataFactory.Close() })
 	var leadershipLost <-chan struct{}
 	leadershipLost, err = metadata.WaitToBecomeLeader()
+	if !stopCancelWatch() {
+		// The parent was cancelled while waiting; the factory is closing.
+		return nil, fmt.Errorf("coordinator start cancelled while waiting for leadership: %w", parent.Err())
+	}
 	if err != nil {
 		return nil, err
 	}
