@@ -50,6 +50,7 @@ type ServerOption func(*serverOptions)
 
 type serverOptions struct {
 	onLeadershipLost     func()
+	onMetadata           func(*coordmetadata.Factory)
 	initialClusterConfig *proto.ClusterConfiguration
 }
 
@@ -61,6 +62,12 @@ func newServerOptions(serverOpts []ServerOption) serverOptions {
 		}
 	}
 	return so
+}
+
+func (so *serverOptions) handMetadata(metadataFactory *coordmetadata.Factory) {
+	if so.onMetadata != nil {
+		so.onMetadata(metadataFactory)
+	}
 }
 
 func (so *serverOptions) seedClusterConfig(metadataFactory *coordmetadata.Factory) error {
@@ -95,6 +102,15 @@ func WithOnLeadershipLost(handler func()) ServerOption {
 // cluster programmatically, without a cluster configuration file or a
 // separate admin call. If a configuration is already present it is left
 // untouched.
+// WithOnMetadata hands the metadata factory to handler as soon as it
+// exists — before the wait for leadership, so a follower's caller can
+// read the raft membership too. A nil handler is ignored.
+func WithOnMetadata(handler func(*coordmetadata.Factory)) ServerOption {
+	return func(so *serverOptions) {
+		so.onMetadata = handler
+	}
+}
+
 func WithInitialClusterConfiguration(config *proto.ClusterConfiguration) ServerOption {
 	return func(so *serverOptions) {
 		so.initialClusterConfig = config
@@ -193,6 +209,7 @@ func NewGrpcServer(parent context.Context, optionsWatch *commonwatch.Watch[*opti
 	if err != nil {
 		return nil, err
 	}
+	so.handMetadata(metadataFactory)
 	metadata, err = metadataFactory.CreateMetadata(parent)
 	if err != nil {
 		return nil, err

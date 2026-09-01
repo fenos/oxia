@@ -45,6 +45,15 @@ type Factory struct {
 	raftInterceptor raft.Interceptor
 }
 
+// Membership is the raft group behind this coordinator's metadata, on the
+// raft provider; false on every other provider.
+func (f *Factory) Membership() (raft.Membership, bool) {
+	if f.raft == nil {
+		return nil, false
+	}
+	return f.raft, true
+}
+
 func (f *Factory) OnApplied(key string, data []byte, version int64) {
 	if f.raftInterceptor == nil {
 		return

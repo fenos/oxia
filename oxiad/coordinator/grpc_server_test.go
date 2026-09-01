@@ -26,6 +26,7 @@ import (
 
 	"github.com/oxia-db/oxia/common/constant"
 	"github.com/oxia-db/oxia/common/proto"
+	coordmetadata "github.com/oxia-db/oxia/oxiad/coordinator/metadata"
 	"github.com/oxia-db/oxia/oxiad/coordinator/option"
 )
 
@@ -95,4 +96,43 @@ func TestNewReturnsWhenStartIsCancelledWhileWaitingForLeadership(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("New did not return after its context was cancelled")
 	}
+}
+
+// The metadata factory reaches the caller as soon as it exists — before
+// the wait for leadership — and on the raft provider carries the group's
+// membership: a founder alone sees itself as the one voter and leader.
+func TestNewHandsTheMetadataFactoryToTheHook(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	self := listener.Addr().String()
+	require.NoError(t, listener.Close())
+
+	options := option.NewDefaultOptions()
+	options.Server.Public.BindAddress = "127.0.0.1:0"
+	options.Server.Internal.BindAddress = "127.0.0.1:0"
+	options.Observability.Metric.Enabled = &constant.FlagFalse
+	options.Metadata.ProviderName = option.ProviderRaft
+	options.Metadata.Name = self
+	options.Metadata.Raft.Address = self
+	options.Metadata.Raft.Peers = []string{self}
+	options.Metadata.Raft.DataDir = filepath.Join(t.TempDir(), "raft")
+
+	handed := make(chan *coordmetadata.Factory, 1)
+	server, err := New(t.Context(), options, WithOnMetadata(func(f *coordmetadata.Factory) { handed <- f }))
+	require.NoError(t, err)
+	defer func() { require.NoError(t, server.Close()) }()
+
+	var factory *coordmetadata.Factory
+	select {
+	case factory = <-handed:
+	default:
+		t.Fatal("the factory was not handed over before New returned")
+	}
+
+	membership, ok := factory.Membership()
+	require.True(t, ok, "the raft provider carries a membership")
+	require.Eventually(t, func() bool {
+		members, err := membership.Members()
+		return err == nil && len(members) == 1 && members[0].Address == self && members[0].Voter && membership.LeaderID() == self
+	}, 30*time.Second, 100*time.Millisecond)
 }

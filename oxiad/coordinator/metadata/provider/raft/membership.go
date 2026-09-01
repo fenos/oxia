@@ -59,6 +59,13 @@ type Member struct {
 	Voter   bool
 }
 
+// Membership is the raft group as one node sees it — what an operator
+// reads to know when the group's new peers vote and who leads.
+type Membership interface {
+	Members() ([]Member, error)
+	LeaderID() string
+}
+
 const (
 	reconcileInterval       = time.Second
 	membershipChangeTimeout = 10 * time.Second
