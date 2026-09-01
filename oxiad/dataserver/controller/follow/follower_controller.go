@@ -360,7 +360,7 @@ func (fc *followerController) NewTerm(req *proto.NewTermRequest) (*proto.NewTerm
 	newTermOptions := req.GetOptions()
 	if newTerm < fc.term.Load() { // Allowing idempotency during negotiations
 		fc.log.Warn("Failed to fence with invalid term", slog.Int64("current-term", fc.term.Load()), slog.Int64("new-term", newTerm))
-		return nil, constant.ErrInvalidTerm
+		return nil, constant.InvalidTermAt(fc.term.Load())
 	}
 	fc.rwMutex.Lock()
 	defer fc.rwMutex.Unlock()
@@ -370,7 +370,7 @@ func (fc *followerController) NewTerm(req *proto.NewTermRequest) (*proto.NewTerm
 	}
 
 	if newTerm < fc.term.Load() { // double-check after lock
-		return nil, constant.ErrInvalidTerm
+		return nil, constant.InvalidTermAt(fc.term.Load())
 	}
 
 	if unsupported := feature.Unsupported(newTermOptions.GetFeatures()); len(unsupported) > 0 {
