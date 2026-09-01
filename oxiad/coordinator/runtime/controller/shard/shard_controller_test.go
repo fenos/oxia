@@ -1379,3 +1379,39 @@ func TestController_DeleteShardAllowsNilEventListener(t *testing.T) {
 	assert.False(t, exists)
 	assert.True(t, s.terminating.Load())
 }
+
+// A coordinator whose status is empty elects at term 0; a member whose log
+// already holds entries of term 0 answers the fence with that head. Leading
+// again under a term that was written to corrupts the log, so the election
+// moves above it and fences at term 1 instead.
+func TestController_ElectionMovesAboveAWrittenTerm(t *testing.T) {
+	var shard int64 = 5
+	rpc := mockutils.NewRpcProvider()
+	s1 := &proto.DataServerIdentity{Public: "s1:9091", Internal: "s1:8191"}
+	metadata := newTestMetadata(t, memory.NewProvider(metadatacodec.ClusterStatusCodec, metadatacommon.WatchDisabled, ""), &proto.ClusterConfiguration{})
+
+	sc := newTestController(t, metadata, constant.DefaultNamespace, shard, namespaceConfig, &proto.ShardMetadata{
+		Status:   proto.ShardStatusUnknown,
+		Term:     -1,
+		Leader:   nil,
+		Ensemble: []*proto.DataServerIdentity{s1},
+	}, NoOpSupportedFeaturesSupplier, rpc, DefaultPeriodicTasksInterval)
+
+	// The member's log was written under term 0 (offset 3) by a leadership
+	// this coordinator never saw; it reports the same head to both fences.
+	rpc.GetNode(s1).NewTermResponse(0, 3, nil)
+	rpc.GetNode(s1).NewTermResponse(0, 3, nil)
+	rpc.GetNode(s1).BecomeLeaderResponse(nil)
+
+	rpc.GetNode(s1).ExpectNewTermRequest(t, shard, 0, true)
+	rpc.GetNode(s1).ExpectNewTermRequest(t, shard, 1, true)
+	rpc.GetNode(s1).ExpectBecomeLeaderRequest(t, shard, 1, 1)
+
+	assert.Eventually(t, func() bool {
+		return shardStatus(metadata, constant.DefaultNamespace, shard) == proto.ShardStatusSteadyState
+	}, 10*time.Second, 100*time.Millisecond)
+	assert.EqualValues(t, 1, shardTerm(metadata, constant.DefaultNamespace, shard), "one above the written term, never equal to it")
+	assertShardLeader(t, metadata, constant.DefaultNamespace, shard, s1)
+
+	assert.NoError(t, sc.Close())
+}

@@ -474,6 +474,17 @@ func (e *Election) start() (newLeader *proto.DataServerIdentity, err error) {
 	if err != nil {
 		return nil, err
 	}
+	if written := highestWrittenTerm(candidatesStatus); written >= e.mutableShardMetadata.Term {
+		// A member's log already holds entries of this term: a leadership
+		// at it happened before this coordinator knew of it — a standalone
+		// directory being adopted, or status that was lost. Leading again
+		// under a term that was written to corrupts the log; the next
+		// attempt fences above it.
+		e.logger.Info("Election term was already written to, moving above it",
+			slog.Int64("term", e.mutableShardMetadata.Term), slog.Int64("written-term", written))
+		e.mutableShardMetadata.Term = written
+		return nil, errTermAlreadyWritten
+	}
 	newLeader, followers, err := e.selectNewLeader(candidatesStatus)
 	if err != nil {
 		return nil, err
@@ -722,4 +733,20 @@ func highestTermHint(err error) (int64, bool) {
 	}
 	walk(err)
 	return highest, found
+}
+
+// errTermAlreadyWritten ends an election attempt whose term some member's
+// log already holds entries of; the retry fences above that term.
+var errTermAlreadyWritten = errors.New("election term was already written to")
+
+// highestWrittenTerm is the highest term any member's head entry carries,
+// or -1 when every log is empty.
+func highestWrittenTerm(candidates map[*proto.DataServerIdentity]*proto.EntryId) int64 {
+	highest := int64(-1)
+	for _, head := range candidates {
+		if head.GetOffset() >= 0 && head.GetTerm() > highest {
+			highest = head.GetTerm()
+		}
+	}
+	return highest
 }
