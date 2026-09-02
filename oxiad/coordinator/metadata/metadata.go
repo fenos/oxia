@@ -16,7 +16,6 @@ package metadata
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -123,9 +122,11 @@ func (m *coordinatorMetadata) computeStatus(fn func(*commonproto.ClusterStatus, 
 		Value:   next,
 		Version: current.Version,
 	})
-	if errors.Is(err, metadatacommon.ErrBadVersion) {
-		panic(err)
-	}
+	// A lost version race is survivable, not fatal: with the coordinator
+	// embedded, a leadership handover can briefly leave two writers, and
+	// the loser's watch catches the winner's version up — its caller
+	// retries over fresh state. A panic here took the whole embedding
+	// process down and flapped the leadership again.
 	return err
 }
 
