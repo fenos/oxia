@@ -128,3 +128,32 @@ func TestWaitForLeadershipShutdown(t *testing.T) {
 	require.Error(t, res.err)
 	assert.Nil(t, res.lost)
 }
+
+func TestWaitForLeadershipShutdownEndsAStuckBarrier(t *testing.T) {
+	notifyCh := make(chan bool, 1)
+	shutdownCh := make(chan struct{})
+
+	// A won notification whose leadership is gone by the time the barrier
+	// dispatches can leave the barrier's future unresolved forever; the
+	// provider closing behind it must still end the wait.
+	barrierEntered := make(chan struct{})
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+
+	resCh := startWaitForLeadership(notifyCh, shutdownCh, func() error {
+		close(barrierEntered)
+		<-release
+		return nil
+	})
+
+	notifyCh <- true
+	<-barrierEntered
+	close(shutdownCh)
+
+	select {
+	case res := <-resCh:
+		require.Error(t, res.err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("waitForLeadership did not return on shutdown with a stuck barrier")
+	}
+}

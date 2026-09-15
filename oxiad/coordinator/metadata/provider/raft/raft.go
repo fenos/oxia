@@ -181,7 +181,19 @@ func waitForLeadership(notifyCh <-chan bool, shutdownCh <-chan struct{}, barrier
 				// keep waiting until this node actually wins
 				continue
 			}
-			if err := barrier(); err != nil {
+			// The barrier's future resolves on the node's terms: leadership
+			// lost right after the notification can leave it pending until
+			// the node itself shuts down. Run it aside so a closing provider
+			// still ends the wait; the laggard's result is discarded.
+			barrierErr := make(chan error, 1)
+			go func() { barrierErr <- barrier() }()
+			var err error
+			select {
+			case err = <-barrierErr:
+			case <-shutdownCh:
+				return nil, errors.New("raft provider closed while waiting for leadership")
+			}
+			if err != nil {
 				// The leadership may already be gone: wait for the next term
 				logger.Warn("Failed to wait for the FSM to catch up after becoming leader",
 					slog.Any("error", err))
