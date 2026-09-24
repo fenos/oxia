@@ -538,7 +538,11 @@ func (s *controller) deleteShardWithRetries() {
 		}
 
 		s.terminating.Store(true)
-		s.metadataStore.DeleteShardStatus(s.namespace, s.shard)
+		if err := s.metadataStore.DeleteShardStatus(s.namespace, s.shard); err != nil {
+			// The shard is still marked as deleting: its deletion resumes when
+			// the coordinator restarts
+			return backoff.Permanent(err)
+		}
 		if s.eventListener != nil {
 			go func() {
 				process.DoWithLabels(
@@ -696,6 +700,7 @@ func (s *controller) handlePeriodicTasks() {
 		}
 
 		mutShardMeta.PendingDeleteShardNodes = nil
-		s.metadataStore.UpdateShardStatus(s.namespace, s.shard, mutShardMeta)
+		// Best-effort: if this is not persisted, the pending deletes are retried
+		_ = s.metadataStore.UpdateShardStatus(s.namespace, s.shard, mutShardMeta)
 	}
 }
