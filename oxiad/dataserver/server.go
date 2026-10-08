@@ -63,13 +63,13 @@ type Server struct {
 
 // New starts a data server with the given options. Unset option values are
 // filled with their defaults, and the options are validated before the server
-// starts. If options is nil, the default options are used.
+// starts.
 //
 // The server keeps a reference to options: the caller must not mutate them
-// after this call and should use UpdateOptions instead.
+// after this call.
 func New(parent context.Context, options *option.Options) (*Server, error) {
 	if options == nil {
-		options = option.NewDefaultOptions()
+		return nil, errors.New("options must not be nil")
 	}
 	options.WithDefault()
 	if err := options.Validate(); err != nil {
@@ -190,21 +190,6 @@ func (s *Server) PublicPort() int {
 
 func (s *Server) InternalPort() int {
 	return s.internalRpcServer.grpcServer.Port()
-}
-
-// UpdateOptions publishes a new configuration to the running server. Only the
-// dynamic settings (currently the log options) take effect at runtime; the
-// remaining settings require a restart.
-func (s *Server) UpdateOptions(options *option.Options) error {
-	if options == nil {
-		return errors.New("options must not be nil")
-	}
-	options.WithDefault()
-	if err := options.Validate(); err != nil {
-		return err
-	}
-	s.optionsWatch.Publish(options)
-	return nil
 }
 
 func (s *Server) backgroundHandleConfChange() {

@@ -46,7 +46,9 @@ options.Storage.WAL.Dir = "./data/wal"
 server, err := dataserver.New(ctx, options)
 ```
 
-These are the same entry points the `oxia` binary itself is built on. See the [`dataserver`](oxiad/dataserver/doc.go) package documentation for embedding a data server or a standalone single-node server, and the [`coordinator`](oxiad/coordinator/doc.go) package documentation for bootstrapping a whole cluster in-process with `coordinator.New`.
+These are the same entry points the `oxia` binary itself is built on. See the [`dataserver`](oxiad/dataserver/doc.go) package documentation for embedding a data server or a standalone single-node server, and the [`coordinator`](oxiad/coordinator/doc.go) package documentation for bootstrapping a whole cluster in-process with `coordinator.New` and for choosing its metadata provider.
+
+Embedded servers share process-global state (the OpenTelemetry meter provider, the Prometheus registry and the log level), and a failure to serve gRPC or metrics, or a fatal storage error, still terminates the host process.
 
 <br>
 

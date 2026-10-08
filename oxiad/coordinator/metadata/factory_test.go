@@ -43,47 +43,74 @@ func newMemoryFactory(t *testing.T) *Factory {
 	return factory
 }
 
-func TestSeedClusterConfig(t *testing.T) {
-	factory := newMemoryFactory(t)
-
-	config := &commonproto.ClusterConfiguration{
+func newSeedConfig(namespace string) *commonproto.ClusterConfiguration {
+	return &commonproto.ClusterConfiguration{
 		Namespaces: []*commonproto.Namespace{{
-			Name:              "test-namespace",
+			Name:              namespace,
 			ReplicationFactor: 1,
 			InitialShardCount: 1,
 		}},
+		Servers: []*commonproto.DataServerIdentity{{
+			Public:   "localhost:6648",
+			Internal: "localhost:6649",
+		}},
 	}
-	require.NoError(t, factory.SeedClusterConfig(config))
-
-	seeded := factory.configProvider.Watch().Load()
-	assert.NotEqual(t, metadatacommon.NotExists, seeded.Version)
-	require.Len(t, seeded.Value.Namespaces, 1)
-	assert.Equal(t, "test-namespace", seeded.Value.Namespaces[0].Name)
 }
 
-func TestSeedClusterConfigRejectsNil(t *testing.T) {
+func loadConfig(t *testing.T, factory *Factory) *commonproto.ClusterConfiguration {
+	t.Helper()
+
+	current := factory.configProvider.Watch().Load()
+	if current.Version == metadatacommon.NotExists {
+		return nil
+	}
+	return current.Value
+}
+
+func TestSeedClusterConfig(t *testing.T) {
 	factory := newMemoryFactory(t)
 
-	require.Error(t, factory.SeedClusterConfig(nil))
-	assert.Equal(t, metadatacommon.NotExists, factory.configProvider.Watch().Load().Version)
+	require.NoError(t, factory.SeedClusterConfig(newSeedConfig("test-namespace")))
+
+	seeded := loadConfig(t, factory)
+	require.NotNil(t, seeded)
+	require.Len(t, seeded.Namespaces, 1)
+	assert.Equal(t, "test-namespace", seeded.Namespaces[0].Name)
 }
 
 func TestSeedClusterConfigDoesNotOverwrite(t *testing.T) {
 	factory := newMemoryFactory(t)
 
-	first := &commonproto.ClusterConfiguration{
-		Namespaces: []*commonproto.Namespace{{Name: "first"}},
-	}
-	require.NoError(t, factory.SeedClusterConfig(first))
-	version := factory.configProvider.Watch().Load().Version
+	require.NoError(t, factory.SeedClusterConfig(newSeedConfig("first")))
+	require.NoError(t, factory.SeedClusterConfig(newSeedConfig("second")))
 
-	second := &commonproto.ClusterConfiguration{
-		Namespaces: []*commonproto.Namespace{{Name: "second"}},
-	}
-	require.NoError(t, factory.SeedClusterConfig(second))
+	current := loadConfig(t, factory)
+	require.NotNil(t, current)
+	require.Len(t, current.Namespaces, 1)
+	assert.Equal(t, "first", current.Namespaces[0].Name)
+}
 
-	current := factory.configProvider.Watch().Load()
-	assert.Equal(t, version, current.Version)
-	require.Len(t, current.Value.Namespaces, 1)
-	assert.Equal(t, "first", current.Value.Namespaces[0].Name)
+// An invalid configuration is rejected before anything is stored: once stored,
+// it would never be replaced by a later seed, and a coordinator would fail on
+// it at every start.
+func TestSeedClusterConfigRejectsInvalid(t *testing.T) {
+	replicationAboveServers := newSeedConfig("test-namespace")
+	replicationAboveServers.Namespaces[0].ReplicationFactor = 3
+
+	noShards := newSeedConfig("test-namespace")
+	noShards.Namespaces[0].InitialShardCount = 0
+
+	for name, config := range map[string]*commonproto.ClusterConfiguration{
+		"nil":                         nil,
+		"replication above servers":   replicationAboveServers,
+		"no initial shards":           noShards,
+		"coordinator without address": {Coordinators: []*commonproto.Coordinator{{Name: "c1"}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			factory := newMemoryFactory(t)
+
+			require.Error(t, factory.SeedClusterConfig(config))
+			assert.Nil(t, loadConfig(t, factory))
+		})
+	}
 }

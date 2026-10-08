@@ -49,19 +49,31 @@ import (
 type ServerOption func(*serverOptions)
 
 type serverOptions struct {
+	// onLeadershipLost is the embedder's handler; nil selects the default,
+	// which terminates the process.
 	onLeadershipLost     func()
 	onMetadata           func(*coordmetadata.Factory)
 	initialClusterConfig *proto.ClusterConfiguration
 }
 
 func newServerOptions(serverOpts []ServerOption) serverOptions {
-	so := serverOptions{onLeadershipLost: onLeadershipLost}
+	so := serverOptions{}
 	for _, opt := range serverOpts {
 		if opt != nil {
 			opt(&so)
 		}
 	}
 	return so
+}
+
+func (so *serverOptions) validate() error {
+	if so.initialClusterConfig == nil {
+		return nil
+	}
+	if err := so.initialClusterConfig.Validate(); err != nil {
+		return fmt.Errorf("invalid initial cluster configuration: %w", err)
+	}
+	return nil
 }
 
 func (so *serverOptions) handMetadata(metadataFactory *coordmetadata.Factory) {
@@ -77,22 +89,26 @@ func (so *serverOptions) seedClusterConfig(metadataFactory *coordmetadata.Factor
 	return metadataFactory.SeedClusterConfig(so.initialClusterConfig)
 }
 
-// WithOnLeadershipLost overrides what happens when this coordinator loses the
-// metadata leadership. The default handler terminates the process, which is
-// the right behavior for a dedicated coordinator process but not when the
-// coordinator is embedded in a larger application.
+// WithOnLeadershipLost replaces what happens when this coordinator loses the
+// metadata leadership. By default the process terminates, which is the right
+// behavior for a dedicated coordinator process but not when the coordinator
+// is embedded in a larger application.
 //
-// A coordinator that lost the leadership must stop coordinating: the handler
-// is expected to arrange for the server to be closed. It is invoked from an
-// internal goroutine that Close waits on, so the handler must not call Close
-// synchronously; spawn a goroutine instead.
+// With a handler set, the coordinator first stops coordinating by itself: its
+// health turns to NOT_SERVING, its admin API answers as a coordinator that is
+// not the leader, and it stops its reconciler, its runtime (the elections and
+// the balancing) and its metadata writes. Only then is the handler called, as
+// a notification. The coordinator does not regain the leadership: to take
+// part in the next election, the application closes it and starts a new one
+// with [New].
+//
+// The handler is called from an internal goroutine that Close waits for, so
+// it must not call Close synchronously. A nil handler keeps the default.
+//
+// Only the configmap and raft metadata providers can lose the leadership; the
+// memory and file providers hold it for the lifetime of the coordinator.
 func WithOnLeadershipLost(handler func()) ServerOption {
 	return func(so *serverOptions) {
-		if handler == nil {
-			// A nil handler would panic at the worst moment; keep the
-			// fail-safe default instead.
-			handler = onLeadershipLost
-		}
 		so.onLeadershipLost = handler
 	}
 }
@@ -102,18 +118,21 @@ func WithOnLeadershipLost(handler func()) ServerOption {
 // cluster programmatically, without a cluster configuration file or a
 // separate admin call. If a configuration is already present it is left
 // untouched.
+//
+// The configuration is validated before the coordinator starts: an invalid
+// one fails [New] and is never stored.
+func WithInitialClusterConfiguration(config *proto.ClusterConfiguration) ServerOption {
+	return func(so *serverOptions) {
+		so.initialClusterConfig = config
+	}
+}
+
 // WithOnMetadata hands the metadata factory to handler as soon as it
 // exists — before the wait for leadership, so a follower's caller can
 // read the raft membership too. A nil handler is ignored.
 func WithOnMetadata(handler func(*coordmetadata.Factory)) ServerOption {
 	return func(so *serverOptions) {
 		so.onMetadata = handler
-	}
-}
-
-func WithInitialClusterConfiguration(config *proto.ClusterConfiguration) ServerOption {
-	return func(so *serverOptions) {
-		so.initialClusterConfig = config
 	}
 }
 
@@ -127,26 +146,34 @@ type GrpcServer struct {
 
 	grpcServer       commonrpc.GrpcServer
 	managementServer commonrpc.GrpcServer
+	management       *managementServer
 	healthServer     *health.Server
 	reconciler       coordreconciler.Reconciler
 	runtime          coordruntime.Runtime
 	metadata         coordmetadata.Metadata
 	metadataFactory  *coordmetadata.Factory
 	metrics          *metric.PrometheusMetrics
+
+	stopOnce sync.Once
+	stopErr  error
 }
 
 // New starts a coordinator with the given options. Unset option values are
 // filled with their defaults, and the options are validated before the
-// coordinator starts. If options is nil, the default options are used.
+// coordinator starts. The metadata provider (Metadata.ProviderName) has no
+// default and must be set.
 //
 // The coordinator keeps a reference to options: the caller must not mutate
-// them after this call and should use UpdateOptions instead.
+// them after this call.
 //
-// With a multi-coordinator metadata provider (file, configmap or raft), this
-// call blocks until the coordinator acquires the metadata leadership.
+// With the file, configmap or raft metadata provider, this call blocks until
+// the coordinator acquires the metadata leadership, which lasts as long as
+// another coordinator holds it. Its listeners are already bound while it
+// waits. Cancelling parent ends the wait: New then releases what it started
+// and returns the context's error.
 func New(parent context.Context, options *option.Options, serverOpts ...ServerOption) (*GrpcServer, error) {
 	if options == nil {
-		options = option.NewDefaultOptions()
+		return nil, errors.New("options must not be nil")
 	}
 	options.WithDefault()
 	if err := options.Validate(); err != nil {
@@ -161,6 +188,10 @@ func New(parent context.Context, options *option.Options, serverOpts ...ServerOp
 // instead.
 func NewGrpcServer(parent context.Context, optionsWatch *commonwatch.Watch[*option.Options], serverOpts ...ServerOption) (_ *GrpcServer, err error) {
 	so := newServerOptions(serverOpts)
+	// Fail fast, before binding the ports and waiting for the leadership.
+	if err := so.validate(); err != nil {
+		return nil, err
+	}
 	options := optionsWatch.Load()
 	slog.Info("Starting Oxia coordinator", slog.Any("options", options))
 
@@ -234,15 +265,14 @@ func NewGrpcServer(parent context.Context, optionsWatch *commonwatch.Watch[*opti
 		return nil, err
 	}
 
-	// Waiting for the leadership can last as long as another coordinator
-	// leads. The parent context bounds the start: cancelling it closes the
-	// metadata factory, which ends the wait with an error.
-	stopCancelWatch := context.AfterFunc(parent, func() { _ = metadataFactory.Close() })
+	// Waiting for the leadership lasts as long as another coordinator leads.
+	// Closing the metadata factory is what ends the wait of every provider,
+	// so a cancelled context closes it.
+	stopCancelWatch := context.AfterFunc(ctx, func() { _ = metadataFactory.Close() })
 	var leadershipLost <-chan struct{}
 	leadershipLost, err = metadata.WaitToBecomeLeader()
 	if !stopCancelWatch() {
-		// The parent was cancelled while waiting; the factory is closing.
-		return nil, fmt.Errorf("coordinator start cancelled while waiting for leadership: %w", parent.Err())
+		return nil, fmt.Errorf("coordinator start cancelled while waiting for the leadership: %w", context.Cause(ctx))
 	}
 	if err != nil {
 		return nil, err
@@ -269,6 +299,7 @@ func NewGrpcServer(parent context.Context, optionsWatch *commonwatch.Watch[*opti
 		optionsWatch:     optionsWatch,
 		grpcServer:       grpcServer,
 		managementServer: managementGrpcServer,
+		management:       management,
 		healthServer:     healthServer,
 		reconciler:       reconciler,
 		runtime:          runtime,
@@ -286,12 +317,7 @@ func NewGrpcServer(parent context.Context, optionsWatch *commonwatch.Watch[*opti
 			process.DoWithLabels(ctx, map[string]string{
 				"component": "leadership-watcher",
 			}, func() {
-				select {
-				case <-leadershipLost:
-					server.logger.Error("Coordination leadership lost: terminating to avoid a split brain")
-					so.onLeadershipLost()
-				case <-ctx.Done():
-				}
+				server.watchLeadership(leadershipLost, so.onLeadershipLost)
 			})
 		})
 	}
@@ -299,17 +325,38 @@ func NewGrpcServer(parent context.Context, optionsWatch *commonwatch.Watch[*opti
 	return &server, nil
 }
 
-// onLeadershipLost is the default WithOnLeadershipLost handler. It terminates
-// the process: a coordinator that lost the leadership must stop coordinating
-// immediately, before it can run elections or move ensembles alongside the
-// new leader, and a restart rejoins the election from a clean state.
-// Overridable in tests.
+// watchLeadership waits for the leadership loss, or for the server to close.
+// On a loss, a nil handler terminates the process; otherwise the coordinator
+// stops coordinating before the handler is called.
+func (s *GrpcServer) watchLeadership(leadershipLost <-chan struct{}, handler func()) {
+	select {
+	case <-leadershipLost:
+	case <-s.ctx.Done():
+		return
+	}
+	if handler == nil {
+		s.logger.Error("Coordination leadership lost: terminating to avoid a split brain")
+		onLeadershipLost()
+		return
+	}
+	s.logger.Error("Coordination leadership lost: stopping coordination to avoid a split brain")
+	if err := s.stopCoordinating(); err != nil {
+		s.logger.Warn("Failed to stop coordinating cleanly", slog.Any("error", err))
+	}
+	handler()
+}
+
+// onLeadershipLost is what happens on a leadership loss when no
+// WithOnLeadershipLost handler is set. It terminates the process: a
+// coordinator that lost the leadership must stop coordinating immediately,
+// before it can run elections or move ensembles alongside the new leader, and
+// a restart rejoins the election from a clean state. Overridable in tests.
 var onLeadershipLost = func() {
 	os.Exit(1)
 }
 
-// InternalPort returns the port of the internal gRPC server used for
-// coordinator-to-coordinator communication.
+// InternalPort returns the port of the internal gRPC server, which serves the
+// health checks.
 func (s *GrpcServer) InternalPort() int {
 	return s.grpcServer.Port()
 }
@@ -318,21 +365,6 @@ func (s *GrpcServer) InternalPort() int {
 // management (admin) API.
 func (s *GrpcServer) PublicPort() int {
 	return s.managementServer.Port()
-}
-
-// UpdateOptions publishes a new configuration to the running coordinator.
-// Only the dynamic settings (currently the log options) take effect at
-// runtime; the remaining settings require a restart.
-func (s *GrpcServer) UpdateOptions(options *option.Options) error {
-	if options == nil {
-		return errors.New("options must not be nil")
-	}
-	options.WithDefault()
-	if err := options.Validate(); err != nil {
-		return err
-	}
-	s.optionsWatch.Publish(options)
-	return nil
 }
 
 func startMetricsServer(metrics commonoption.MetricOptions) (*metric.PrometheusMetrics, error) {
@@ -366,21 +398,39 @@ func (s *GrpcServer) backgroundHandleConfChange() {
 	}
 }
 
+// stopCoordinating turns the health to NOT_SERVING, turns the admin API away
+// to the leader, and stops everything that acts on the cluster: the
+// reconciler, the runtime (elections, balancing, splits) and the metadata
+// writes. The listeners and the metadata providers stay open until Close. It
+// runs once, on a leadership loss or on Close.
+func (s *GrpcServer) stopCoordinating() error {
+	s.stopOnce.Do(func() {
+		// Canceling the context first stops the metadata status write
+		// retries, which could otherwise block closing the runtime forever
+		// (e.g. after losing the leadership).
+		s.ctxCancel()
+		s.healthServer.Shutdown()
+		s.management.stop()
+		s.stopErr = multierr.Combine(
+			s.reconciler.Close(),
+			s.runtime.Close(),
+			s.metadata.Close(),
+		)
+	})
+	return s.stopErr
+}
+
 func (s *GrpcServer) Close() error {
-	// sync close the background task first. Canceling the context also stops
-	// the metadata status write retries, which could otherwise block closing
-	// the runtime forever (e.g. after losing the leadership).
+	// Canceling the context ends the background tasks: wait for them before
+	// closing what they use.
 	s.ctxCancel()
 	s.wg.Wait()
 
-	var err error
 	s.healthServer.Shutdown()
-	err = multierr.Combine(
+	err := multierr.Combine(
 		s.grpcServer.Close(),
 		s.managementServer.Close(),
-		s.reconciler.Close(),
-		s.runtime.Close(),
-		s.metadata.Close(),
+		s.stopCoordinating(),
 		s.metadataFactory.Close(),
 	)
 	if s.metrics != nil {
@@ -390,7 +440,7 @@ func (s *GrpcServer) Close() error {
 }
 
 // closePointer closes p unless it is nil. A nil pointer wrapped in an
-// io.Closer passes CloseIfNotNil's check and is then dereferenced; the
+// interface passes CloseIfNotNil's nil check and is then dereferenced: the
 // parts NewGrpcServer holds as pointers are closed through this instead.
 func closePointer[T any, P interface {
 	*T

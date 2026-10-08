@@ -25,6 +25,7 @@
 //		dsOptions := dsoption.NewDefaultOptions()
 //		dsOptions.Server.Public.BindAddress = "localhost:0"
 //		dsOptions.Server.Internal.BindAddress = "localhost:0"
+//		dsOptions.Observability.Metric.BindAddress = "localhost:0"
 //		dsOptions.Storage.Database.Dir = filepath.Join(dataDir, strconv.Itoa(i), "db")
 //		dsOptions.Storage.WAL.Dir = filepath.Join(dataDir, strconv.Itoa(i), "wal")
 //
@@ -43,7 +44,9 @@
 //	options := option.NewDefaultOptions()
 //	options.Server.Public.BindAddress = "localhost:0"
 //	options.Server.Internal.BindAddress = "localhost:0"
-//	options.Metadata.ProviderName = option.ProviderMemory
+//	options.Observability.Metric.BindAddress = "localhost:0"
+//	options.Metadata.ProviderName = option.ProviderFile
+//	options.Metadata.File.Dir = filepath.Join(dataDir, "coordinator")
 //
 //	coord, err := coordinator.New(ctx, options,
 //		coordinator.WithInitialClusterConfiguration(&proto.ClusterConfiguration{
@@ -61,11 +64,43 @@
 //
 //	client, err := oxia.NewSyncClient(identities[0].Public)
 //
-// The example uses the in-memory metadata provider, which keeps the cluster
-// status inside the coordinator process and is suitable when a single
-// coordinator is embedded. Multi-coordinator topologies should use the file
-// or raft metadata providers instead, and must decide what happens when a
-// coordinator loses the metadata leadership: by default the whole process
-// exits, which embedding applications usually want to override with
-// [WithOnLeadershipLost].
+// Every server serves metrics on 0.0.0.0:8080 by default: servers sharing a
+// process need distinct metrics addresses, or metrics disabled.
+//
+// # Choosing a metadata provider
+//
+// The coordinator keeps the cluster status (including the cluster instance
+// id, which every data server records and checks) in its metadata provider:
+//
+//   - file: the status survives a restart of the process. The right choice for
+//     a single embedded coordinator with persistent data servers, as above.
+//     Its leadership is a lock on a local file, so it does not elect a leader
+//     among coordinators on different machines.
+//   - raft or configmap (on Kubernetes): for several coordinators, on
+//     different machines, of which one leads at a time.
+//   - memory: the status is lost when the process exits, and a restarted
+//     coordinator mints a new cluster instance id that the data servers
+//     reject. Use it only with data servers whose storage is ephemeral too,
+//     as in tests.
+//
+// With the file, configmap or raft provider, [New] blocks until the
+// coordinator acquires the metadata leadership; cancel its context to stop
+// waiting.
+//
+// Only the raft and configmap providers can lose the leadership. By default a
+// coordinator that loses it terminates the process; an embedding application
+// sets [WithOnLeadershipLost] instead, and starts a new coordinator to take
+// part in the next election.
+//
+// # Limitations
+//
+// Embedded servers share process-global state, and some failures still
+// terminate the host process:
+//
+//   - The metrics package installs the global OpenTelemetry MeterProvider when
+//     it is loaded, and every metrics endpoint serves the default Prometheus
+//     registry: the servers of one process share one metrics pipeline.
+//   - The log level is package-global, shared by all the servers.
+//   - A failure to serve gRPC or metrics, and a fatal Pebble error, exit the
+//     process.
 package coordinator

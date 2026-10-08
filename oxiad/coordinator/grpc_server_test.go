@@ -32,8 +32,9 @@ import (
 
 func TestServerOptions(t *testing.T) {
 	so := newServerOptions(nil)
-	assert.NotNil(t, so.onLeadershipLost)
+	assert.Nil(t, so.onLeadershipLost, "no handler selects the default")
 	assert.Nil(t, so.initialClusterConfig)
+	require.NoError(t, so.validate())
 
 	config := &proto.ClusterConfiguration{}
 	called := false
@@ -45,14 +46,24 @@ func TestServerOptions(t *testing.T) {
 	so.onLeadershipLost()
 	assert.True(t, called)
 	assert.Same(t, config, so.initialClusterConfig)
+	require.NoError(t, so.validate())
 }
 
-// A nil option is ignored and a nil leadership-loss handler keeps the
-// fail-safe default: neither can leave the coordinator with a nil to call.
+// A nil option is ignored and a nil leadership-loss handler keeps the default:
+// neither can leave the coordinator with a nil to call.
 func TestServerOptionsNilSafe(t *testing.T) {
 	so := newServerOptions([]ServerOption{nil, WithOnLeadershipLost(nil)})
-	assert.NotNil(t, so.onLeadershipLost)
+	assert.Nil(t, so.onLeadershipLost, "a nil handler selects the default")
 	assert.Nil(t, so.initialClusterConfig)
+}
+
+func TestServerOptionsRejectInvalidInitialClusterConfiguration(t *testing.T) {
+	so := newServerOptions([]ServerOption{
+		WithInitialClusterConfiguration(&proto.ClusterConfiguration{
+			Namespaces: []*proto.Namespace{{Name: "default", ReplicationFactor: 1}},
+		}),
+	})
+	require.ErrorContains(t, so.validate(), "initialShardCount")
 }
 
 // A coordinator that is not the founder of its raft group waits to be

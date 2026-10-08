@@ -28,13 +28,31 @@
 //	defer server.Close()
 //
 // A data server is passive until a coordinator assigns shards to it; see the
-// coordinator package for how to run a whole Oxia cluster in-process.
+// coordinator package for how to run a whole Oxia cluster in-process, and for
+// the process-global state that embedded servers share.
 //
 // [NewStandalone] starts a self-contained single-node server instead, with no
 // replication and no coordinator: the embedded equivalent of the
 // `oxia standalone` command, and the simplest option for tests and
-// single-process deployments. [StandaloneConfig.Namespaces] gives it several
-// namespaces, each with its own key sorting, laid out on disk exactly as a
-// coordinator would lay them out — so a standalone data directory can later
-// be adopted by a coordinated cluster.
+// single-process deployments:
+//
+//	config := dataserver.StandaloneConfig{NotificationsEnabled: true}
+//	config.DataServerOptions.Storage.Database.Dir = "./data/db"
+//	config.DataServerOptions.Storage.WAL.Dir = "./data/wal"
+//
+//	server, err := dataserver.NewStandalone(config)
+//	if err != nil {
+//		return err
+//	}
+//	defer server.Close()
+//
+//	client, err := oxia.NewSyncClient(server.ServiceAddr())
+//
+// Unlike the command, a StandaloneConfig leaves notifications disabled unless
+// NotificationsEnabled is set, and clients subscribing to them then fail.
+//
+// [StandaloneConfig.Namespaces] gives it several namespaces, each with its own
+// key sorting, laid out on disk exactly as a coordinator would lay them out —
+// so a standalone data directory can later be adopted by a coordinated
+// cluster.
 package dataserver

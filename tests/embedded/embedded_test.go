@@ -135,10 +135,3 @@ func TestEmbeddedStandalone(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "value", string(value))
 }
-
-func TestEmbeddedDataServerUpdateOptions(t *testing.T) {
-	server, _ := newDataServer(t)
-
-	assert.Error(t, server.UpdateOptions(nil))
-	assert.NoError(t, server.UpdateOptions(newDataServerOptions(t)))
-}
