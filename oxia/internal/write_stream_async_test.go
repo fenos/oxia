@@ -112,9 +112,9 @@ func TestAsyncWriteStreamPartialResendFailsTheWrites(t *testing.T) {
 	stream := newAsyncWriteStream(ctx, 0, streams.open)
 
 	shard := int64(0)
-	a, err := stream.send(ctx, nil, putRequest(&shard, "a"))
+	a, err := stream.send(ctx, nil, request(putRequest(&shard, "a")))
 	require.NoError(t, err)
-	b, err := stream.send(ctx, nil, putRequest(&shard, "b"))
+	b, err := stream.send(ctx, nil, request(putRequest(&shard, "b")))
 	require.NoError(t, err)
 
 	close(first.release)
@@ -142,9 +142,9 @@ func TestAsyncWriteStreamPartialResendRejectedAtSetupIsRetried(t *testing.T) {
 	stream := newAsyncWriteStream(ctx, 0, streams.open)
 
 	shard := int64(0)
-	_, err := stream.send(ctx, nil, putRequest(&shard, "a"))
+	_, err := stream.send(ctx, nil, request(putRequest(&shard, "a")))
 	require.NoError(t, err)
-	_, err = stream.send(ctx, nil, putRequest(&shard, "b"))
+	_, err = stream.send(ctx, nil, request(putRequest(&shard, "b")))
 	require.NoError(t, err)
 
 	close(first.release)

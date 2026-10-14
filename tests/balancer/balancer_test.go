@@ -61,7 +61,9 @@ func TestBalancer(t *testing.T) {
 	// candidate misses the fencing grace period): with a too-short quarantine
 	// the balancer degenerates into a hot loop of no-op elections on a loaded
 	// machine.
-	metadata.GetConfig().UnsafeBorrow().LoadBalancer = &proto.LoadBalancer{
+	config, err := metadata.GetConfig()
+	require.NoError(t, err)
+	config.UnsafeBorrow().LoadBalancer = &proto.LoadBalancer{
 		ScheduleInterval: "10ms",
 		QuarantineTime:   "1s",
 	}
@@ -72,7 +74,8 @@ func TestBalancer(t *testing.T) {
 		require.NoError(t, coordinatorInstance.Close())
 	})
 
-	reconciler := coordreconciler.New(t.Context(), coordinatorInstance)
+	reconciler, err := coordreconciler.New(t.Context(), coordinatorInstance)
+	require.NoError(t, err)
 	t.Cleanup(func() {
 		require.NoError(t, reconciler.Close())
 	})

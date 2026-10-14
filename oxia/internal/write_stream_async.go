@@ -88,10 +88,13 @@ func newAsyncWriteStream(ctx context.Context, shard int64, open openWriteStream)
 	return &asyncWriteStream{ctx: ctx, shard: shard, open: open}
 }
 
-// send sends the request, opening a stream if there is none, and returns the
-// write in flight, whose response completes it. An error means that the
-// request was not sent.
-func (s *asyncWriteStream) send(ctx context.Context, hint constant.ErrorMetadata, request *proto.WriteRequest) (*asyncWrite, error) {
+// send sends the request that prepare returns, opening a stream if there is
+// none, and returns the write in flight, whose response completes it. prepare
+// is invoked right before the request is handed to gRPC, unless ctx is done:
+// a request is never sent after its deadline. An error means that the request
+// was not sent.
+func (s *asyncWriteStream) send(ctx context.Context, hint constant.ErrorMetadata,
+	prepare func() (*proto.WriteRequest, error)) (*asyncWrite, error) {
 	if err := s.lockSettled(ctx); err != nil {
 		return nil, err
 	}
@@ -106,6 +109,13 @@ func (s *asyncWriteStream) send(ctx context.Context, hint constant.ErrorMetadata
 			return nil, err
 		}
 		s.install(stream, cancel) //nolint:contextcheck // The stream outlives the request.
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	request, err := prepare()
+	if err != nil {
+		return nil, err
 	}
 	if err := s.stream.Send(request); err != nil {
 		// The stream ended: its reader settles the writes in flight on it

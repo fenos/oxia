@@ -87,7 +87,6 @@ type Election struct {
 	mutableShardMetadata *proto.ShardMetadata
 	changeEnsembleAction *action.ChangeEnsembleAction
 	followerCaughtUp     atomic.Bool // If the followers caught up leader after election
-	termOptions          *proto.NewTermOptions
 	// requiredFeatures are the features that an earlier attempt found
 	// already enabled on the shard, which the next attempts must pin
 	requiredFeatures []proto.Feature
@@ -102,12 +101,21 @@ type Election struct {
 	becomeLeaderSent bool
 	// started
 	started atomic.Bool
+	// term is the term of the shard as the election last persisted it. It is
+	// owned by the election, which writes it when it is created and when it
+	// persists a new term; Term lends it to any goroutine, e.g. the term
+	// gauge of the shard controller.
+	term atomic.Int64
 }
 
-func (e *Election) refreshedEnsemble(ensemble []*proto.DataServerIdentity) []*proto.DataServerIdentity {
+func (e *Election) refreshedEnsemble(ensemble []*proto.DataServerIdentity) ([]*proto.DataServerIdentity, error) {
 	refreshedEnsembleDataServerAddress := make([]*proto.DataServerIdentity, len(ensemble))
 	for idx, candidate := range ensemble {
-		if borrowedDataServer, exist := e.metadataStore.GetDataServer(candidate.GetNameOrDefault()); exist {
+		borrowedDataServer, exist, err := e.metadataStore.GetDataServer(candidate.GetNameOrDefault())
+		if err != nil {
+			return nil, err
+		}
+		if exist {
 			if identity := borrowedDataServer.UnsafeBorrow().GetIdentity(); identity != nil {
 				refreshedEnsembleDataServerAddress[idx] = identity
 				continue
@@ -121,7 +129,7 @@ func (e *Election) refreshedEnsemble(ensemble []*proto.DataServerIdentity) []*pr
 				slog.Any("new-ensemble", refreshedEnsembleDataServerAddress))
 		}
 	}
-	return refreshedEnsembleDataServerAddress
+	return refreshedEnsembleDataServerAddress, nil
 }
 
 func (e *Election) fenceNewTerm(ctx context.Context, term int64, options *proto.NewTermOptions, dataServer *proto.DataServerIdentity) (*proto.NewTermResponse, error) {
@@ -641,7 +649,8 @@ func (e *Election) abortChangeEnsemble(retryShardMetadata *proto.ShardMetadata, 
 func (e *Election) persistNewTerm() error {
 	var stopReason string
 	shardExists := false
-	if err := e.metadataStore.UpdateShardStatuses(e.namespace, func(shards map[int64]*proto.ShardMetadata) bool {
+	if err := e.metadataStore.PatchNamespaceStatus(e.namespace, func(status *proto.NamespaceStatus) bool {
+		shards := status.Shards
 		stopReason = ""
 		current, exists := shards[e.shard]
 		shardExists = exists
@@ -676,7 +685,8 @@ func (e *Election) persistNewTerm() error {
 // persistNewLeader stores the shard metadata with the elected leader.
 func (e *Election) persistNewLeader() error {
 	shardExists := false
-	if err := e.metadataStore.UpdateShardStatuses(e.namespace, func(shards map[int64]*proto.ShardMetadata) bool {
+	if err := e.metadataStore.PatchNamespaceStatus(e.namespace, func(status *proto.NamespaceStatus) bool {
+		shards := status.Shards
 		current, exists := shards[e.shard]
 		shardExists = exists
 		if exists {
@@ -714,13 +724,26 @@ func (e *Election) start() (newLeader *proto.DataServerIdentity, err error) {
 	e.logger.Info("Starting a new election")
 	timer := e.leaderElectionLatency.Timer()
 
+	// Load the options of the namespace and the addresses of the ensemble
+	// before persisting a new term: a failed load is retried without using up
+	// a term
+	termOptions, err := e.metadataStore.GetNamespaceTermOptions(e.namespace)
+	if err != nil {
+		return nil, err
+	}
+	refreshedEnsemble, err := e.refreshedEnsemble(e.mutableShardMetadata.Ensemble)
+	if err != nil {
+		return nil, err
+	}
+
 	e.mutableShardMetadata.Status = proto.ShardStatusElection
 	e.mutableShardMetadata.Leader = nil
 	e.mutableShardMetadata.Term++
-	e.mutableShardMetadata.Ensemble = e.refreshedEnsemble(e.mutableShardMetadata.Ensemble)
+	e.mutableShardMetadata.Ensemble = refreshedEnsemble
 	if err = e.persistNewTerm(); err != nil {
 		return nil, err
 	}
+	e.term.Store(e.mutableShardMetadata.Term)
 
 	var retryShardMetadata *proto.ShardMetadata
 	if e.changeEnsembleAction != nil {
@@ -740,10 +763,6 @@ func (e *Election) start() (newLeader *proto.DataServerIdentity, err error) {
 	// pinned as well (see checkNegotiatedFeatures).
 	features := e.dataServerSupportedFeaturesSupplier(e.mutableShardMetadata.Ensemble)
 	negotiatedFeatures := unionFeatures(negotiate(features, len(e.mutableShardMetadata.Ensemble)), e.requiredFeatures)
-	termOptions := e.termOptions.CloneVT()
-	if termOptions == nil {
-		termOptions = &proto.NewTermOptions{}
-	}
 	termOptions.Features = negotiatedFeatures
 
 	// Send NewTerm to all the ensemble members
@@ -952,6 +971,13 @@ func negotiate(nodeFeatures map[string][]proto.Feature, candidates int) []proto.
 	return negotiated
 }
 
+// Term returns the term of the shard as the election last persisted it, the
+// term of the shard when the election was created until then. It can be called
+// from any goroutine.
+func (e *Election) Term() int64 {
+	return e.term.Load()
+}
+
 func (e *Election) IsReadyForChangeEnsemble() bool {
 	return e.followerCaughtUp.Load()
 }
@@ -1021,11 +1047,11 @@ func NewElection(ctx context.Context, logger *slog.Logger, eventListener control
 	leaderSelector selector.Selector[*leaderselector.Context, *proto.DataServerIdentity],
 	provider rpc.Provider, namespace string, shard int64,
 	shardMetadata *proto.ShardMetadata,
-	changeEnsembleAction *action.ChangeEnsembleAction, termOptions *proto.NewTermOptions,
+	changeEnsembleAction *action.ChangeEnsembleAction,
 	leaderElectionLatency metric.LatencyHistogram, newTermQuorumLatency metric.LatencyHistogram,
 	becomeLeaderLatency metric.LatencyHistogram, leaderElectionsFailed metric.Counter) *Election {
 	current, cancelFunc := context.WithCancel(ctx)
-	return &Election{
+	election := &Election{
 		logger:                              logger,
 		ctx:                                 current,
 		ctxCancel:                           cancelFunc,
@@ -1038,13 +1064,14 @@ func NewElection(ctx context.Context, logger *slog.Logger, eventListener control
 		namespace:                           namespace,
 		shard:                               shard,
 		mutableShardMetadata:                gproto.CloneOf(shardMetadata),
-		termOptions:                         termOptions,
 		changeEnsembleAction:                changeEnsembleAction,
 		leaderElectionLatency:               leaderElectionLatency,
 		newTermQuorumLatency:                newTermQuorumLatency,
 		becomeLeaderLatency:                 becomeLeaderLatency,
 		leaderElectionsFailed:               leaderElectionsFailed,
 	}
+	election.term.Store(shardMetadata.GetTerm())
+	return election
 }
 
 func chooseCandidates(candidatesStatus map[*proto.DataServerIdentity]*proto.EntryId) []*proto.DataServerIdentity {

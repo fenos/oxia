@@ -122,7 +122,10 @@ type controller struct {
 	periodicTasksInterval time.Duration
 	logger                *slog.Logger
 
-	currentElection *Election
+	// currentElection is owned by the event loop, the only goroutine that
+	// replaces it. The term gauge, which runs on the goroutine that collects
+	// the metrics, borrows it to read its term: hence the atomic pointer.
+	currentElection atomic.Pointer[Election]
 
 	leaderElectionLatency metric.LatencyHistogram
 	newTermQuorumLatency  metric.LatencyHistogram
@@ -206,11 +209,10 @@ func NewController(
 
 	s.termGauge = metric.NewGauge("oxia_coordinator_term",
 		"The term of the shard", "count", labels, func() int64 {
-			borrowedMeta, exists := s.metadataStore.GetShardStatus(s.namespace, s.shard)
-			if !exists {
-				return constant.I64NegativeOne
+			if e := s.currentElection.Load(); e != nil {
+				return e.Term()
 			}
-			return borrowedMeta.UnsafeBorrow().Term
+			return constant.I64NegativeOne
 		})
 
 	s.ctx, s.ctxCancel = context.WithCancel(context.Background())
@@ -225,7 +227,17 @@ func NewController(
 				"namespace": s.namespace,
 				"shard":     fmt.Sprintf("%d", s.shard),
 			}, func() {
-				s.run()
+				// Retry until the shard controller closes
+				bo := oxiatime.NewBackOff(s.ctx)
+				_ = backoff.RetryNotify(func() error {
+					return s.run(bo)
+				}, bo, func(err error, duration time.Duration) {
+					s.logger.Warn(
+						"Failed to start the shard controller, retrying later",
+						slog.Any("error", err),
+						slog.Duration("retry-after", duration),
+					)
+				})
 			},
 		)
 	})
@@ -234,32 +246,77 @@ func NewController(
 }
 
 func (s *controller) Election(electionAction *action.ElectionAction) string {
-	s.terminationMu.RLock()
-	if s.terminating.Load() {
-		s.terminationMu.RUnlock()
-		return ""
-	}
 	clonedAction := electionAction.Clone()
 	clonedAction.Waiter.Add(1)
-	if !channel.PushNoBlock(s.electionOp, clonedAction) {
-		s.terminationMu.RUnlock()
-		clonedAction.Waiter.Done()
-		s.logger.Debug("Discarding leader election because queue is full")
-		return ""
-	}
-	s.terminationMu.RUnlock()
-
+	s.enqueueElectionAction(clonedAction)
 	clonedAction.Waiter.Wait()
 	return clonedAction.NewLeader
 }
 
-func (s *controller) run() {
-	borrowedMeta, exists := s.metadataStore.GetShardStatus(s.namespace, s.shard)
+func (s *controller) enqueueElectionAction(electionAction *action.ElectionAction) {
+	s.terminationMu.RLock()
+	defer s.terminationMu.RUnlock()
+	if s.terminating.Load() {
+		electionAction.Done("")
+		return
+	}
+	if !channel.PushNoBlock(s.electionOp, electionAction) {
+		s.logger.Debug("Discarding leader election because queue is full")
+		electionAction.Done("")
+	}
+}
+
+func (s *controller) run(bo backoff.BackOff) error {
+	borrowedMeta, exists, err := s.metadataStore.GetShardStatus(s.namespace, s.shard)
+	if err != nil {
+		return err
+	}
 	initShardMeta := common.Must(borrowedMeta, exists,
 		"bug: shard metadata missing while starting shard controller: namespace=", s.namespace, " shard=",
 		s.shard).UnsafeBorrow()
 
-	// Do initial check or leader election
+	if err := s.start(initShardMeta); err != nil {
+		return err
+	}
+
+	s.logger.Info("Shard is ready", slog.Any("leader", initShardMeta.Leader))
+	// A failure from now on is retried from the initial interval
+	bo.Reset()
+
+	periodicTasksTimer := time.NewTimer(s.periodicTasksInterval)
+	defer periodicTasksTimer.Stop()
+
+	// The event loop must not block on a failure. A handler that can't
+	// complete, e.g. because the shard metadata can't be loaded, sends its
+	// notification to the channel again a second later instead of retrying
+	// in place. A change of the ensemble fails fast instead: its caller gets
+	// the error and retries it.
+	for !s.terminating.Load() {
+		select {
+		case <-s.ctx.Done():
+			return nil
+		case <-s.deleteOp:
+			s.deleteShardWithRetries()
+		case n := <-s.dataServerFailureOp:
+			s.handleDataServerFailureWithRetries(n)
+		case <-s.featuresDiscoveredOp:
+			s.handleFeaturesDiscoveredWithRetries()
+		case op := <-s.changeEnsembleOp:
+			s.onChangeEnsemble(op)
+		case <-periodicTasksTimer.C:
+			s.handlePeriodicTasks()
+			periodicTasksTimer.Reset(s.periodicTasksInterval)
+		case electionAction := <-s.electionOp:
+			s.handleElectionWithRetries(electionAction)
+		}
+	}
+	s.logger.Info("Shard controller is stopped, stopping event loop")
+	return nil
+}
+
+// start does the initial check or leader election of the shard, when the
+// controller starts.
+func (s *controller) start(initShardMeta *proto.ShardMetadata) error {
 	switch {
 	case initShardMeta.GetStatusOrDefault() == proto.ShardStatusDeleting:
 		s.DeleteShard()
@@ -270,8 +327,15 @@ func (s *controller) run() {
 		// triggering elections that would interfere with the split controller.
 		s.logger.Info("Child shard during split, waiting for split to complete")
 		s.waitForSplitComplete()
+	case initShardMeta.GetRestore() != nil:
+		// A shard created by a restore: its members install the backup before
+		// its first election
+		if err := s.restoreShard(initShardMeta); err != nil {
+			return err
+		}
+		s.electLeader(initShardMeta, nil)
 	case initShardMeta.Leader == nil || initShardMeta.GetStatusOrDefault() != proto.ShardStatusSteadyState:
-		s.onElectLeader(nil)
+		s.electLeader(initShardMeta, nil)
 	default:
 		s.logger.Info(
 			"There is already a data server marked as leader on the shard, verifying",
@@ -279,40 +343,12 @@ func (s *controller) run() {
 		)
 
 		if !s.verifyCurrentEnsemble(initShardMeta) {
-			s.onElectLeader(nil)
+			s.electLeader(initShardMeta, nil)
 		} else {
 			s.SyncServerAddress()
 		}
 	}
-
-	s.logger.Info("Shard is ready", slog.Any("leader", initShardMeta.Leader))
-
-	periodicTasksTimer := time.NewTimer(s.periodicTasksInterval)
-	defer periodicTasksTimer.Stop()
-
-	for {
-		if s.terminating.Load() {
-			s.logger.Info("Shard controller is stopped, stopping event loop")
-			return
-		}
-		select {
-		case <-s.ctx.Done():
-			return
-		case <-s.deleteOp:
-			s.deleteShardWithRetries()
-		case n := <-s.dataServerFailureOp:
-			s.handleDataServerFailure(n)
-		case <-s.featuresDiscoveredOp:
-			s.handleFeaturesDiscovered()
-		case op := <-s.changeEnsembleOp:
-			s.onChangeEnsemble(op)
-		case <-periodicTasksTimer.C:
-			s.handlePeriodicTasks()
-			periodicTasksTimer.Reset(s.periodicTasksInterval)
-		case electionAction := <-s.electionOp:
-			electionAction.Done(s.onElectLeader(nil).GetNameOrDefault())
-		}
-	}
+	return nil
 }
 
 // waitForSplitComplete blocks until the Split metadata is cleared from this
@@ -328,7 +364,11 @@ func (s *controller) waitForSplitComplete() {
 		case <-s.ctx.Done():
 			return
 		case <-ticker.C:
-			borrowedMeta, exists := s.metadataStore.GetShardStatus(s.namespace, s.shard)
+			borrowedMeta, exists, err := s.metadataStore.GetShardStatus(s.namespace, s.shard)
+			if err != nil {
+				s.logger.Warn("Failed to load the shard metadata, retrying later", slog.Any("error", err))
+				continue
+			}
 			if !exists {
 				continue
 			}
@@ -343,8 +383,17 @@ func (s *controller) waitForSplitComplete() {
 	}
 }
 
-func (s *controller) handleDataServerFailure(failedDataServer *proto.DataServerIdentity) {
-	borrowedMeta, exists := s.metadataStore.GetShardStatus(s.namespace, s.shard)
+func (s *controller) handleDataServerFailureWithRetries(failedDataServer *proto.DataServerIdentity) {
+	borrowedMeta, exists, err := s.metadataStore.GetShardStatus(s.namespace, s.shard)
+	if err != nil {
+		s.logger.Warn(
+			"Failed to handle the data server failure, retrying later",
+			slog.Any("failed-data-server", failedDataServer.GetNameOrDefault()),
+			slog.Any("error", err),
+		)
+		time.AfterFunc(time.Second, func() { s.BecameUnavailable(failedDataServer) })
+		return
+	}
 	shardMeta := common.Must(borrowedMeta, exists,
 		"bug: shard metadata missing while handling data server failure: namespace=", s.namespace, " shard=",
 		s.shard).UnsafeBorrow()
@@ -360,21 +409,32 @@ func (s *controller) handleDataServerFailure(failedDataServer *proto.DataServerI
 			"Detected failure on shard leader",
 			slog.Any("leader", failedDataServer.GetNameOrDefault()),
 		)
-		s.onElectLeader(nil)
+		s.electLeader(shardMeta, nil)
 	}
 }
 
-// handleFeaturesDiscovered checks the features pinned by the current term
+// handleFeaturesDiscoveredWithRetries checks the features pinned by the current term
 // when the features of ensemble members are discovered (see
 // checkTermFeatures). The features of the other data servers don't change the
 // ones that the ensemble supports.
-func (s *controller) handleFeaturesDiscovered() {
+func (s *controller) handleFeaturesDiscoveredWithRetries() {
 	s.discoveredDataServersMu.Lock()
 	discovered := s.discoveredDataServers
 	s.discoveredDataServers = make(map[string]*proto.DataServerIdentity)
 	s.discoveredDataServersMu.Unlock()
 
-	borrowedMeta, exists := s.metadataStore.GetShardStatus(s.namespace, s.shard)
+	borrowedMeta, exists, err := s.metadataStore.GetShardStatus(s.namespace, s.shard)
+	if err != nil {
+		// The features are notified once: send them again to the event loop
+		// later
+		s.logger.Warn("Failed to check the term features, retrying later", slog.Any("error", err))
+		time.AfterFunc(time.Second, func() {
+			for _, dataServer := range discovered {
+				s.FeaturesDiscovered(dataServer)
+			}
+		})
+		return
+	}
 	shardMeta := common.Must(borrowedMeta, exists,
 		"bug: shard metadata missing while handling discovered features: namespace=", s.namespace, " shard=",
 		s.shard).UnsafeBorrow()
@@ -436,14 +496,14 @@ func (s *controller) checkTermFeatures(shardMeta *proto.ShardMetadata) {
 		slog.Any("pinned-features", pinned),
 		slog.Any("features", features),
 	)
-	s.onElectLeader(nil)
+	s.electLeader(shardMeta, nil)
 }
 
 // termFeatures returns the features pinned by the current term of the shard.
 // They are known if the controller elected the leader of the term; otherwise,
 // e.g. after a restart of the coordinator, the leader reports them.
 func (s *controller) termFeatures(shardMeta *proto.ShardMetadata) ([]proto.Feature, error) {
-	if e := s.currentElection; e != nil && e.mutableShardMetadata.GetLeader() != nil &&
+	if e := s.currentElection.Load(); e != nil && e.mutableShardMetadata.GetLeader() != nil &&
 		e.mutableShardMetadata.GetTerm() == shardMeta.GetTerm() {
 		return e.pinnedFeatures, nil
 	}
@@ -510,30 +570,8 @@ func (s *controller) verifyCurrentEnsemble(initShardMeta *proto.ShardMetadata) b
 	return true
 }
 
-// namespaceTermOptions builds the NewTerm options (notifications + key sorting)
-// for a shard from its namespace config, falling back to defaults when the
-// namespace config is missing. Shared by the leader-election path and the
-// shard-split path so post-split children inherit the same term settings as a
-// normally-elected leader.
-func namespaceTermOptions(metadataStore coordmetadata.Metadata, namespace string) *proto.NewTermOptions {
-	termOptions := &proto.NewTermOptions{
-		EnableNotifications: true,
-		KeySorting:          proto.KeySortingType_UNKNOWN,
-	}
-	if borrowedNamespaceConfig, exist := metadataStore.GetNamespace(namespace); exist {
-		nsConfig := borrowedNamespaceConfig.UnsafeBorrow()
-		termOptions.EnableNotifications = nsConfig.NotificationsEnabledOrDefault()
-		termOptions.KeySorting, _ = nsConfig.GetKeySortingType()
-	}
-	return termOptions
-}
-
-func (s *controller) validateChangeEnsembleFeatures(changeEnsembleAction *action.ChangeEnsembleAction) error {
-	borrowedMeta, exists := s.metadataStore.GetShardStatus(s.namespace, s.shard)
-	shardMeta := common.Must(borrowedMeta, exists,
-		"bug: shard metadata missing while validating change ensemble: namespace=", s.namespace, " shard=",
-		s.shard).UnsafeBorrow()
-
+func (s *controller) validateChangeEnsembleFeatures(shardMeta *proto.ShardMetadata,
+	changeEnsembleAction *action.ChangeEnsembleAction) error {
 	// The ensemble of the parent and of the children of a split doesn't change
 	// until the split ends. Checking it before the election that changes the
 	// ensemble keeps the current election of the shard running; the election
@@ -601,29 +639,37 @@ func (s *controller) validateChangeEnsembleFeatures(changeEnsembleAction *action
 	return nil
 }
 
-func (s *controller) onElectLeader(changeEnsembleAction *action.ChangeEnsembleAction) *proto.DataServerIdentity {
-	borrowedMeta, exists := s.metadataStore.GetShardStatus(s.namespace, s.shard)
+func (s *controller) handleElectionWithRetries(electionAction *action.ElectionAction) {
+	borrowedMeta, exists, err := s.metadataStore.GetShardStatus(s.namespace, s.shard)
+	if err != nil {
+		s.logger.Warn("Failed to start the election, retrying later", slog.Any("error", err))
+		time.AfterFunc(time.Second, func() { s.enqueueElectionAction(electionAction) })
+		return
+	}
 	shardMeta := common.Must(borrowedMeta, exists,
 		"bug: shard metadata missing while starting election: namespace=", s.namespace, " shard=",
 		s.shard).UnsafeBorrow()
+	electionAction.Done(s.electLeader(shardMeta, nil).GetNameOrDefault())
+}
 
+// electLeader starts a new election of the shard, with its current metadata,
+// in place of the current one.
+func (s *controller) electLeader(shardMeta *proto.ShardMetadata,
+	changeEnsembleAction *action.ChangeEnsembleAction) *proto.DataServerIdentity {
 	// stop the current term election
-	if s.currentElection != nil {
-		s.currentElection.Stop()
-		s.currentElection = nil
+	if e := s.currentElection.Swap(nil); e != nil {
+		e.Stop()
 	}
 
-	termOptions := namespaceTermOptions(s.metadataStore, s.namespace)
-	s.currentElection = NewElection(s.ctx, s.logger, s.eventListener,
+	election := NewElection(s.ctx, s.logger, s.eventListener,
 		s.metadataStore, s.dataServerSupportedFeaturesSupplier, s.leaderSelector,
 		s.rpc, s.namespace, s.shard, shardMeta, changeEnsembleAction,
-		termOptions,
 		s.leaderElectionLatency,
 		s.newTermQuorumLatency,
 		s.becomeLeaderLatency,
 		s.leaderElectionsFailed)
-	leaderDataServer := s.currentElection.Start()
-	return leaderDataServer
+	s.currentElection.Store(election)
+	return election.Start()
 }
 
 func (s *controller) DeleteShard() {
@@ -632,70 +678,71 @@ func (s *controller) DeleteShard() {
 	if s.terminating.Load() {
 		return
 	}
-	select {
-	case s.deleteOp <- nil:
-	case <-s.ctx.Done():
-	}
+	// A pending deletion covers this one too
+	channel.PushNoBlock(s.deleteOp, nil)
 }
 
 func (s *controller) deleteShardWithRetries() {
 	s.logger.Info("Deleting shard")
+	if err := s.deleteShard(); err != nil {
+		s.logger.Warn("Delete shard failed, retrying later", slog.Any("error", err))
+		time.AfterFunc(time.Second, s.DeleteShard)
+	}
+}
 
-	_ = backoff.RetryNotify(func() error {
-		borrowedMeta, exists := s.metadataStore.GetShardStatus(s.namespace, s.shard)
-		shardMeta := gproto.CloneOf(common.Must(borrowedMeta, exists,
-			"bug: shard metadata missing while deleting shard: namespace=", s.namespace, " shard=",
-			s.shard).UnsafeBorrow())
-		for _, server := range shardMeta.Ensemble {
-			// We need to save the address because it gets modified in the loop
-			if _, err := s.rpc.DeleteShard(s.ctx, server, &proto.DeleteShardRequest{
-				Namespace: s.namespace,
-				Shard:     s.shard,
-				Term:      shardMeta.Term,
-			}); err != nil {
-				s.logger.Warn(
-					"Failed to delete shard",
-					slog.Any("error", err),
-					slog.Any("data-server", server),
-				)
-				return err
-			}
-
-			s.logger.Info(
-				"Successfully deleted shard from data server",
-				slog.Any("server-address", server),
-			)
-		}
-
-		s.terminating.Store(true)
-		if err := s.metadataStore.DeleteShardStatus(s.namespace, s.shard); err != nil {
-			// The shard is still marked as deleting: its deletion resumes when
-			// the coordinator restarts
-			return backoff.Permanent(err)
-		}
-		if s.eventListener != nil {
-			go func() {
-				process.DoWithLabels(
-					context.Background(),
-					map[string]string{
-						"oxia":      "shard-controller-deleted-callback",
-						"namespace": s.namespace,
-						"shard":     fmt.Sprintf("%d", s.shard),
-					}, func() {
-						s.eventListener.ShardDeleted(s.shard)
-					},
-				)
-			}()
-		}
-		return nil
-	}, oxiatime.NewBackOff(s.ctx),
-		func(err error, duration time.Duration) {
+func (s *controller) deleteShard() error {
+	borrowedMeta, exists, err := s.metadataStore.GetShardStatus(s.namespace, s.shard)
+	if err != nil {
+		return err
+	}
+	shardMeta := gproto.CloneOf(common.Must(borrowedMeta, exists,
+		"bug: shard metadata missing while deleting shard: namespace=", s.namespace, " shard=",
+		s.shard).UnsafeBorrow())
+	for _, server := range shardMeta.Ensemble {
+		// We need to save the address because it gets modified in the loop
+		if _, err := s.rpc.DeleteShard(s.ctx, server, &proto.DeleteShardRequest{
+			Namespace: s.namespace,
+			Shard:     s.shard,
+			Term:      shardMeta.Term,
+		}); err != nil {
 			s.logger.Warn(
-				"Delete shard failed, retrying later",
-				slog.Duration("retry-after", duration),
+				"Failed to delete shard",
 				slog.Any("error", err),
+				slog.Any("data-server", server),
 			)
-		})
+			return err
+		}
+
+		s.logger.Info(
+			"Successfully deleted shard from data server",
+			slog.Any("server-address", server),
+		)
+	}
+
+	s.terminationMu.Lock()
+	err = s.metadataStore.DeleteShardStatus(s.namespace, s.shard)
+	if err == nil {
+		s.terminating.Store(true)
+	}
+	s.terminationMu.Unlock()
+	if err != nil {
+		return err
+	}
+	if s.eventListener != nil {
+		go func() {
+			process.DoWithLabels(
+				context.Background(),
+				map[string]string{
+					"oxia":      "shard-controller-deleted-callback",
+					"namespace": s.namespace,
+					"shard":     fmt.Sprintf("%d", s.shard),
+				}, func() {
+					s.eventListener.ShardDeleted(s.shard)
+				},
+			)
+		}()
+	}
+	return nil
 }
 
 func (s *controller) Close() error {
@@ -749,20 +796,29 @@ func (s *controller) ChangeEnsemble(changeEnsembleAction *action.ChangeEnsembleA
 }
 
 func (s *controller) onChangeEnsemble(changeEnsembleAction *action.ChangeEnsembleAction) {
-	if s.currentElection != nil {
-		if ready := s.currentElection.IsReadyForChangeEnsemble(); !ready {
+	if e := s.currentElection.Load(); e != nil {
+		if ready := e.IsReadyForChangeEnsemble(); !ready {
 			s.logger.Warn("Change ensemble rejected: shard is not ready (follower catch-up still in progress)")
 			changeEnsembleAction.Error(ErrNotReadyForChangeEnsemble)
 			return
 		}
 	}
-	if err := s.validateChangeEnsembleFeatures(changeEnsembleAction); err != nil {
+	borrowedMeta, exists, err := s.metadataStore.GetShardStatus(s.namespace, s.shard)
+	if err != nil {
+		changeEnsembleAction.Error(err)
+		return
+	}
+	shardMeta := common.Must(borrowedMeta, exists,
+		"bug: shard metadata missing while changing the ensemble: namespace=", s.namespace, " shard=",
+		s.shard).UnsafeBorrow()
+	if err := s.validateChangeEnsembleFeatures(shardMeta, changeEnsembleAction); err != nil {
 		changeEnsembleAction.Error(err)
 		return
 	}
 	// todo: support optimized ensemble change to avoid start a new election
-	leader := s.onElectLeader(changeEnsembleAction)
-	if err := s.currentElection.ChangeEnsembleError(); err != nil {
+	leader := s.electLeader(shardMeta, changeEnsembleAction)
+	election := s.currentElection.Load()
+	if err := election.ChangeEnsembleError(); err != nil {
 		changeEnsembleAction.Error(err)
 		return
 	}
@@ -772,8 +828,8 @@ func (s *controller) onChangeEnsemble(changeEnsembleAction *action.ChangeEnsembl
 		// as ready for a change of its ensemble as it was before this one: drop
 		// the election, which never elected a leader for its followers to catch
 		// up with, or it rejects the next changes as not ready.
-		s.currentElection.Stop()
-		s.currentElection = nil
+		election.Stop()
+		s.currentElection.Store(nil)
 		changeEnsembleAction.Error(fmt.Errorf("%w: the election stopped before changing the ensemble",
 			ErrNotReadyForChangeEnsemble))
 		return
@@ -787,18 +843,26 @@ func (s *controller) SyncServerAddress() {
 	if s.terminating.Load() {
 		return
 	}
-	borrowedMeta, exists := s.metadataStore.GetShardStatus(s.namespace, s.shard)
-	if !exists {
-		if s.terminating.Load() {
-			return
-		}
+	borrowedMeta, exists, err := s.metadataStore.GetShardStatus(s.namespace, s.shard)
+	if err != nil {
+		s.logger.Warn("Failed to sync the server addresses", slog.Any("error", err))
+		return
+	}
+	if !exists && s.terminating.Load() {
+		// The shard was deleted since the check above
+		return
 	}
 	shardMeta := common.Must(borrowedMeta, exists,
 		"bug: shard metadata missing while syncing server addresses: namespace=", s.namespace, " shard=",
 		s.shard).UnsafeBorrow()
 	needSync := false
 	for _, candidate := range shardMeta.Ensemble {
-		if borrowedDataServer, ok := s.metadataStore.GetDataServer(candidate.GetNameOrDefault()); ok {
+		borrowedDataServer, ok, err := s.metadataStore.GetDataServer(candidate.GetNameOrDefault())
+		if err != nil {
+			s.logger.Warn("Failed to sync the server addresses", slog.Any("error", err))
+			return
+		}
+		if ok {
 			newInfo := borrowedDataServer.UnsafeBorrow().GetIdentity()
 			if newInfo != nil &&
 				(newInfo.GetPublic() != candidate.GetPublic() || newInfo.GetInternal() != candidate.GetInternal()) {
@@ -823,7 +887,11 @@ func (s *controller) SyncServerAddress() {
 }
 
 func (s *controller) handlePeriodicTasks() {
-	borrowedMeta, exists := s.metadataStore.GetShardStatus(s.namespace, s.shard)
+	borrowedMeta, exists, err := s.metadataStore.GetShardStatus(s.namespace, s.shard)
+	if err != nil {
+		s.logger.Warn("Failed to handle the periodic tasks, retrying next round", slog.Any("error", err))
+		return
+	}
 	shardMeta := common.Must(borrowedMeta, exists,
 		"bug: shard metadata missing while handling periodic tasks: namespace=", s.namespace, " shard=",
 		s.shard).UnsafeBorrow()
@@ -860,7 +928,8 @@ func (s *controller) handlePendingDeleteShard(shardMeta *proto.ShardMetadata) er
 	}
 
 	// Best-effort: if this is not persisted, the pending deletes are retried
-	_ = s.metadataStore.UpdateShardStatuses(s.namespace, func(shards map[int64]*proto.ShardMetadata) bool {
+	_ = s.metadataStore.PatchNamespaceStatus(s.namespace, func(status *proto.NamespaceStatus) bool {
+		shards := status.Shards
 		current, exists := shards[s.shard]
 		if !exists {
 			return false

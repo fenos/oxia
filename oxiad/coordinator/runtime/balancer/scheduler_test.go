@@ -97,16 +97,16 @@ func (m *mockMetadata) GetNamespaceStatus(namespace string) (commonobject.Borrow
 	return commonobject.Borrow(status), true, nil
 }
 
-func (m *mockMetadata) GetShardStatus(namespace string, shard int64) (commonobject.Borrowed[*proto.ShardMetadata], bool) {
+func (m *mockMetadata) GetShardStatus(namespace string, shard int64) (commonobject.Borrowed[*proto.ShardMetadata], bool, error) {
 	namespaceStatus, exists := m.status.GetNamespaces()[namespace]
 	if !exists {
-		return commonobject.Borrowed[*proto.ShardMetadata]{}, false
+		return commonobject.Borrowed[*proto.ShardMetadata]{}, false, nil
 	}
 	shardStatus, exists := namespaceStatus.GetShards()[shard]
 	if !exists {
-		return commonobject.Borrowed[*proto.ShardMetadata]{}, false
+		return commonobject.Borrowed[*proto.ShardMetadata]{}, false, nil
 	}
-	return commonobject.Borrow(shardStatus), true
+	return commonobject.Borrow(shardStatus), true, nil
 }
 
 func (*mockMetadata) DeleteNamespaceStatus(string) commonobject.Borrowed[*proto.NamespaceStatus] {
@@ -122,9 +122,9 @@ func (m *mockMetadata) UpdateShardStatus(namespace string, shard int64, shardMet
 	return nil
 }
 
-func (m *mockMetadata) UpdateShardStatuses(namespace string, update func(map[int64]*proto.ShardMetadata) bool) error {
+func (m *mockMetadata) PatchNamespaceStatus(namespace string, modify func(*proto.NamespaceStatus) bool) error {
 	if ns, exists := m.status.GetNamespaces()[namespace]; exists {
-		update(ns.Shards)
+		modify(ns)
 	}
 	return nil
 }
@@ -145,22 +145,22 @@ func (*mockMetadata) DeleteNamespace(string) (*proto.Namespace, error) {
 	return &proto.Namespace{}, nil
 }
 
-func (m *mockMetadata) ListNamespace() map[string]commonobject.Borrowed[*proto.Namespace] {
+func (m *mockMetadata) ListNamespace() (map[string]commonobject.Borrowed[*proto.Namespace], error) {
 	namespaces := make(map[string]commonobject.Borrowed[*proto.Namespace], len(m.nsConfigs))
 	for name, namespace := range m.nsConfigs {
 		namespaces[name] = commonobject.Borrow(namespace)
 	}
-	return namespaces
+	return namespaces, nil
 }
 
-func (m *mockMetadata) GetConfig() commonobject.Borrowed[*proto.ClusterConfiguration] {
+func (m *mockMetadata) GetConfig() (commonobject.Borrowed[*proto.ClusterConfiguration], error) {
 	namespaces := make([]*proto.Namespace, 0, len(m.nsConfigs))
 	for _, namespace := range m.nsConfigs {
 		namespaces = append(namespaces, namespace)
 	}
 	return commonobject.Borrow(&proto.ClusterConfiguration{
 		Namespaces: namespaces,
-	})
+	}), nil
 }
 
 // SubscribeConfig is not used by these tests.
@@ -168,14 +168,14 @@ func (*mockMetadata) SubscribeConfig() *cache.Subscription[provider.Versioned[*p
 	return nil
 }
 
-func (m *mockMetadata) GetLoadBalancer() commonobject.Borrowed[*proto.LoadBalancer] {
+func (m *mockMetadata) GetLoadBalancerConfig() (commonobject.Borrowed[*proto.LoadBalancer], error) {
 	if m.lbConfig != nil {
-		return commonobject.Borrow(m.lbConfig)
+		return commonobject.Borrow(m.lbConfig), nil
 	}
 	return commonobject.Borrow(&proto.LoadBalancer{
 		ScheduleInterval: "30s",
 		QuarantineTime:   "5m",
-	})
+	}), nil
 }
 
 func (*mockMetadata) CreateDataServer(*proto.DataServer) error {
@@ -190,7 +190,7 @@ func (*mockMetadata) DeleteDataServer(string) (*proto.DataServer, error) {
 	return &proto.DataServer{}, nil
 }
 
-func (m *mockMetadata) ListDataServer() map[string]commonobject.Borrowed[*proto.DataServer] {
+func (m *mockMetadata) ListDataServer() (map[string]commonobject.Borrowed[*proto.DataServer], error) {
 	dataServers := make(map[string]commonobject.Borrowed[*proto.DataServer], m.nodes.Size())
 	for _, id := range m.nodes.Values() {
 		name := id
@@ -210,21 +210,26 @@ func (m *mockMetadata) ListDataServer() map[string]commonobject.Borrowed[*proto.
 			Metadata: metadata,
 		})
 	}
-	return dataServers
+	return dataServers, nil
 }
 
-func (m *mockMetadata) GetNamespace(namespace string) (commonobject.Borrowed[*proto.Namespace], bool) {
+// GetNamespaceTermOptions is not used by these tests.
+func (*mockMetadata) GetNamespaceTermOptions(string) (*proto.NewTermOptions, error) {
+	return &proto.NewTermOptions{}, nil
+}
+
+func (m *mockMetadata) GetNamespace(namespace string) (commonobject.Borrowed[*proto.Namespace], bool, error) {
 	nc, ok := m.nsConfigs[namespace]
 	if !ok {
-		return commonobject.Borrowed[*proto.Namespace]{}, false
+		return commonobject.Borrowed[*proto.Namespace]{}, false, nil
 	}
-	return commonobject.Borrow(nc), true
+	return commonobject.Borrow(nc), true, nil
 }
 
-func (m *mockMetadata) GetDataServer(name string) (commonobject.Borrowed[*proto.DataServer], bool) {
+func (m *mockMetadata) GetDataServer(name string) (commonobject.Borrowed[*proto.DataServer], bool, error) {
 	n, ok := m.nodeMap[name]
 	if !ok {
-		return commonobject.Borrowed[*proto.DataServer]{}, false
+		return commonobject.Borrowed[*proto.DataServer]{}, false, nil
 	}
 	metadata, ok := m.metadata[name]
 	if !ok {
@@ -233,7 +238,7 @@ func (m *mockMetadata) GetDataServer(name string) (commonobject.Borrowed[*proto.
 	return commonobject.Borrow(&proto.DataServer{
 		Identity: n,
 		Metadata: metadata,
-	}), true
+	}), true, nil
 }
 
 // alwaysErrorSelector is a selector that always returns ErrUnsatisfiedAntiAffinity.
@@ -249,12 +254,14 @@ func newTestBalancer(
 	metadata *mockMetadata,
 	sel selector.Selector[*single.Context, string],
 ) *nodeBasedBalancer {
+	// The mock never fails to load the configuration
+	loadBalancerConf, _ := metadata.GetLoadBalancerConfig()
 	return &nodeBasedBalancer{
 		logger:                  slog.Default(),
 		ctx:                     ctx,
 		ctxCancel:               cancel,
 		wg:                      sync.WaitGroup{},
-		loadBalancerConf:        metadata.GetLoadBalancer().UnsafeBorrow(),
+		loadBalancerConf:        loadBalancerConf.UnsafeBorrow(),
 		metadata:                metadata,
 		selector:                sel,
 		loadRatioAlgorithm:      single.DefaultShardsRank,
@@ -604,7 +611,9 @@ func TestSwapShardPassesNamespaceAndShardToSelector(t *testing.T) {
 	defer cancel()
 
 	b := newTestBalancer(ctx, cancel, metadata, sel)
-	candidates, candidatesMetadata := dataServersToCandidatesAndMetadata(metadata.ListDataServer())
+	dataServers, err := metadata.ListDataServer()
+	assert.NoError(t, err)
+	candidates, candidatesMetadata := dataServersToCandidatesAndMetadata(dataServers)
 	loadRatios := single.DefaultShardsRank(&model.RatioParams{
 		NodeShardsInfos: map[string][]model.ShardInfo{
 			"sv-1": {{
@@ -621,7 +630,7 @@ func TestSwapShardPassesNamespaceAndShardToSelector(t *testing.T) {
 		},
 	})
 
-	_, err := b.swapShard(
+	_, err = b.swapShard(
 		&model.ShardLoadRatio{
 			ShardInfo: &model.ShardInfo{
 				Namespace: "ns-1",

@@ -127,8 +127,8 @@ func TestRpcProvider_AsyncWritesAreSentBeforeTheirResponses(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
-	first := provider.ExecuteWriteAsync(ctx, putRequest(&shardId, "a"))
-	second := provider.ExecuteWriteAsync(ctx, putRequest(&shardId, "b"))
+	first := provider.ExecuteWriteAsync(ctx, shardId, request(putRequest(&shardId, "a")))
+	second := provider.ExecuteWriteAsync(ctx, shardId, request(putRequest(&shardId, "b")))
 
 	require.Eventually(t, func() bool { return len(server.receivedKeys()) == 2 }, 10*time.Second, time.Millisecond)
 	assert.Equal(t, []string{"a", "b"}, server.receivedKeys())
@@ -153,8 +153,8 @@ func TestRpcProvider_AsyncWriteDeadlineClosesTheStream(t *testing.T) {
 	defer cancelShort()
 	long, cancelLong := context.WithTimeout(t.Context(), time.Minute)
 	defer cancelLong()
-	first := provider.ExecuteWriteAsync(short, putRequest(&shardId, "a"))
-	second := provider.ExecuteWriteAsync(long, putRequest(&shardId, "b"))
+	first := provider.ExecuteWriteAsync(short, shardId, request(putRequest(&shardId, "a")))
+	second := provider.ExecuteWriteAsync(long, shardId, request(putRequest(&shardId, "b")))
 	require.Eventually(t, func() bool { return len(server.receivedKeys()) == 2 }, 10*time.Second, time.Millisecond)
 
 	_, err := first()
@@ -171,7 +171,7 @@ func TestRpcProvider_AsyncWriteDeadlineClosesTheStream(t *testing.T) {
 		require.Fail(t, "the write behind the expired one kept waiting on the stream")
 	}
 
-	third := provider.ExecuteWriteAsync(long, putRequest(&shardId, "c"))
+	third := provider.ExecuteWriteAsync(long, shardId, request(putRequest(&shardId, "c")))
 	require.Eventually(t, func() bool { return len(server.receivedKeys()) == 3 }, 10*time.Second, time.Millisecond)
 	server.answer <- nil
 	_, err = third()
@@ -189,8 +189,8 @@ func TestRpcProvider_AsyncWritesInFlightFailWhenTheLeaderStepsDown(t *testing.T)
 
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
-	first := provider.ExecuteWriteAsync(ctx, putRequest(&shardId, "a"))
-	second := provider.ExecuteWriteAsync(ctx, putRequest(&shardId, "b"))
+	first := provider.ExecuteWriteAsync(ctx, shardId, request(putRequest(&shardId, "a")))
+	second := provider.ExecuteWriteAsync(ctx, shardId, request(putRequest(&shardId, "b")))
 	require.Eventually(t, func() bool { return len(server.receivedKeys()) == 2 }, 10*time.Second, time.Millisecond)
 
 	server.answer <- constant.IntoGrpcStatusError(constant.ErrNodeIsNotLeader)
@@ -199,7 +199,7 @@ func TestRpcProvider_AsyncWritesInFlightFailWhenTheLeaderStepsDown(t *testing.T)
 	_, err = second()
 	require.ErrorIs(t, err, constant.ErrNodeIsNotLeader)
 
-	third := provider.ExecuteWriteAsync(ctx, putRequest(&shardId, "c"))
+	third := provider.ExecuteWriteAsync(ctx, shardId, request(putRequest(&shardId, "c")))
 	require.Eventually(t, func() bool { return len(server.receivedKeys()) == 3 }, 10*time.Second, time.Millisecond)
 	server.answer <- nil
 	_, err = third()
@@ -217,8 +217,8 @@ func TestRpcProvider_AsyncWritesLeftUnprocessedAreSentAgain(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
-	first := provider.ExecuteWriteAsync(ctx, putRequest(&shardId, "a"))
-	second := provider.ExecuteWriteAsync(ctx, putRequest(&shardId, "b"))
+	first := provider.ExecuteWriteAsync(ctx, shardId, request(putRequest(&shardId, "a")))
+	second := provider.ExecuteWriteAsync(ctx, shardId, request(putRequest(&shardId, "b")))
 	require.Eventually(t, func() bool { return len(server.receivedKeys()) == 2 }, 10*time.Second, time.Millisecond)
 
 	server.answer <- constant.IntoGrpcStatusError(constant.ErrNodeIsNotLeader, constant.WithUnprocessed())
@@ -252,9 +252,9 @@ func TestRpcProvider_AsyncWritesRejectedAtSetupAreSentToTheHintedLeader(t *testi
 
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
-	first := provider.ExecuteWriteAsync(ctx, putRequest(&shardId, "a"))
-	second := provider.ExecuteWriteAsync(ctx, putRequest(&shardId, "b"))
-	third := provider.ExecuteWriteAsync(ctx, putRequest(&shardId, "c"))
+	first := provider.ExecuteWriteAsync(ctx, shardId, request(putRequest(&shardId, "a")))
+	second := provider.ExecuteWriteAsync(ctx, shardId, request(putRequest(&shardId, "b")))
+	third := provider.ExecuteWriteAsync(ctx, shardId, request(putRequest(&shardId, "c")))
 
 	require.Eventually(t, func() bool { return len(newLeader.receivedKeys()) == 3 }, 10*time.Second, time.Millisecond)
 	assert.Equal(t, []string{"a", "b", "c"}, newLeader.receivedKeys())
@@ -309,7 +309,7 @@ func TestRpcProvider_AsyncWritesRejectedAgainAreResentWithABackoff(t *testing.T)
 
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
-	_, err := provider.ExecuteWriteAsync(ctx, putRequest(&shardId, "a"))()
+	_, err := provider.ExecuteWriteAsync(ctx, shardId, request(putRequest(&shardId, "a")))()
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 	assert.Less(t, server.streams.Load(), int32(10), "the writes were sent again without a delay")
 }
@@ -325,7 +325,7 @@ func TestRpcProvider_AsyncWritesRejectedByAGoneShardFail(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
-	wait := provider.ExecuteWriteAsync(ctx, putRequest(&shardId, "a"))
+	wait := provider.ExecuteWriteAsync(ctx, shardId, request(putRequest(&shardId, "a")))
 	require.Eventually(t, func() bool { return server.streams.Load() > 0 }, 10*time.Second, time.Millisecond)
 	shardManager.removed.Store(true)
 
@@ -343,8 +343,8 @@ func TestRpcProvider_AsyncWritesInFlightFailWhenTheStreamBreaks(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
-	first := provider.ExecuteWriteAsync(ctx, putRequest(&shardId, "a"))
-	second := provider.ExecuteWriteAsync(ctx, putRequest(&shardId, "b"))
+	first := provider.ExecuteWriteAsync(ctx, shardId, request(putRequest(&shardId, "a")))
+	second := provider.ExecuteWriteAsync(ctx, shardId, request(putRequest(&shardId, "b")))
 	require.Eventually(t, func() bool { return len(server.receivedKeys()) == 2 }, 10*time.Second, time.Millisecond)
 
 	broken := status.Error(codes.Internal, "stream broken")
@@ -354,10 +354,15 @@ func TestRpcProvider_AsyncWritesInFlightFailWhenTheStreamBreaks(t *testing.T) {
 	_, err = second()
 	require.Equal(t, codes.Internal, status.Code(err))
 
-	third := provider.ExecuteWriteAsync(ctx, putRequest(&shardId, "c"))
+	third := provider.ExecuteWriteAsync(ctx, shardId, request(putRequest(&shardId, "c")))
 	require.Eventually(t, func() bool { return len(server.receivedKeys()) == 3 }, 10*time.Second, time.Millisecond)
 	server.answer <- nil
 	_, err = third()
 	require.NoError(t, err)
 	assert.Equal(t, []string{"a", "b", "c"}, server.receivedKeys(), "no write was sent again")
+}
+
+// request prepares a request as it is.
+func request(req *proto.WriteRequest) func() (*proto.WriteRequest, error) {
+	return func() (*proto.WriteRequest, error) { return req, nil }
 }

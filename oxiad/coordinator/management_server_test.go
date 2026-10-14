@@ -570,7 +570,8 @@ func TestManagementServerCreateNamespace(t *testing.T) {
 	assert.False(t, res.Namespace.NotificationsEnabledOrDefault())
 	assert.Equal(t, "natural", res.Namespace.GetKeySorting())
 
-	namespace, found := management.metadata.GetNamespace("ns-1")
+	namespace, found, err := management.metadata.GetNamespace("ns-1")
+	require.NoError(t, err)
 	require.True(t, found)
 	assert.Equal(t, "ns-1", namespace.UnsafeBorrow().GetName())
 }
@@ -663,7 +664,8 @@ func TestManagementServerCreateNamespaceRejectsReservedName(t *testing.T) {
 			require.Error(t, err)
 			assert.Equal(t, codes.InvalidArgument, grpcstatus.Code(err))
 
-			_, found := management.metadata.GetNamespace(name)
+			_, found, err := management.metadata.GetNamespace(name)
+			require.NoError(t, err)
 			assert.False(t, found)
 		})
 	}
@@ -780,7 +782,8 @@ func TestManagementServerPatchNamespace(t *testing.T) {
 	assert.False(t, res.Namespace.NotificationsEnabledOrDefault())
 	assert.Equal(t, "hierarchical", res.Namespace.GetKeySorting())
 
-	namespace, found := management.metadata.GetNamespace("ns-1")
+	namespace, found, err := management.metadata.GetNamespace("ns-1")
+	require.NoError(t, err)
 	require.True(t, found)
 	assert.EqualValues(t, 1, namespace.UnsafeBorrow().GetInitialShardCount())
 	assert.EqualValues(t, 2, namespace.UnsafeBorrow().GetReplicationFactor())
@@ -822,7 +825,8 @@ func TestManagementServerPatchNamespaceRejectsAntiAffinities(t *testing.T) {
 	assert.Equal(t, codes.InvalidArgument, grpcstatus.Code(err))
 	assert.Nil(t, res)
 
-	namespace, found := management.metadata.GetNamespace("ns-1")
+	namespace, found, err := management.metadata.GetNamespace("ns-1")
+	require.NoError(t, err)
 	require.True(t, found)
 	require.Len(t, namespace.UnsafeBorrow().GetAntiAffinities(), 1)
 	assert.Equal(t, []string{"rack"}, namespace.UnsafeBorrow().GetAntiAffinities()[0].GetLabels())
@@ -981,9 +985,11 @@ func TestManagementServerDeleteNamespace(t *testing.T) {
 	assert.EqualValues(t, 1, res.Namespace.GetInitialShardCount())
 	assert.Equal(t, "natural", res.Namespace.GetKeySorting())
 
-	_, found := management.metadata.GetNamespace("ns-1")
+	_, found, err := management.metadata.GetNamespace("ns-1")
+	require.NoError(t, err)
 	assert.False(t, found)
-	namespace, found := management.metadata.GetNamespace("ns-2")
+	namespace, found, err := management.metadata.GetNamespace("ns-2")
+	require.NoError(t, err)
 	require.True(t, found)
 	assert.Equal(t, "ns-2", namespace.UnsafeBorrow().GetName())
 }
@@ -1094,7 +1100,8 @@ func TestManagementServerCreateDataServer(t *testing.T) {
 	assert.Equal(t, "internal-1", res.DataServer.Identity.GetInternal())
 	assert.Equal(t, map[string]string{"rack": "rack-1"}, res.DataServer.Metadata.GetLabels())
 
-	created, found := management.metadata.GetDataServer(serverName)
+	created, found, err := management.metadata.GetDataServer(serverName)
+	require.NoError(t, err)
 	require.True(t, found)
 	assert.Equal(t, "public-1", created.UnsafeBorrow().Identity.GetPublic())
 }
@@ -1183,7 +1190,8 @@ func TestManagementServerPatchDataServer(t *testing.T) {
 	assert.Equal(t, "internal-1", res.DataServer.Identity.GetInternal())
 	assert.Equal(t, map[string]string{"rack": "rack-2"}, res.DataServer.Metadata.GetLabels())
 
-	patched, found := management.metadata.GetDataServer(serverName)
+	patched, found, err := management.metadata.GetDataServer(serverName)
+	require.NoError(t, err)
 	require.True(t, found)
 	assert.Equal(t, "public-2", patched.UnsafeBorrow().Identity.GetPublic())
 	assert.Equal(t, "internal-1", patched.UnsafeBorrow().Identity.GetInternal())
@@ -1256,7 +1264,8 @@ func TestManagementServerDeleteDataServer(t *testing.T) {
 	assert.Equal(t, "internal-1", res.DataServer.Identity.GetInternal())
 	assert.Equal(t, map[string]string{"rack": "rack-1"}, res.DataServer.Metadata.GetLabels())
 
-	_, found := management.metadata.GetDataServer(serverName)
+	_, found, err := management.metadata.GetDataServer(serverName)
+	require.NoError(t, err)
 	assert.False(t, found)
 }
 
@@ -1313,6 +1322,19 @@ func TestManagementServerDeleteDataServerFailedPrecondition(t *testing.T) {
 	require.Error(t, err)
 	assert.Equal(t, codes.FailedPrecondition, grpcstatus.Code(err))
 
-	_, found := management.metadata.GetDataServer(serverName1)
+	_, found, err := management.metadata.GetDataServer(serverName1)
+	require.NoError(t, err)
 	assert.True(t, found)
+}
+
+func (*testRuntime) RequestBackup(string, *int64) (int, error) {
+	return 0, coordruntime.ErrBackupsUnsupported
+}
+
+func (*testRuntime) ListBackups(context.Context, string, *int64, string) ([]*proto.BackupInfo, error) {
+	return nil, coordruntime.ErrBackupsUnsupported
+}
+
+func (*testRuntime) RestoreNamespace(context.Context, *proto.RestoreNamespaceRequest) (*proto.RestoreNamespaceResponse, error) {
+	return nil, coordruntime.ErrBackupsUnsupported
 }

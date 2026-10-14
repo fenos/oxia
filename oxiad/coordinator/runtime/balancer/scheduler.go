@@ -17,6 +17,7 @@ package balancer
 import (
 	"context"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -88,10 +89,17 @@ func dataServersToCandidatesAndMetadata(dataServers map[string]commonobject.Borr
 	*linkedhashset.Set[string],
 	map[string]*commonproto.DataServerMetadata,
 ) {
+	// The candidates are ordered by name: a selector that picks the first
+	// one then places the growth the same way on every run
+	names := make([]string, 0, len(dataServers))
+	for name := range dataServers {
+		names = append(names, name)
+	}
+	slices.Sort(names)
 	candidates := linkedhashset.New[string]()
 	metadata := make(map[string]*commonproto.DataServerMetadata, len(dataServers))
-	for name, borrowedDataServer := range dataServers {
-		dataServer := borrowedDataServer.UnsafeBorrow()
+	for _, name := range names {
+		dataServer := dataServers[name].UnsafeBorrow()
 		candidates.Add(name)
 		if dataServer.GetMetadata() != nil {
 			metadata[name] = dataServer.GetMetadata()
@@ -120,7 +128,11 @@ func (r *nodeBasedBalancer) rebalanceEnsemble() bool {
 		r.logger.Warn("Failed to rebalance the shard ensembles", slog.Any("error", err))
 		return false
 	}
-	dataServers := r.metadata.ListDataServer()
+	dataServers, err := r.metadata.ListDataServer()
+	if err != nil {
+		r.logger.Warn("Failed to rebalance the shard ensembles", slog.Any("error", err))
+		return false
+	}
 	candidates, metadata := dataServersToCandidatesAndMetadata(dataServers)
 	groupedStatus, historyNodes := state.GroupingShardsNodeByStatus(candidates, currentStatus)
 	loadRatios := r.loadRatioAlgorithm(&model.RatioParams{NodeShardsInfos: groupedStatus, HistoryNodes: historyNodes})
@@ -245,7 +257,10 @@ func (r *nodeBasedBalancer) swapShard(
 	var err error
 
 	var borrowedNamespace commonobject.Borrowed[*commonproto.Namespace]
-	if borrowedNamespace, exist = r.metadata.GetNamespace(candidateShard.Namespace); !exist {
+	if borrowedNamespace, exist, err = r.metadata.GetNamespace(candidateShard.Namespace); err != nil {
+		return false, err
+	}
+	if !exist {
 		return false, nil
 	}
 	nsc = borrowedNamespace.UnsafeBorrow()
@@ -286,7 +301,10 @@ func (r *nodeBasedBalancer) swapShard(
 	}
 	var targetNode *commonproto.DataServerIdentity
 	var borrowedTargetNode commonobject.Borrowed[*commonproto.DataServer]
-	if borrowedTargetNode, exist = r.metadata.GetDataServer(targetNodeID); !exist {
+	if borrowedTargetNode, exist, err = r.metadata.GetDataServer(targetNodeID); err != nil {
+		return false, err
+	}
+	if !exist {
 		return false, errors.New("target node does not exist")
 	}
 	targetNode = borrowedTargetNode.UnsafeBorrow().GetIdentity()
@@ -341,7 +359,10 @@ func (r *nodeBasedBalancer) IsNodeQuarantined(highestLoadRatioNode *model.NodeLo
 }
 
 func (r *nodeBasedBalancer) IsBalanced() bool {
-	configNamespaces := r.metadata.ListNamespace()
+	configNamespaces, err := r.metadata.ListNamespace()
+	if err != nil {
+		return false
+	}
 	status, err := r.metadata.ListNamespaceStatus()
 	if err != nil || len(configNamespaces) != len(status) {
 		return false
@@ -352,7 +373,11 @@ func (r *nodeBasedBalancer) IsBalanced() bool {
 		}
 	}
 
-	candidates, _ := dataServersToCandidatesAndMetadata(r.metadata.ListDataServer())
+	dataServers, err := r.metadata.ListDataServer()
+	if err != nil {
+		return false
+	}
+	candidates, _ := dataServersToCandidatesAndMetadata(dataServers)
 	groupedStatus, historyNodes := state.GroupingShardsNodeByStatus(candidates, status)
 	shardsBalanced := r.loadRatioAlgorithm(
 		&model.RatioParams{
@@ -508,7 +533,12 @@ func (r *nodeBasedBalancer) rebalanceLeader() {
 		r.logger.Warn("Failed to rebalance the shard leaders", slog.Any("error", err))
 		return
 	}
-	candidates, _ := dataServersToCandidatesAndMetadata(r.metadata.ListDataServer())
+	dataServers, err := r.metadata.ListDataServer()
+	if err != nil {
+		r.logger.Warn("Failed to rebalance the shard leaders", slog.Any("error", err))
+		return
+	}
+	candidates, _ := dataServersToCandidatesAndMetadata(dataServers)
 	totalShards, electedShards, nodeLeaders := state.NodeShardLeaders(candidates, status)
 
 	electedRate := float64(electedShards) / float64(totalShards)
@@ -568,7 +598,7 @@ func NewLoadBalancer(options Options) LoadBalancer {
 		ctx:                     ctx,
 		ctxCancel:               cancelFunc,
 		wg:                      sync.WaitGroup{},
-		loadBalancerConf:        options.Metadata.GetLoadBalancer().UnsafeBorrow(),
+		loadBalancerConf:        options.LoadBalancerConfig,
 		actionCh:                make(chan action.Action, 1000),
 		nodeAvailableJudger:     options.NodeAvailableJudger,
 		metadata:                options.Metadata,
@@ -591,9 +621,18 @@ func (r *nodeBasedBalancer) growEnsembles(group *sync.WaitGroup) {
 		r.logger.Warn("Failed to grow the shard ensembles", slog.Any("error", err))
 		return
 	}
-	candidates, metadata := dataServersToCandidatesAndMetadata(r.metadata.ListDataServer())
+	dataServers, err := r.metadata.ListDataServer()
+	if err != nil {
+		r.logger.Warn("Failed to grow the shard ensembles", slog.Any("error", err))
+		return
+	}
+	candidates, metadata := dataServersToCandidatesAndMetadata(dataServers)
 	for name, borrowedStatus := range statuses {
-		borrowedConfig, exist := r.metadata.GetNamespace(name)
+		borrowedConfig, exist, err := r.metadata.GetNamespace(name)
+		if err != nil {
+			r.logger.Warn("Failed to grow the shard ensembles", slog.String("namespace", name), slog.Any("error", err))
+			continue
+		}
 		if !exist {
 			continue
 		}
@@ -666,7 +705,10 @@ func (r *nodeBasedBalancer) growShard(
 	if err != nil {
 		return err
 	}
-	borrowedTargetNode, exist := r.metadata.GetDataServer(targetNodeID)
+	borrowedTargetNode, exist, err := r.metadata.GetDataServer(targetNodeID)
+	if err != nil {
+		return err
+	}
 	if !exist {
 		return errors.New("target node does not exist")
 	}

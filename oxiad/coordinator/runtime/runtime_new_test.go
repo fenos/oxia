@@ -25,7 +25,7 @@ import (
 	"github.com/oxia-db/oxia/common/constant"
 	"github.com/oxia-db/oxia/common/proto"
 	"github.com/oxia-db/oxia/oxiad/coordinator/rpc"
-	"github.com/oxia-db/oxia/oxiad/coordinator/runtime/controller/mockutils"
+	"github.com/oxia-db/oxia/oxiad/coordinator/rpc/rpctest"
 )
 
 // The data server controllers that New starts may discover a node's features
@@ -70,7 +70,7 @@ func TestNewDiscoversFeaturesWhileStartingShardControllers(t *testing.T) {
 	}))
 
 	// Each node supports features, so its first handshake is a discovery
-	rpcProvider := mockutils.NewRpcProvider()
+	rpcProvider := rpctest.NewRpcProvider()
 	for _, server := range servers {
 		rpcProvider.GetNode(server).SetNodeFeatures([]proto.Feature{proto.Feature_FEATURE_DB_CHECKSUM})
 	}

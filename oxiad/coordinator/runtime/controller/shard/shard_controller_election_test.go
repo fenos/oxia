@@ -30,18 +30,12 @@ import (
 	"github.com/oxia-db/oxia/common/proto"
 	coordmetadata "github.com/oxia-db/oxia/oxiad/coordinator/metadata"
 	coordrpc "github.com/oxia-db/oxia/oxiad/coordinator/rpc"
+	"github.com/oxia-db/oxia/oxiad/coordinator/rpc/rpctest"
 	"github.com/oxia-db/oxia/oxiad/coordinator/runtime/action"
 	leaderselector "github.com/oxia-db/oxia/oxiad/coordinator/runtime/balancer/selector/leader"
-	"github.com/oxia-db/oxia/oxiad/coordinator/runtime/controller/mockutils"
 )
 
-func testDataServer(id string) *proto.DataServerIdentity {
-	return &proto.DataServerIdentity{Internal: id, Public: id}
-}
-
-type electionResponse = fenceResponse
-
-func TestNegotiate_EmptyInput(t *testing.T) {
+func TestNegotiateEmptyInput(t *testing.T) {
 	result := negotiate(nil, 0)
 	assert.Nil(t, result)
 
@@ -49,7 +43,7 @@ func TestNegotiate_EmptyInput(t *testing.T) {
 	assert.Nil(t, result)
 }
 
-func TestNegotiate_SingleNode(t *testing.T) {
+func TestNegotiateSingleNode(t *testing.T) {
 	nodeFeatures := map[string][]proto.Feature{
 		"node1": {proto.Feature_FEATURE_DB_CHECKSUM},
 	}
@@ -58,7 +52,7 @@ func TestNegotiate_SingleNode(t *testing.T) {
 	assert.Equal(t, []proto.Feature{proto.Feature_FEATURE_DB_CHECKSUM}, result)
 }
 
-func TestNegotiate_AllNodesSupport(t *testing.T) {
+func TestNegotiateAllNodesSupport(t *testing.T) {
 	nodeFeatures := map[string][]proto.Feature{
 		"node1": {proto.Feature_FEATURE_DB_CHECKSUM},
 		"node2": {proto.Feature_FEATURE_DB_CHECKSUM},
@@ -69,7 +63,7 @@ func TestNegotiate_AllNodesSupport(t *testing.T) {
 	assert.Equal(t, []proto.Feature{proto.Feature_FEATURE_DB_CHECKSUM}, result)
 }
 
-func TestNegotiate_PartialSupport(t *testing.T) {
+func TestNegotiatePartialSupport(t *testing.T) {
 	nodeFeatures := map[string][]proto.Feature{
 		"node1": {proto.Feature_FEATURE_DB_CHECKSUM},
 		"node2": {proto.Feature_FEATURE_DB_CHECKSUM},
@@ -80,7 +74,7 @@ func TestNegotiate_PartialSupport(t *testing.T) {
 	assert.Empty(t, result)
 }
 
-func TestNegotiate_IgnoresUnknownFeature(t *testing.T) {
+func TestNegotiateIgnoresUnknownFeature(t *testing.T) {
 	nodeFeatures := map[string][]proto.Feature{
 		"node1": {proto.Feature_FEATURE_UNKNOWN, proto.Feature_FEATURE_DB_CHECKSUM},
 		"node2": {proto.Feature_FEATURE_UNKNOWN, proto.Feature_FEATURE_DB_CHECKSUM},
@@ -91,7 +85,7 @@ func TestNegotiate_IgnoresUnknownFeature(t *testing.T) {
 	assert.NotContains(t, result, proto.Feature_FEATURE_UNKNOWN)
 }
 
-func TestNegotiate_HandlesDuplicates(t *testing.T) {
+func TestNegotiateHandlesDuplicates(t *testing.T) {
 	nodeFeatures := map[string][]proto.Feature{
 		"node1": {proto.Feature_FEATURE_DB_CHECKSUM, proto.Feature_FEATURE_DB_CHECKSUM},
 		"node2": {proto.Feature_FEATURE_DB_CHECKSUM},
@@ -101,7 +95,7 @@ func TestNegotiate_HandlesDuplicates(t *testing.T) {
 	assert.Equal(t, []proto.Feature{proto.Feature_FEATURE_DB_CHECKSUM}, result)
 }
 
-func TestNegotiate_NoCommonFeatures(t *testing.T) {
+func TestNegotiateNoCommonFeatures(t *testing.T) {
 	nodeFeatures := map[string][]proto.Feature{
 		"node1": {proto.Feature_FEATURE_DB_CHECKSUM},
 		"node2": {},
@@ -112,7 +106,7 @@ func TestNegotiate_NoCommonFeatures(t *testing.T) {
 	assert.Empty(t, result)
 }
 
-func TestNegotiate_OldNodeWithNoFeatures(t *testing.T) {
+func TestNegotiateOldNodeWithNoFeatures(t *testing.T) {
 	nodeFeatures := map[string][]proto.Feature{
 		"new-node-1": {proto.Feature_FEATURE_DB_CHECKSUM},
 		"new-node-2": {proto.Feature_FEATURE_DB_CHECKSUM},
@@ -123,7 +117,7 @@ func TestNegotiate_OldNodeWithNoFeatures(t *testing.T) {
 	assert.Empty(t, result, "should not enable features when old nodes are present")
 }
 
-func TestNegotiate_NilNodeFeatures(t *testing.T) {
+func TestNegotiateNilNodeFeatures(t *testing.T) {
 	nodeFeatures := map[string][]proto.Feature{
 		"node1": {proto.Feature_FEATURE_DB_CHECKSUM},
 		"node2": {proto.Feature_FEATURE_DB_CHECKSUM},
@@ -134,7 +128,7 @@ func TestNegotiate_NilNodeFeatures(t *testing.T) {
 	assert.Empty(t, result, "nil feature info must not count as support")
 }
 
-func TestNegotiate_MissingFeatureInfo(t *testing.T) {
+func TestNegotiateMissingFeatureInfo(t *testing.T) {
 	nodeFeatures := map[string][]proto.Feature{
 		"node1": {proto.Feature_FEATURE_DB_CHECKSUM},
 		"node2": {proto.Feature_FEATURE_DB_CHECKSUM},
@@ -144,18 +138,7 @@ func TestNegotiate_MissingFeatureInfo(t *testing.T) {
 	assert.Empty(t, result, "missing feature info must not count as support")
 }
 
-func TestNoOpSupportedFeaturesSupplier(t *testing.T) {
-	result := NoOpSupportedFeaturesSupplier(nil)
-	assert.NotNil(t, result)
-	assert.Empty(t, result)
-
-	server := testDataServer("node1")
-	result = NoOpSupportedFeaturesSupplier([]*proto.DataServerIdentity{server})
-	assert.Contains(t, result, server.GetNameOrDefault())
-	assert.Empty(t, result[server.GetNameOrDefault()])
-}
-
-func TestNegotiate_MixedVersions_RollingUpgrade(t *testing.T) {
+func TestNegotiateMixedVersionsRollingUpgrade(t *testing.T) {
 	nodeFeatures := map[string][]proto.Feature{
 		"new-node-1": {proto.Feature_FEATURE_DB_CHECKSUM},
 		"new-node-2": {proto.Feature_FEATURE_DB_CHECKSUM},
@@ -171,7 +154,7 @@ func TestNegotiate_MixedVersions_RollingUpgrade(t *testing.T) {
 	assert.Contains(t, result, proto.Feature_FEATURE_DB_CHECKSUM, "feature should be enabled after all nodes are upgraded")
 }
 
-func TestNegotiate_SecondaryIndexValidationRequiresFullUpgrade(t *testing.T) {
+func TestNegotiateSecondaryIndexValidationRequiresFullUpgrade(t *testing.T) {
 	currentFeatures := []proto.Feature{
 		proto.Feature_FEATURE_DB_CHECKSUM,
 		proto.Feature_FEATURE_SECONDARY_INDEX_NAME_VALIDATION,
@@ -191,7 +174,62 @@ func TestNegotiate_SecondaryIndexValidationRequiresFullUpgrade(t *testing.T) {
 	assert.Contains(t, result, proto.Feature_FEATURE_SECONDARY_INDEX_NAME_VALIDATION)
 }
 
-func TestWaitForMajority_Success(t *testing.T) {
+func TestChooseCandidatesChoosesHighestHeadEntry(t *testing.T) {
+	tests := []struct {
+		name           string
+		candidates     map[*proto.DataServerIdentity]*proto.EntryId
+		expectedLeader *proto.DataServerIdentity
+	}{
+		{
+			name: "Choose highest term",
+			candidates: map[*proto.DataServerIdentity]*proto.EntryId{
+				{Public: "1", Internal: "1"}: {Term: 200, Offset: 2480},
+				{Public: "2", Internal: "2"}: {Term: 200, Offset: 2500},
+				{Public: "3", Internal: "3"}: {Term: 198, Offset: 3000},
+			},
+			expectedLeader: &proto.DataServerIdentity{Public: "2", Internal: "2"},
+		},
+		{
+			name: "Same term, different offsets",
+			candidates: map[*proto.DataServerIdentity]*proto.EntryId{
+				{Public: "1", Internal: "1"}: {Term: 200, Offset: 1000},
+				{Public: "2", Internal: "2"}: {Term: 200, Offset: 2000},
+				{Public: "3", Internal: "3"}: {Term: 200, Offset: 1500},
+			},
+			expectedLeader: &proto.DataServerIdentity{Public: "2", Internal: "2"},
+		},
+		{
+			name: "Different terms, same offsets",
+			candidates: map[*proto.DataServerIdentity]*proto.EntryId{
+				{Public: "1", Internal: "1"}: {Term: 200, Offset: 1500},
+				{Public: "2", Internal: "2"}: {Term: 198, Offset: 1500},
+				{Public: "3", Internal: "3"}: {Term: 199, Offset: 1500},
+			},
+			expectedLeader: &proto.DataServerIdentity{Public: "1", Internal: "1"},
+		},
+		{
+			name: "Single candidate",
+			candidates: map[*proto.DataServerIdentity]*proto.EntryId{
+				{Public: "1", Internal: "1"}: {Term: 200, Offset: 1500},
+			},
+			expectedLeader: &proto.DataServerIdentity{Public: "1", Internal: "1"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			candidates := chooseCandidates(tt.candidates)
+
+			// Check candidates
+			assert.Equal(t, 1, len(candidates))
+			for _, candidate := range candidates {
+				assert.Equal(t, tt.expectedLeader, candidate)
+			}
+		})
+	}
+}
+
+func TestElectionWaitForMajoritySuccess(t *testing.T) {
 	e := &Election{}
 	server1 := testDataServer("server1")
 	server2 := testDataServer("server2")
@@ -211,7 +249,7 @@ func TestWaitForMajority_Success(t *testing.T) {
 	assert.Equal(t, int64(95), result[server2].Offset)
 }
 
-func TestWaitForMajority_FailureNoQuorum(t *testing.T) {
+func TestElectionWaitForMajorityFailureNoQuorum(t *testing.T) {
 	e := &Election{}
 	server1 := testDataServer("server1")
 	server2 := testDataServer("server2")
@@ -231,7 +269,7 @@ func TestWaitForMajority_FailureNoQuorum(t *testing.T) {
 	assert.Equal(t, 3, totalResponses)
 }
 
-func TestWaitForMajority_MixedSuccessAndFailure(t *testing.T) {
+func TestElectionWaitForMajorityMixedSuccessAndFailure(t *testing.T) {
 	e := &Election{}
 	server1 := testDataServer("server1")
 	server2 := testDataServer("server2")
@@ -252,7 +290,7 @@ func TestWaitForMajority_MixedSuccessAndFailure(t *testing.T) {
 	assert.Equal(t, int64(90), result[server3].Offset)
 }
 
-func TestWaitForMajority_ExcludesRemovedServers(t *testing.T) {
+func TestElectionWaitForMajorityExcludesRemovedServers(t *testing.T) {
 	e := &Election{}
 	server1 := testDataServer("server1")
 	server2 := testDataServer("server2")
@@ -278,7 +316,7 @@ func TestWaitForMajority_ExcludesRemovedServers(t *testing.T) {
 	assert.Equal(t, int64(110), removed[removedServer].Offset)
 }
 
-func TestWaitForMajority_EarlyReturn(t *testing.T) {
+func TestElectionWaitForMajorityEarlyReturn(t *testing.T) {
 	e := &Election{}
 	server1 := testDataServer("server1")
 	server2 := testDataServer("server2")
@@ -296,7 +334,7 @@ func TestWaitForMajority_EarlyReturn(t *testing.T) {
 	assert.Len(t, result, 2)
 }
 
-func TestWaitForEnsembleMajority_WaitsForEnsembleMember(t *testing.T) {
+func TestElectionWaitForEnsembleMajorityWaitsForEnsembleMember(t *testing.T) {
 	e := &Election{}
 	server1 := testDataServer("server1")
 	server2 := testDataServer("server2")
@@ -324,7 +362,7 @@ func TestWaitForEnsembleMajority_WaitsForEnsembleMember(t *testing.T) {
 	assert.Contains(t, result, server2)
 }
 
-func TestWaitForEnsembleMajority_FailureNoQuorum(t *testing.T) {
+func TestElectionWaitForEnsembleMajorityFailureNoQuorum(t *testing.T) {
 	server1 := testDataServer("server1")
 	server2 := testDataServer("server2")
 	removedServer := testDataServer("removed")
@@ -357,7 +395,7 @@ func TestWaitForEnsembleMajority_FailureNoQuorum(t *testing.T) {
 	}
 }
 
-func TestWaitForEnsembleMajority_AlreadyReached(t *testing.T) {
+func TestElectionWaitForEnsembleMajorityAlreadyReached(t *testing.T) {
 	e := &Election{}
 	server1 := testDataServer("server1")
 	server2 := testDataServer("server2")
@@ -385,7 +423,7 @@ func TestWaitForEnsembleMajority_AlreadyReached(t *testing.T) {
 	assert.Len(t, result, 2)
 }
 
-func TestWaitForGracePeriod_AllResponsesReceived(t *testing.T) {
+func TestElectionWaitForGracePeriodAllResponsesReceived(t *testing.T) {
 	e := &Election{}
 	server1 := testDataServer("server1")
 	server2 := testDataServer("server2")
@@ -408,7 +446,7 @@ func TestWaitForGracePeriod_AllResponsesReceived(t *testing.T) {
 	assert.Equal(t, int64(90), candidatesResponse[server3].Offset)
 }
 
-func TestWaitForGracePeriod_Timeout(t *testing.T) {
+func TestElectionWaitForGracePeriodTimeout(t *testing.T) {
 	e := &Election{}
 	server1 := testDataServer("server1")
 	server2 := testDataServer("server2")
@@ -429,7 +467,7 @@ func TestWaitForGracePeriod_Timeout(t *testing.T) {
 	assert.Less(t, elapsed, quorumFencingGracePeriod+50*time.Millisecond, "should not wait much longer")
 }
 
-func TestWaitForGracePeriod_IgnoresErrors(t *testing.T) {
+func TestElectionWaitForGracePeriodIgnoresErrors(t *testing.T) {
 	e := &Election{}
 	server1 := testDataServer("server1")
 	server2 := testDataServer("server2")
@@ -452,7 +490,7 @@ func TestWaitForGracePeriod_IgnoresErrors(t *testing.T) {
 	assert.NotContains(t, candidatesResponse, server2, "failed server should not be added")
 }
 
-func TestWaitForGracePeriod_ExcludesRemovedServers(t *testing.T) {
+func TestElectionWaitForGracePeriodExcludesRemovedServers(t *testing.T) {
 	e := &Election{}
 	server1 := testDataServer("server1")
 	server2 := testDataServer("server2")
@@ -478,7 +516,7 @@ func TestWaitForGracePeriod_ExcludesRemovedServers(t *testing.T) {
 	assert.Equal(t, int64(110), removed[removedServer].Offset)
 }
 
-func TestWaitForGracePeriod_AlreadyComplete(t *testing.T) {
+func TestElectionWaitForGracePeriodAlreadyComplete(t *testing.T) {
 	e := &Election{}
 	server1 := testDataServer("server1")
 	server2 := testDataServer("server2")
@@ -499,7 +537,7 @@ func TestWaitForGracePeriod_AlreadyComplete(t *testing.T) {
 	assert.Less(t, elapsed, 10*time.Millisecond, "should return immediately when all responses received")
 }
 
-func TestCheckRemovedEntries(t *testing.T) {
+func TestElectionCheckRemovedEntriesReplicationFactor3(t *testing.T) {
 	s1 := testDataServer("s1")
 	s2 := testDataServer("s2")
 	s3 := testDataServer("s3")
@@ -570,7 +608,7 @@ func TestCheckRemovedEntries(t *testing.T) {
 	}
 }
 
-func TestCheckRemovedEntries_ReplicationFactor5(t *testing.T) {
+func TestElectionCheckRemovedEntriesReplicationFactor5(t *testing.T) {
 	s1 := testDataServer("s1")
 	s2 := testDataServer("s2")
 	s3 := testDataServer("s3")
@@ -599,93 +637,10 @@ func TestCheckRemovedEntries_ReplicationFactor5(t *testing.T) {
 	}, removed), ErrChangeEnsembleLosesEntries)
 }
 
-// startElection starts a leader election of the shard, as its shard
-// controller does, and returns the elected leader once the election ends.
-func startElection(t *testing.T, metadata coordmetadata.Metadata, rpc coordrpc.Provider, shard int64) <-chan *proto.DataServerIdentity {
-	t.Helper()
-	labels := metric.LabelsForShard(constant.DefaultNamespace, shard)
-	s := &controller{
-		namespace:                           constant.DefaultNamespace,
-		shard:                               shard,
-		metadataStore:                       metadata,
-		dataServerSupportedFeaturesSupplier: NoOpSupportedFeaturesSupplier,
-		leaderSelector:                      leaderselector.NewSelector(),
-		rpc:                                 rpc,
-		logger:                              slog.Default(),
-		leaderElectionLatency: metric.NewLatencyHistogram("oxia_coordinator_leader_election_latency",
-			"The time it takes to elect a leader for the shard", labels),
-		leaderElectionsFailed: metric.NewCounter("oxia_coordinator_leader_election_failed",
-			"The number of failed leader elections", "count", labels),
-		newTermQuorumLatency: metric.NewLatencyHistogram("oxia_coordinator_new_term_quorum_latency",
-			"The time it takes to take the ensemble of data servers to a new term", labels),
-		becomeLeaderLatency: metric.NewLatencyHistogram("oxia_coordinator_become_leader_latency",
-			"The time it takes for the new elected leader to start", labels),
-	}
-	s.ctx, s.ctxCancel = context.WithCancel(context.Background())
-
-	elected := make(chan *proto.DataServerIdentity, 1)
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		elected <- s.onElectLeader(nil)
-	}()
-	t.Cleanup(func() {
-		s.ctxCancel()
-		<-done
-		s.currentElection.Stop()
-	})
-	return elected
-}
-
-// requireElectionEnded waits for the election to end, and returns the leader
-// it elected.
-func requireElectionEnded(t *testing.T, elected <-chan *proto.DataServerIdentity) *proto.DataServerIdentity {
-	t.Helper()
-	select {
-	case leader := <-elected:
-		return leader
-	case <-time.After(10 * time.Second):
-		require.FailNow(t, "the election did not end in time")
-		return nil
-	}
-}
-
-// electParentLeader completes an election of the parent shard of
-// setupSplitTest that is fencing its ensemble: ps2 has the highest entry, and
-// becomes the leader.
-func electParentLeader(t *testing.T, rpc *mockutils.RpcProvider, elected <-chan *proto.DataServerIdentity) {
-	t.Helper()
-	rpc.GetNode(ps1).NewTermResponse(5, 100, nil)
-	rpc.GetNode(ps2).NewTermResponse(5, 105, nil)
-	rpc.GetNode(ps3).NewTermResponse(5, 100, nil)
-	rpc.GetNode(ps2).BecomeLeaderResponse(nil)
-	assert.Equal(t, ps2.GetPublic(), requireElectionEnded(t, elected).GetPublic())
-}
-
-// expectParentFenced waits for the election to fence each member of the
-// parent's ensemble at the term.
-func expectParentFenced(t *testing.T, rpc *mockutils.RpcProvider, term int64) {
-	t.Helper()
-	for _, node := range []*proto.DataServerIdentity{ps1, ps2, ps3} {
-		rpc.GetNode(node).ExpectNewTermRequest(t, 0, term, true)
-	}
-}
-
-// updateSplitParent applies an update of the split controller to the parent
-// shard of setupSplitTest, and returns the updated split metadata.
-func updateSplitParent(t *testing.T, metadata coordmetadata.Metadata, update func(parent *proto.ShardMetadata)) *proto.SplitMetadata {
-	t.Helper()
-	require.NoError(t, metadata.UpdateShardStatuses(constant.DefaultNamespace, func(shards map[int64]*proto.ShardMetadata) bool {
-		update(shards[0])
-		return true
-	}))
-	return requireShardMetadata(t, metadata, constant.DefaultNamespace, 0).GetSplit()
-}
-
 // The split controller updates the parent while a leader election of the
 // parent is fencing its ensemble: the election must store its outcome on top
 // of these updates.
-func TestElection_KeepsSplitUpdatesWhileFencing(t *testing.T) {
+func TestElectionStartKeepsSplitUpdatesWhileFencing(t *testing.T) {
 	for _, test := range []struct {
 		name   string
 		update func(parent *proto.ShardMetadata)
@@ -718,7 +673,7 @@ func TestElection_KeepsSplitUpdatesWhileFencing(t *testing.T) {
 // e.g. because its ensemble has no quorum: the next attempt must start from
 // the current metadata of the parent, or the parent stays marked as being
 // split, into children that no longer exist.
-func TestElection_KeepsSplitUpdatesBetweenAttempts(t *testing.T) {
+func TestElectionStartKeepsSplitUpdatesBetweenAttempts(t *testing.T) {
 	rpc, metadata, _ := setupSplitTest(t, proto.SplitPhaseCatchUp)
 	elected := startElection(t, metadata, rpc, 0)
 
@@ -743,7 +698,7 @@ func TestElection_KeepsSplitUpdatesBetweenAttempts(t *testing.T) {
 // Deleting the namespace marks the shard for deletion while its leader
 // election is fencing the ensemble: the election must not bring the shard
 // back, which would publish it again until its shard controller deletes it.
-func TestElection_KeepsDeletingStatus(t *testing.T) {
+func TestElectionStartKeepsDeletingStatus(t *testing.T) {
 	rpc, metadata, _ := setupSplitTest(t, proto.SplitPhaseCatchUp)
 	elected := startElection(t, metadata, rpc, 0)
 
@@ -755,4 +710,95 @@ func TestElection_KeepsDeletingStatus(t *testing.T) {
 	assert.Equal(t, proto.ShardStatusDeleting, shard.GetStatus())
 	assert.EqualValues(t, 6, shard.GetTerm())
 	assert.Equal(t, ps2.GetPublic(), shard.GetLeader().GetPublic())
+}
+
+type electionResponse = fenceResponse
+
+func testDataServer(id string) *proto.DataServerIdentity {
+	return &proto.DataServerIdentity{Internal: id, Public: id}
+}
+
+// startElection starts a leader election of the shard, as its shard
+// controller does, and returns the elected leader once the election ends.
+func startElection(t *testing.T, metadata coordmetadata.Metadata, rpc coordrpc.Provider, shard int64) <-chan *proto.DataServerIdentity {
+	t.Helper()
+	labels := metric.LabelsForShard(constant.DefaultNamespace, shard)
+	s := &controller{
+		namespace:                           constant.DefaultNamespace,
+		shard:                               shard,
+		metadataStore:                       metadata,
+		dataServerSupportedFeaturesSupplier: NoOpSupportedFeaturesSupplier,
+		leaderSelector:                      leaderselector.NewSelector(),
+		rpc:                                 rpc,
+		logger:                              slog.Default(),
+		leaderElectionLatency: metric.NewLatencyHistogram("oxia_coordinator_leader_election_latency",
+			"The time it takes to elect a leader for the shard", labels),
+		leaderElectionsFailed: metric.NewCounter("oxia_coordinator_leader_election_failed",
+			"The number of failed leader elections", "count", labels),
+		newTermQuorumLatency: metric.NewLatencyHistogram("oxia_coordinator_new_term_quorum_latency",
+			"The time it takes to take the ensemble of data servers to a new term", labels),
+		becomeLeaderLatency: metric.NewLatencyHistogram("oxia_coordinator_become_leader_latency",
+			"The time it takes for the new elected leader to start", labels),
+	}
+	s.ctx, s.ctxCancel = context.WithCancel(context.Background())
+
+	shardMeta, _ := testShardMetadata(metadata, constant.DefaultNamespace, shard)
+	elected := make(chan *proto.DataServerIdentity, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		elected <- s.electLeader(shardMeta, nil)
+	}()
+	t.Cleanup(func() {
+		s.ctxCancel()
+		<-done
+		s.currentElection.Load().Stop()
+	})
+	return elected
+}
+
+// requireElectionEnded waits for the election to end, and returns the leader
+// it elected.
+func requireElectionEnded(t *testing.T, elected <-chan *proto.DataServerIdentity) *proto.DataServerIdentity {
+	t.Helper()
+	select {
+	case leader := <-elected:
+		return leader
+	case <-time.After(10 * time.Second):
+		require.FailNow(t, "the election did not end in time")
+		return nil
+	}
+}
+
+// electParentLeader completes an election of the parent shard of
+// setupSplitTest that is fencing its ensemble: ps2 has the highest entry, and
+// becomes the leader.
+func electParentLeader(t *testing.T, rpc *rpctest.RpcProvider, elected <-chan *proto.DataServerIdentity) {
+	t.Helper()
+	rpc.GetNode(ps1).NewTermResponse(5, 100, nil)
+	rpc.GetNode(ps2).NewTermResponse(5, 105, nil)
+	rpc.GetNode(ps3).NewTermResponse(5, 100, nil)
+	rpc.GetNode(ps2).BecomeLeaderResponse(nil)
+	assert.Equal(t, ps2.GetPublic(), requireElectionEnded(t, elected).GetPublic())
+}
+
+// expectParentFenced waits for the election to fence each member of the
+// parent's ensemble at the term.
+func expectParentFenced(t *testing.T, rpc *rpctest.RpcProvider, term int64) {
+	t.Helper()
+	for _, node := range []*proto.DataServerIdentity{ps1, ps2, ps3} {
+		rpc.GetNode(node).ExpectNewTermRequest(t, 0, term, true)
+	}
+}
+
+// updateSplitParent applies an update of the split controller to the parent
+// shard of setupSplitTest, and returns the updated split metadata.
+func updateSplitParent(t *testing.T, metadata coordmetadata.Metadata, update func(parent *proto.ShardMetadata)) *proto.SplitMetadata {
+	t.Helper()
+	require.NoError(t, metadata.PatchNamespaceStatus(constant.DefaultNamespace, func(status *proto.NamespaceStatus) bool {
+		shards := status.Shards
+		update(shards[0])
+		return true
+	}))
+	return requireShardMetadata(t, metadata, constant.DefaultNamespace, 0).GetSplit()
 }

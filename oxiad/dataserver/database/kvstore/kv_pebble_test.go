@@ -1847,6 +1847,7 @@ func TestPebbleRangeScanInvertedBoundsIsEmpty(t *testing.T) {
 }
 
 func testRangeScanInvertedBoundsIsEmpty(t *testing.T, sorting proto.KeySortingType) {
+	t.Helper()
 	factory, err := NewPebbleKVFactory(NewFactoryOptionsForTest(t))
 	assert.NoError(t, err)
 	kv, err := factory.NewKV(constant.DefaultNamespace, 1, sorting)

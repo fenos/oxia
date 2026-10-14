@@ -272,6 +272,7 @@ func (c *clientImpl) Put(key string, value []byte, options ...PutOption) <-chan 
 		ExpectedVersionId:  opts.expectedVersion,
 		SequenceKeysDeltas: opts.sequenceKeysDeltas,
 		PartitionKey:       opts.partitionKey,
+		CallContext:        opts.callContext,
 		Callback:           callback,
 		SecondaryIndexes:   toSecondaryIndexes(opts.secondaryIndexes),
 	}
@@ -313,6 +314,7 @@ func (c *clientImpl) Delete(key string, options ...DeleteOption) <-chan error {
 		Key:               key,
 		ExpectedVersionId: opts.expectedVersion,
 		PartitionKey:      opts.partitionKey,
+		CallContext:       opts.callContext,
 		Callback:          callback,
 	})
 	return ch
@@ -330,7 +332,7 @@ func (c *clientImpl) DeleteRange(minKeyInclusive string, maxKeyExclusive string,
 	opts := newDeleteRangeOptions(options)
 	if opts.partitionKey != nil {
 		shardId := c.getShardForKey("", opts)
-		c.doSingleShardDeleteRange(shardId, minKeyInclusive, maxKeyExclusive, opts.partitionKey, ch)
+		c.doSingleShardDeleteRange(shardId, minKeyInclusive, maxKeyExclusive, opts.partitionKey, opts.callContext, ch)
 		return ch
 	}
 
@@ -343,6 +345,9 @@ func (c *clientImpl) DeleteRange(minKeyInclusive string, maxKeyExclusive string,
 		c.writeBatchManager.Add(shardId, model.DeleteRangeCall{
 			MinKeyInclusive: minKeyInclusive,
 			MaxKeyExclusive: maxKeyExclusive,
+			// Shared by the calls to all the shards: once one is sent, the
+			// others are not dropped anymore
+			CallContext: opts.callContext,
 			Callback: func(response *proto.DeleteRangeResponse, err error) {
 				if err != nil {
 					wg.Fail(err)
@@ -366,11 +371,12 @@ func (c *clientImpl) DeleteRange(minKeyInclusive string, maxKeyExclusive string,
 }
 
 func (c *clientImpl) doSingleShardDeleteRange(shardId int64, minKeyInclusive string, maxKeyExclusive string,
-	partitionKey *string, ch chan error) {
+	partitionKey *string, callContext *model.CallContext, ch chan error) {
 	c.writeBatchManager.Add(shardId, model.DeleteRangeCall{
 		MinKeyInclusive: minKeyInclusive,
 		MaxKeyExclusive: maxKeyExclusive,
 		PartitionKey:    partitionKey,
+		CallContext:     callContext,
 		Callback: func(response *proto.DeleteRangeResponse, err error) {
 			if err != nil {
 				ch <- err

@@ -83,6 +83,9 @@ type SplitControllerConfig struct {
 	RpcProvider      rpc.Provider
 	EventListener    controllerapi.ShardSplitEventListener
 	EnsembleSelector func(namespace string) ([]*proto.DataServerIdentity, error)
+	// Split is the split metadata of the parent shard: its child shards and
+	// its split point.
+	Split *proto.SplitMetadata
 
 	// SupportedFeaturesSupplier reports the features supported by each data
 	// server. Optional: when nil, no features are negotiated for the
@@ -127,14 +130,11 @@ func NewSplitController(cfg SplitControllerConfig) *SplitController {
 	sc.ctx, sc.ctxCancel = context.WithTimeout(context.Background(), splitTimeout)
 	sc.finalizeCtx, sc.finalizeCtxCancel = context.WithCancel(context.Background())
 
-	// Load the current split metadata from cluster status
-	parentMeta, exists := sc.metadata.GetShardStatus(sc.namespace, sc.parentShardId)
-	if !exists || parentMeta.UnsafeBorrow().Split == nil {
-		sc.logger.Error("Parent shard or split metadata not found")
+	split := cfg.Split
+	if split == nil || len(split.ChildShardIds) != 2 {
+		sc.logger.Error("Parent shard split metadata not found")
 		return sc
 	}
-
-	split := parentMeta.UnsafeBorrow().Split
 	sc.leftChildId = split.ChildShardIds[0]
 	sc.rightChildId = split.ChildShardIds[1]
 	sc.splitPoint = split.SplitPoint
@@ -172,30 +172,50 @@ func (sc *SplitController) run() {
 		return sc.driveStateMachine()
 	}, oxiatime.NewBackOff(sc.ctx), logRetry)
 
-	phase, exists := sc.currentPhase()
-	if !exists {
-		return
-	}
-	if phase == proto.SplitPhaseFinalize {
-		// Past the point of no return the split can only move forward: retry
-		// until it completes, even past the split timeout. Closing the
-		// controller leaves it for the next coordinator to resume.
-		err = backoff.RetryNotify(sc.runFinalize, oxiatime.NewBackOff(sc.finalizeCtx), logRetry)
-		if err != nil && sc.finalizeCtx.Err() == nil {
-			// The split state could not be persisted, see updateShardMeta
-			sc.logger.Warn("Split stopped, it resumes from its persisted state after a restart", slog.Any("error", err))
+	// Past the point of no return the split can only move forward: retry
+	// Finalize until it completes, even past the split timeout. Closing the
+	// controller leaves it for the next coordinator to resume.
+	var phase proto.SplitPhase
+	exists := false
+	finalizeErr := backoff.RetryNotify(func() error {
+		var loadErr error
+		if phase, exists, loadErr = sc.currentPhase(); loadErr != nil {
+			return loadErr
 		}
+		if !exists || phase != proto.SplitPhaseFinalize {
+			return nil
+		}
+		return sc.runFinalize()
+	}, oxiatime.NewBackOff(sc.finalizeCtx), logRetry)
+	switch {
+	case exists && phase == proto.SplitPhaseFinalize:
+		if finalizeErr != nil && sc.finalizeCtx.Err() == nil {
+			// A shard of the split is gone, see updateShardMeta
+			sc.logger.Warn("Split stopped, it resumes from its persisted state after a restart",
+				slog.Any("error", finalizeErr))
+		}
+		return
+	case finalizeErr != nil:
+		// The controller closed before the phase could be loaded
+		return
+	case !exists:
 		return
 	}
 	if err != nil && sc.ctx.Err() == nil {
-		// The split state could not be persisted, see updateShardMeta
+		// A shard of the split is gone, see updateShardMeta
 		sc.logger.Warn("Split stopped, it resumes from its persisted state after a restart", slog.Any("error", err))
 	}
 
 	// If we exited due to timeout/cancellation and the split isn't done,
-	// abort and clean up.
+	// abort and clean up. The abort runs at least once, even when the
+	// controller is closing; closing stops its retries, and a split whose abort
+	// wasn't persisted resumes after a restart.
 	if sc.ctx.Err() != nil {
-		sc.abort()
+		sc.logger.Warn("Aborting split due to timeout or cancellation")
+		if err := backoff.RetryNotify(sc.abort, oxiatime.NewBackOff(sc.finalizeCtx), logRetry); err != nil &&
+			sc.finalizeCtx.Err() == nil {
+			sc.logger.Warn("Failed to persist the split abort", slog.Any("error", err))
+		}
 	}
 }
 
@@ -205,7 +225,10 @@ func (sc *SplitController) driveStateMachine() error {
 			return backoff.Permanent(err)
 		}
 
-		phase, exists := sc.currentPhase()
+		phase, exists, err := sc.currentPhase()
+		if err != nil {
+			return err
+		}
 		if !exists {
 			// Split is done or metadata was cleaned up
 			return nil
@@ -217,7 +240,6 @@ func (sc *SplitController) driveStateMachine() error {
 
 		sc.logger.Info("Running split phase", slog.String("phase", phase.String()))
 
-		var err error
 		switch phase {
 		case proto.SplitPhaseBootstrap:
 			err = sc.runBootstrap()
@@ -236,12 +258,15 @@ func (sc *SplitController) driveStateMachine() error {
 	}
 }
 
-func (sc *SplitController) currentPhase() (proto.SplitPhase, bool) {
-	parentMeta, exists := sc.metadata.GetShardStatus(sc.namespace, sc.parentShardId)
-	if !exists || parentMeta.UnsafeBorrow().Split == nil {
-		return proto.SplitPhaseBootstrap, false
+func (sc *SplitController) currentPhase() (proto.SplitPhase, bool, error) {
+	parentMeta, exists, err := sc.metadata.GetShardStatus(sc.namespace, sc.parentShardId)
+	if err != nil {
+		return proto.SplitPhaseBootstrap, false, err
 	}
-	return parentMeta.UnsafeBorrow().Split.GetPhaseOrDefault(), true
+	if !exists || parentMeta.UnsafeBorrow().Split == nil {
+		return proto.SplitPhaseBootstrap, false, nil
+	}
+	return parentMeta.UnsafeBorrow().Split.GetPhaseOrDefault(), true, nil
 }
 
 // isFinalizingSplitParent reports whether a shard is the parent of a split past
@@ -253,8 +278,8 @@ func isFinalizingSplitParent(meta *proto.ShardMetadata) bool {
 }
 
 // updatePhase atomically updates the split phase on both parent and children,
-// on their current metadata. Failing to persist it stops the split, as in
-// updateShardMeta.
+// on their current metadata. A failed write is returned, and the step that
+// updates the phase is retried.
 func (sc *SplitController) updatePhase(newPhase proto.SplitPhase) error {
 	_, exists, err := sc.metadata.GetNamespaceStatus(sc.namespace)
 	if err != nil {
@@ -266,7 +291,8 @@ func (sc *SplitController) updatePhase(newPhase proto.SplitPhase) error {
 			slog.String("phase", newPhase.String()))
 		return nil
 	}
-	if err := sc.metadata.UpdateShardStatuses(sc.namespace, func(shards map[int64]*proto.ShardMetadata) bool {
+	return sc.metadata.PatchNamespaceStatus(sc.namespace, func(status *proto.NamespaceStatus) bool {
+		shards := status.Shards
 		changed := false
 		for _, shardId := range []int64{sc.parentShardId, sc.leftChildId, sc.rightChildId} {
 			if meta, exists := shards[shardId]; exists && meta.Split != nil {
@@ -275,10 +301,7 @@ func (sc *SplitController) updatePhase(newPhase proto.SplitPhase) error {
 			}
 		}
 		return changed
-	}); err != nil {
-		return backoff.Permanent(err)
-	}
-	return nil
+	})
 }
 
 // runBootstrap validates preconditions, fences the members of the children's
@@ -287,7 +310,10 @@ func (sc *SplitController) updatePhase(newPhase proto.SplitPhase) error {
 func (sc *SplitController) runBootstrap() error {
 	sc.logger.Info("Phase Bootstrap: fencing children and adding as observers")
 
-	parentMeta := sc.loadParentMeta()
+	parentMeta, err := sc.loadParentMeta()
+	if err != nil {
+		return err
+	}
 	if parentMeta == nil || parentMeta.Leader == nil {
 		return errors.New("parent shard has no leader")
 	}
@@ -319,7 +345,10 @@ func (sc *SplitController) runBootstrap() error {
 	// the observer cursors.
 	childLeaders := make(map[int64]string)
 	for _, childId := range []int64{sc.leftChildId, sc.rightChildId} {
-		childMeta := sc.loadShardMeta(childId)
+		childMeta, err := sc.loadShardMeta(childId)
+		if err != nil {
+			return err
+		}
 		if childMeta != nil && childMeta.Leader != nil {
 			childLeaders[childId] = childMeta.Leader.GetInternal()
 		}
@@ -343,7 +372,10 @@ func (sc *SplitController) runBootstrap() error {
 // from the parent. Skipped if the child already has a leader at that term
 // (from a previous Bootstrap run).
 func (sc *SplitController) fenceAndResetChild(childId int64, parentTerm int64) error {
-	childMeta := sc.loadShardMeta(childId)
+	childMeta, err := sc.loadShardMeta(childId)
+	if err != nil {
+		return err
+	}
 	if childMeta == nil {
 		return errors.Errorf("child shard %d not found", childId)
 	}
@@ -357,7 +389,11 @@ func (sc *SplitController) fenceAndResetChild(childId int64, parentTerm int64) e
 	}
 
 	childTerm := parentTerm
-	headEntries, _, err := sc.fenceEnsemble(sc.ctx, childId, childTerm, childMeta.Ensemble, namespaceTermOptions(sc.metadata, sc.namespace))
+	termOptions, err := sc.metadata.GetNamespaceTermOptions(sc.namespace)
+	if err != nil {
+		return err
+	}
+	headEntries, _, err := sc.fenceEnsemble(sc.ctx, childId, childTerm, childMeta.Ensemble, termOptions)
 	if err != nil {
 		return errors.Wrapf(err, "failed to fence child shard %d", childId)
 	}
@@ -407,11 +443,15 @@ func (sc *SplitController) resetChildMember(childId int64, childTerm int64,
 	}); err != nil {
 		return err
 	}
-	_, err := sc.rpcProvider.NewTerm(sc.ctx, member, &proto.NewTermRequest{
+	termOptions, err := sc.metadata.GetNamespaceTermOptions(sc.namespace)
+	if err != nil {
+		return err
+	}
+	_, err = sc.rpcProvider.NewTerm(sc.ctx, member, &proto.NewTermRequest{
 		Namespace: sc.namespace,
 		Shard:     childId,
 		Term:      childTerm,
-		Options:   namespaceTermOptions(sc.metadata, sc.namespace),
+		Options:   termOptions,
 	})
 	return err
 }
@@ -424,7 +464,10 @@ func (sc *SplitController) resetChildMember(childId int64, childTerm int64,
 // parent tells the child which of the notifications of the parent it delivers.
 func (sc *SplitController) addChildObservers(childId int64, parentLeader *proto.DataServerIdentity,
 	parentTerm int64, parentHashRange *proto.HashRange) error {
-	childMeta := sc.loadShardMeta(childId)
+	childMeta, err := sc.loadShardMeta(childId)
+	if err != nil {
+		return err
+	}
 	if childMeta == nil || childMeta.Leader == nil {
 		return errors.Errorf("child shard %d has no leader", childId)
 	}
@@ -495,10 +538,10 @@ func (sc *SplitController) runCatchUp() error {
 			return backoff.Permanent(err)
 		}
 
-		if fallback, err := sc.checkObserverCursorsStale(); err != nil {
+		if _, stale, err := sc.checkObserverCursorsStale(); err != nil {
 			return err
-		} else if fallback {
-			return nil
+		} else if stale {
+			return sc.updatePhase(proto.SplitPhaseBootstrap)
 		}
 
 		caughtUp, err := sc.runCatchUpRound()
@@ -513,12 +556,16 @@ func (sc *SplitController) runCatchUp() error {
 }
 
 // checkObserverCursorsStale detects if a parent or child leader election has
-// invalidated the observer cursors set up during Bootstrap. Returns
-// (true, nil) if the phase was reset to Bootstrap and the caller should return.
-func (sc *SplitController) checkObserverCursorsStale() (bool, error) {
-	parentMeta := sc.loadParentMeta()
+// invalidated the observer cursors set up during Bootstrap, in which case the
+// caller must reset the phase to Bootstrap. It returns the parent metadata it
+// checked.
+func (sc *SplitController) checkObserverCursorsStale() (*proto.ShardMetadata, bool, error) {
+	parentMeta, err := sc.loadParentMeta()
+	if err != nil {
+		return nil, false, err
+	}
 	if parentMeta == nil || parentMeta.Split == nil {
-		return false, errors.New("parent or split metadata missing")
+		return nil, false, errors.New("parent or split metadata missing")
 	}
 
 	// Parent leader election: observer cursors are closed when the old leader
@@ -530,32 +577,26 @@ func (sc *SplitController) checkObserverCursorsStale() (bool, error) {
 			slog.Int64("bootstrap-term", parentMeta.Split.ParentTermAtBootstrap),
 			slog.Int64("current-term", parentMeta.Term),
 		)
-		if err := sc.updatePhase(proto.SplitPhaseBootstrap); err != nil {
-			return false, err
-		}
-		return true, nil
+		return parentMeta, true, nil
 	}
 
 	// Child leader election: the observer cursor targets the old (dead) leader.
 	// Remove the stale cursor and fall back to Bootstrap to re-add.
-	if sc.removeStaleChildObservers(parentMeta) {
-		if err := sc.updatePhase(proto.SplitPhaseBootstrap); err != nil {
-			return false, err
-		}
-		return true, nil
-	}
-
-	return false, nil
+	removed, err := sc.removeStaleChildObservers(parentMeta)
+	return parentMeta, removed, err
 }
 
 // removeStaleChildObservers checks if any child leader changed since Bootstrap.
 // If so, removes the stale observer cursor from the parent and returns true.
-func (sc *SplitController) removeStaleChildObservers(parentMeta *proto.ShardMetadata) bool {
+func (sc *SplitController) removeStaleChildObservers(parentMeta *proto.ShardMetadata) (bool, error) {
 	if parentMeta.Split.ChildLeadersAtBootstrap == nil || parentMeta.Leader == nil {
-		return false
+		return false, nil
 	}
 	for _, childId := range []int64{sc.leftChildId, sc.rightChildId} {
-		childMeta := sc.loadShardMeta(childId)
+		childMeta, err := sc.loadShardMeta(childId)
+		if err != nil {
+			return false, err
+		}
 		if childMeta == nil || childMeta.Leader == nil {
 			continue
 		}
@@ -576,16 +617,19 @@ func (sc *SplitController) removeStaleChildObservers(parentMeta *proto.ShardMeta
 			FollowerName: bootstrapLeader,
 			TargetShard:  childId,
 		})
-		return true
+		return true, nil
 	}
-	return false
+	return false, nil
 }
 
 // runCatchUpRound snapshots the parent's commitOffset and waits up to
 // CatchUpRoundTimeout for both children to reach it. Returns true if all
 // children caught up, false if the round timed out (caller should retry).
 func (sc *SplitController) runCatchUpRound() (bool, error) {
-	parentMeta := sc.loadParentMeta()
+	parentMeta, err := sc.loadParentMeta()
+	if err != nil {
+		return false, err
+	}
 	if parentMeta == nil || parentMeta.Leader == nil {
 		return false, errors.New("parent has no leader")
 	}
@@ -634,15 +678,19 @@ func (sc *SplitController) runCutover() error {
 
 	// If a parent or child leader election invalidated the observer cursors
 	// since bootstrap, rebuild them before cutover. Unfreeze the parent first
-	// in case an earlier cutover attempt had frozen it.
-	if fallback, err := sc.checkObserverCursorsStale(); err != nil {
+	// in case an earlier cutover attempt had frozen it: Bootstrap and CatchUp
+	// don't freeze it, and a reset that fails is retried in Cutover.
+	if parentMeta, stale, err := sc.checkObserverCursorsStale(); err != nil {
 		return err
-	} else if fallback {
-		sc.unfreezeParentBestEffort()
-		return nil
+	} else if stale {
+		sc.unfreezeParentBestEffort(parentMeta.Leader, parentMeta.Term)
+		return sc.updatePhase(proto.SplitPhaseBootstrap)
 	}
 
-	parentMeta := sc.loadParentMeta()
+	parentMeta, err := sc.loadParentMeta()
+	if err != nil {
+		return err
+	}
 	if parentMeta == nil || parentMeta.Leader == nil {
 		return errors.New("parent shard has no leader")
 	}
@@ -688,11 +736,11 @@ func (sc *SplitController) runCutover() error {
 		if err != nil {
 			return err
 		}
-		if fallback, err := sc.checkObserverCursorsStale(); err != nil {
+		if parentMeta, stale, err := sc.checkObserverCursorsStale(); err != nil {
 			return err
-		} else if fallback {
-			sc.unfreezeParentBestEffort()
-			return nil
+		} else if stale {
+			sc.unfreezeParentBestEffort(parentMeta.Leader, parentMeta.Term)
+			return sc.updatePhase(proto.SplitPhaseBootstrap)
 		}
 		if caughtUp {
 			break
@@ -718,11 +766,8 @@ func (sc *SplitController) runCutover() error {
 		slog.Int64("frozen-term", parentTerm),
 		slog.Any("frozen-leader", parentLeader),
 	)
-	if err = sc.updatePhase(proto.SplitPhaseBootstrap); err != nil {
-		return err
-	}
-	sc.unfreezeParentBestEffort()
-	return nil
+	sc.unfreezeParentBestEffort(parentLeader, parentTerm)
+	return sc.updatePhase(proto.SplitPhaseBootstrap)
 }
 
 // passPointOfNoReturn moves the split to Finalize, and records the parent
@@ -764,7 +809,10 @@ func (sc *SplitController) passPointOfNoReturn(frozenLeader *proto.DataServerIde
 // Every step can be repeated, so a failed attempt, or a coordinator restart,
 // runs Finalize again from the start.
 func (sc *SplitController) runFinalize() error {
-	parentMeta := sc.loadParentMeta()
+	parentMeta, err := sc.loadParentMeta()
+	if err != nil {
+		return err
+	}
 	if parentMeta == nil || parentMeta.Split == nil {
 		// The split already completed
 		return nil
@@ -850,20 +898,20 @@ func (sc *SplitController) cutoverCatchUpRound(target int64) (bool, error) {
 }
 
 // unfreezeParentBestEffort lifts a write-freeze previously placed on the parent
-// leader, so it resumes serving writes. Used when cutover falls back to
-// Bootstrap or aborts before fencing. Best-effort: a new parent term clears the
-// freeze on its own, and after fencing the parent is gone anyway.
-func (sc *SplitController) unfreezeParentBestEffort() {
-	parentMeta := sc.loadParentMeta()
-	if parentMeta == nil || parentMeta.Leader == nil {
+// leader in the given term, so it resumes serving writes. Used when cutover
+// falls back to Bootstrap or aborts before fencing. Best-effort: the freeze is
+// kept in the memory of the leader, so a new parent term or a restart of the
+// leader clears it on its own, and after fencing the parent is gone anyway.
+func (sc *SplitController) unfreezeParentBestEffort(leader *proto.DataServerIdentity, term int64) {
+	if leader == nil {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if _, err := sc.rpcProvider.FreezeShard(ctx, parentMeta.Leader, &proto.FreezeShardRequest{
+	if _, err := sc.rpcProvider.FreezeShard(ctx, leader, &proto.FreezeShardRequest{
 		Namespace: sc.namespace,
 		Shard:     sc.parentShardId,
-		Term:      parentMeta.Term,
+		Term:      term,
 		Frozen:    false,
 	}); err != nil {
 		sc.logger.Warn("Failed to unfreeze parent (best-effort)", slog.Any("error", err))
@@ -873,15 +921,22 @@ func (sc *SplitController) unfreezeParentBestEffort() {
 // abort cleans up a failed/timed-out split that has not yet fenced the parent.
 // It unfreezes the parent (if cutover had frozen it), removes observer cursors
 // from the parent, deletes child shards from status, clears the parent's split
-// metadata, and notifies the coordinator.
-func (sc *SplitController) abort() {
-	sc.logger.Warn("Aborting split due to timeout or cancellation")
-
+// metadata, and notifies the coordinator. It returns the errors to retry: the
+// split is kept until the parent and the children can be loaded, and the abort
+// is persisted. The unfreeze and the removal of the observers are best-effort.
+func (sc *SplitController) abort() error {
 	// Use a fresh context since the split context is cancelled.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	parentMeta := sc.loadParentMeta()
+	parentMeta, err := sc.loadParentMeta()
+	if err != nil {
+		return err
+	}
+	childrenMeta, err := sc.loadChildrenMeta()
+	if err != nil {
+		return err
+	}
 
 	// Remove observer cursors from parent leader (best-effort).
 	// Only needed if we reached Bootstrap (observers were added).
@@ -889,7 +944,7 @@ func (sc *SplitController) abort() {
 		phase := parentMeta.Split.GetPhaseOrDefault()
 		if phase == proto.SplitPhaseBootstrap || phase == proto.SplitPhaseCatchUp || phase == proto.SplitPhaseCutover {
 			for _, childId := range []int64{sc.leftChildId, sc.rightChildId} {
-				childMeta := sc.loadShardMeta(childId)
+				childMeta := childrenMeta[childId]
 				if childMeta == nil || childMeta.Leader == nil {
 					continue
 				}
@@ -915,19 +970,17 @@ func (sc *SplitController) abort() {
 
 	// Lift any write-freeze placed on the parent during cutover so it resumes
 	// serving (best-effort; a new term would clear it anyway).
-	sc.unfreezeParentBestEffort()
+	sc.unfreezeParentBestEffort(parentMeta.GetLeader(), parentMeta.GetTerm())
 
-	// If the coordinator is closing and this cannot be persisted, the split
-	// resumes after a restart.
 	if err := sc.removeSplit(); err != nil {
-		sc.logger.Warn("Failed to persist the split abort", slog.Any("error", err))
-		return
+		return err
 	}
 
 	sc.logger.Info("Split aborted, parent restored")
 
 	// Notify coordinator to clean up child controllers and recompute assignments.
 	sc.eventListener.SplitAborted(sc.parentShardId, sc.leftChildId, sc.rightChildId)
+	return nil
 }
 
 // removeSplit deletes the child shards and clears the parent's split metadata
@@ -945,7 +998,8 @@ func (sc *SplitController) removeSplit() error {
 			slog.String("namespace", sc.namespace))
 		return nil
 	}
-	return sc.metadata.UpdateShardStatuses(sc.namespace, func(shards map[int64]*proto.ShardMetadata) bool {
+	return sc.metadata.PatchNamespaceStatus(sc.namespace, func(status *proto.NamespaceStatus) bool {
+		shards := status.Shards
 		changed := false
 		for _, childId := range []int64{sc.leftChildId, sc.rightChildId} {
 			if _, exists := shards[childId]; exists {
@@ -963,16 +1017,35 @@ func (sc *SplitController) removeSplit() error {
 
 // --- Helper methods ---
 
-func (sc *SplitController) loadParentMeta() *proto.ShardMetadata {
+func (sc *SplitController) loadParentMeta() (*proto.ShardMetadata, error) {
 	return sc.loadShardMeta(sc.parentShardId)
 }
 
-func (sc *SplitController) loadShardMeta(shardId int64) *proto.ShardMetadata {
-	meta, exists := sc.metadata.GetShardStatus(sc.namespace, shardId)
-	if !exists {
-		return nil
+// loadShardMeta returns a copy of the metadata of the shard, nil if it doesn't
+// exist, or the error of the status load.
+func (sc *SplitController) loadShardMeta(shardId int64) (*proto.ShardMetadata, error) {
+	meta, exists, err := sc.metadata.GetShardStatus(sc.namespace, shardId)
+	if err != nil {
+		return nil, err
 	}
-	return gproto.Clone(meta.UnsafeBorrow()).(*proto.ShardMetadata) //nolint:revive
+	if !exists {
+		return nil, nil //nolint:nilnil
+	}
+	return gproto.Clone(meta.UnsafeBorrow()).(*proto.ShardMetadata), nil //nolint:revive
+}
+
+// loadChildrenMeta returns copies of the metadata of the child shards, nil for
+// a child that doesn't exist.
+func (sc *SplitController) loadChildrenMeta() (map[int64]*proto.ShardMetadata, error) {
+	childrenMeta := make(map[int64]*proto.ShardMetadata, 2)
+	for _, childId := range []int64{sc.leftChildId, sc.rightChildId} {
+		childMeta, err := sc.loadShardMeta(childId)
+		if err != nil {
+			return nil, err
+		}
+		childrenMeta[childId] = childMeta
+	}
+	return childrenMeta, nil
 }
 
 func (sc *SplitController) updateParentMeta(fn func(meta *proto.ShardMetadata)) error {
@@ -986,18 +1059,17 @@ func (sc *SplitController) updateChildMeta(childId int64, fn func(meta *proto.Sh
 // updateShardMeta persists a change to a shard's metadata, applied to its
 // current metadata: the shard controller updates the same shard concurrently,
 // e.g. with the outcome of a leader election, which a write of an earlier copy
-// would revert. A failed write (the coordinator is closing, or the shard is
-// gone) returns a permanent error: the split must stop rather than retry its
-// phases from a state that was not persisted. It resumes from the persisted
-// state after a restart.
+// would revert. A shard that is gone returns a permanent error: the split
+// stops, and resumes from its persisted state after a restart. A failed write
+// is returned, and the step that made it is retried: it applies the change to
+// the current metadata again.
 func (sc *SplitController) updateShardMeta(shardId int64, fn func(meta *proto.ShardMetadata)) error {
 	return sc.updateShardsMeta(map[int64]func(meta *proto.ShardMetadata){shardId: fn})
 }
 
 // updateShardsMeta persists changes to the metadata of several shards in a
 // single status update, applied to their current metadata: all of them, or
-// none if one of the shards is gone. A failed write returns a permanent error,
-// as in updateShardMeta.
+// none if one of the shards is gone, as in updateShardMeta.
 func (sc *SplitController) updateShardsMeta(updates map[int64]func(meta *proto.ShardMetadata)) error {
 	_, err := sc.updateShardsMetaIf(nil, updates)
 	return err
@@ -1021,7 +1093,8 @@ func (sc *SplitController) updateShardsMetaIf(
 	}
 	var notFound error
 	applied := false
-	err = sc.metadata.UpdateShardStatuses(sc.namespace, func(shards map[int64]*proto.ShardMetadata) bool {
+	err = sc.metadata.PatchNamespaceStatus(sc.namespace, func(status *proto.NamespaceStatus) bool {
+		shards := status.Shards
 		notFound = nil
 		applied = false
 		for shardId := range updates {
@@ -1039,11 +1112,11 @@ func (sc *SplitController) updateShardsMetaIf(
 		applied = true
 		return true
 	})
-	if err == nil {
-		err = notFound
-	}
 	if err != nil {
-		return false, backoff.Permanent(err)
+		return false, err
+	}
+	if notFound != nil {
+		return false, backoff.Permanent(notFound)
 	}
 	return applied, nil
 }
@@ -1144,7 +1217,10 @@ func (*SplitController) pickLeader(entries map[*proto.DataServerIdentity]*proto.
 // round-based CatchUp algorithm passes a round-scoped context).
 func (sc *SplitController) waitForChildCommitOffset(ctx context.Context, childId int64, targetOffset int64) error {
 	return backoff.RetryNotify(func() error {
-		childMeta := sc.loadShardMeta(childId)
+		childMeta, err := sc.loadShardMeta(childId)
+		if err != nil {
+			return err
+		}
 		if childMeta == nil || childMeta.Leader == nil {
 			return errors.Errorf("child shard %d has no leader", childId)
 		}
@@ -1197,7 +1273,10 @@ func (sc *SplitController) waitForChildCommitOffset(ctx context.Context, childId
 // reelectChild fences the child ensemble with a new term and re-elects the
 // same leader. This establishes a clean term independent of the parent.
 func (sc *SplitController) reelectChild(ctx context.Context, childId int64) error {
-	childMeta := sc.loadShardMeta(childId)
+	childMeta, err := sc.loadShardMeta(childId)
+	if err != nil {
+		return err
+	}
 	if childMeta == nil {
 		return errors.Errorf("child shard %d not found", childId)
 	}
@@ -1225,7 +1304,10 @@ func (sc *SplitController) reelectChild(ctx context.Context, childId int64) erro
 		return err
 	}
 
-	termOptions := namespaceTermOptions(sc.metadata, sc.namespace)
+	termOptions, err := sc.metadata.GetNamespaceTermOptions(sc.namespace)
+	if err != nil {
+		return err
+	}
 	termOptions.Features = negotiatedFeatures
 	headEntries, enabledFeatures, err := sc.fenceEnsemble(ctx, childId, newTerm, childMeta.Ensemble, termOptions)
 	if err != nil {

@@ -52,10 +52,19 @@ func (so *Context) LabelGroupedSelectedLabelValues() map[string]*linkedhashset.S
 	return so.labelGroupedSelectedLabelValues
 }
 
+// SetSelected records the nodes selected already, and leaves them out of the
+// candidates, which keep their order: a difference of the sets would iterate
+// their hash table, and reorder them from one call to the next.
 func (so *Context) SetSelected(selected *linkedhashset.Set[string]) {
 	so.selected = selected
 	so.selectedOnce = sync.Once{}
-	so.Candidates = so.Candidates.Difference(so.selected)
+	remaining := linkedhashset.New[string]()
+	for _, candidate := range so.Candidates.Values() {
+		if !selected.Contains(candidate) {
+			remaining.Add(candidate)
+		}
+	}
+	so.Candidates = remaining
 }
 
 func (so *Context) maybeGrouping() {

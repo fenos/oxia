@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -34,23 +35,26 @@ import (
 	"google.golang.org/grpc/health/grpc_health_v1"
 	gproto "google.golang.org/protobuf/proto"
 
+	commonobject "github.com/oxia-db/oxia/common/object"
 	"github.com/oxia-db/oxia/common/proto"
+	oxiatime "github.com/oxia-db/oxia/common/time"
 	coordmetadata "github.com/oxia-db/oxia/oxiad/coordinator/metadata"
 	"github.com/oxia-db/oxia/oxiad/coordinator/metadata/provider"
 	"github.com/oxia-db/oxia/oxiad/coordinator/metadata/provider/memory"
 	coordoption "github.com/oxia-db/oxia/oxiad/coordinator/option"
 	coordrpc "github.com/oxia-db/oxia/oxiad/coordinator/rpc"
 
+	"github.com/oxia-db/oxia/oxiad/coordinator/rpc/rpctest"
 	"github.com/oxia-db/oxia/oxiad/coordinator/runtime/action"
 	controllerapi "github.com/oxia-db/oxia/oxiad/coordinator/runtime/controller"
 	dataservercontroller "github.com/oxia-db/oxia/oxiad/coordinator/runtime/controller/dataserver"
-	"github.com/oxia-db/oxia/oxiad/coordinator/runtime/controller/mockutils"
 
 	"github.com/oxia-db/oxia/common/concurrent"
 
 	"github.com/oxia-db/oxia/common/constant"
 	"github.com/oxia-db/oxia/common/metric"
 	"github.com/oxia-db/oxia/oxiad/common/feature"
+	"github.com/oxia-db/oxia/oxiad/common/health"
 	leaderselector "github.com/oxia-db/oxia/oxiad/coordinator/runtime/balancer/selector/leader"
 )
 
@@ -153,8 +157,8 @@ func storeTestShardMetadata(
 }
 
 func testShardMetadata(metadata coordmetadata.Metadata, namespace string, shard int64) (*proto.ShardMetadata, bool) {
-	borrowedMeta, exists := metadata.GetShardStatus(namespace, shard)
-	if !exists {
+	borrowedMeta, exists, err := metadata.GetShardStatus(namespace, shard)
+	if err != nil || !exists {
 		return nil, false
 	}
 	return gproto.CloneOf(borrowedMeta.UnsafeBorrow()), true
@@ -214,64 +218,20 @@ func assertShardEnsemble(
 	}
 }
 
-func TestLeaderElection_ShouldChooseHighestTerm(t *testing.T) {
-	tests := []struct {
-		name           string
-		candidates     map[*proto.DataServerIdentity]*proto.EntryId
-		expectedLeader *proto.DataServerIdentity
-	}{
-		{
-			name: "Choose highest term",
-			candidates: map[*proto.DataServerIdentity]*proto.EntryId{
-				{Public: "1", Internal: "1"}: {Term: 200, Offset: 2480},
-				{Public: "2", Internal: "2"}: {Term: 200, Offset: 2500},
-				{Public: "3", Internal: "3"}: {Term: 198, Offset: 3000},
-			},
-			expectedLeader: &proto.DataServerIdentity{Public: "2", Internal: "2"},
-		},
-		{
-			name: "Same term, different offsets",
-			candidates: map[*proto.DataServerIdentity]*proto.EntryId{
-				{Public: "1", Internal: "1"}: {Term: 200, Offset: 1000},
-				{Public: "2", Internal: "2"}: {Term: 200, Offset: 2000},
-				{Public: "3", Internal: "3"}: {Term: 200, Offset: 1500},
-			},
-			expectedLeader: &proto.DataServerIdentity{Public: "2", Internal: "2"},
-		},
-		{
-			name: "Different terms, same offsets",
-			candidates: map[*proto.DataServerIdentity]*proto.EntryId{
-				{Public: "1", Internal: "1"}: {Term: 200, Offset: 1500},
-				{Public: "2", Internal: "2"}: {Term: 198, Offset: 1500},
-				{Public: "3", Internal: "3"}: {Term: 199, Offset: 1500},
-			},
-			expectedLeader: &proto.DataServerIdentity{Public: "1", Internal: "1"},
-		},
-		{
-			name: "Single candidate",
-			candidates: map[*proto.DataServerIdentity]*proto.EntryId{
-				{Public: "1", Internal: "1"}: {Term: 200, Offset: 1500},
-			},
-			expectedLeader: &proto.DataServerIdentity{Public: "1", Internal: "1"},
-		},
-	}
+func TestNoOpSupportedFeaturesSupplierReturnsNoFeatures(t *testing.T) {
+	result := NoOpSupportedFeaturesSupplier(nil)
+	assert.NotNil(t, result)
+	assert.Empty(t, result)
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			candidates := chooseCandidates(tt.candidates)
-
-			// Check candidates
-			assert.Equal(t, 1, len(candidates))
-			for _, candidate := range candidates {
-				assert.Equal(t, tt.expectedLeader, candidate)
-			}
-		})
-	}
+	server := testDataServer("node1")
+	result = NoOpSupportedFeaturesSupplier([]*proto.DataServerIdentity{server})
+	assert.Contains(t, result, server.GetNameOrDefault())
+	assert.Empty(t, result[server.GetNameOrDefault()])
 }
 
 func TestController_OnElectLeaderReturnsNewLeader(t *testing.T) {
 	var shard int64 = 5
-	rpc := mockutils.NewRpcProvider()
+	rpc := rpctest.NewRpcProvider()
 
 	s1 := &proto.DataServerIdentity{Public: "s1:9091", Internal: "s1:8191"}
 
@@ -307,7 +267,8 @@ func TestController_OnElectLeaderReturnsNewLeader(t *testing.T) {
 	rpc.GetNode(s1).NewTermResponse(1, 0, nil)
 	rpc.GetNode(s1).BecomeLeaderResponse(nil)
 
-	newLeader := s.onElectLeader(nil)
+	shardMeta, _ := testShardMetadata(metadata, constant.DefaultNamespace, shard)
+	newLeader := s.electLeader(shardMeta, nil)
 	require.NotNil(t, newLeader)
 	assert.True(t, gproto.Equal(s1, newLeader))
 	assertShardLeader(t, metadata, constant.DefaultNamespace, shard, s1)
@@ -326,13 +287,13 @@ func (statusWriteFailingMetadata) UpdateShardStatus(string, int64, *proto.ShardM
 	return context.Canceled
 }
 
-func (statusWriteFailingMetadata) UpdateShardStatuses(string, func(map[int64]*proto.ShardMetadata) bool) error {
+func (statusWriteFailingMetadata) PatchNamespaceStatus(string, func(*proto.NamespaceStatus) bool) error {
 	return context.Canceled
 }
 
 func TestController_ElectionDoesNotFenceWithUnpersistedTerm(t *testing.T) {
 	var shard int64 = 5
-	rpc := mockutils.NewRpcProvider()
+	rpc := rpctest.NewRpcProvider()
 
 	s1 := &proto.DataServerIdentity{Public: "s1:9091", Internal: "s1:8191"}
 
@@ -354,7 +315,7 @@ func TestController_ElectionDoesNotFenceWithUnpersistedTerm(t *testing.T) {
 
 func TestController(t *testing.T) {
 	var shard int64 = 5
-	rpc := mockutils.NewRpcProvider()
+	rpc := rpctest.NewRpcProvider()
 
 	s1 := &proto.DataServerIdentity{Public: "s1:9091", Internal: "s1:8191"}
 	s2 := &proto.DataServerIdentity{Public: "s2:9091", Internal: "s2:8191"}
@@ -427,9 +388,128 @@ func TestController(t *testing.T) {
 	assert.NoError(t, sc.Close())
 }
 
+// shardStatusFailingMetadata fails the shard status loads while failures is
+// positive, each failed load decrementing it.
+type shardStatusFailingMetadata struct {
+	coordmetadata.Metadata
+	failures atomic.Int32
+}
+
+func (m *shardStatusFailingMetadata) GetShardStatus(namespace string, shard int64) (
+	commonobject.Borrowed[*proto.ShardMetadata], bool, error) {
+	if m.failures.Add(-1) >= 0 {
+		return commonobject.Borrowed[*proto.ShardMetadata]{}, false, errors.New("status unavailable")
+	}
+	return m.Metadata.GetShardStatus(namespace, shard)
+}
+
+// The shard controller retries the shard status loads that fail when it
+// starts, and when it handles the failure of the leader, which is notified
+// once: it elects a leader in both cases.
+func TestController_RetriesShardStatusLoadError(t *testing.T) {
+	var shard int64 = 5
+	rpc := rpctest.NewRpcProvider()
+
+	s1 := &proto.DataServerIdentity{Public: "s1:9091", Internal: "s1:8191"}
+	s2 := &proto.DataServerIdentity{Public: "s2:9091", Internal: "s2:8191"}
+	s3 := &proto.DataServerIdentity{Public: "s3:9091", Internal: "s3:8191"}
+
+	metadata := &shardStatusFailingMetadata{
+		Metadata: newTestMetadata(t, memory.NewProvider(metadatacodec.ClusterStatusCodec, metadatacommon.WatchDisabled, ""),
+			&proto.ClusterConfiguration{}),
+	}
+	metadata.failures.Store(2)
+
+	sc := newTestController(t, metadata, constant.DefaultNamespace, shard, namespaceConfig, &proto.ShardMetadata{
+		Status:   proto.ShardStatusUnknown,
+		Term:     1,
+		Leader:   nil,
+		Ensemble: []*proto.DataServerIdentity{s1, s2, s3},
+	}, NoOpSupportedFeaturesSupplier, rpc, DefaultPeriodicTasksInterval)
+	t.Cleanup(func() {
+		assert.NoError(t, sc.Close())
+	})
+
+	rpc.GetNode(s1).NewTermResponse(1, 0, nil)
+	rpc.GetNode(s2).NewTermResponse(1, -1, nil)
+	rpc.GetNode(s3).NewTermResponse(1, -1, nil)
+	rpc.GetNode(s1).BecomeLeaderResponse(nil)
+
+	rpc.GetNode(s1).ExpectNewTermRequest(t, shard, 2, true)
+	rpc.GetNode(s2).ExpectNewTermRequest(t, shard, 2, true)
+	rpc.GetNode(s3).ExpectNewTermRequest(t, shard, 2, true)
+	rpc.GetNode(s1).ExpectBecomeLeaderRequest(t, shard, 2, 3)
+
+	assert.Eventually(t, func() bool {
+		return shardStatus(metadata, constant.DefaultNamespace, shard) == proto.ShardStatusSteadyState
+	}, 10*time.Second, 100*time.Millisecond)
+	assertShardLeader(t, metadata, constant.DefaultNamespace, shard, s1)
+
+	// The failure of the leader is notified once: its handling retries the
+	// load of the shard status
+	rpc.GetNode(s2).NewTermResponse(2, 0, nil)
+	rpc.GetNode(s3).NewTermResponse(2, -1, nil)
+	rpc.GetNode(s2).BecomeLeaderResponse(nil)
+
+	metadata.failures.Store(2)
+	rpc.FailNode(s1, errors.New("failed to connect"))
+	sc.BecameUnavailable(s1)
+
+	rpc.GetNode(s2).ExpectNewTermRequest(t, shard, 3, true)
+	rpc.GetNode(s3).ExpectNewTermRequest(t, shard, 3, true)
+	rpc.GetNode(s2).ExpectBecomeLeaderRequest(t, shard, 3, 3)
+
+	assert.Eventually(t, func() bool {
+		return shardStatus(metadata, constant.DefaultNamespace, shard) == proto.ShardStatusSteadyState &&
+			shardTerm(metadata, constant.DefaultNamespace, shard) == 3
+	}, 10*time.Second, 100*time.Millisecond)
+	assertShardLeader(t, metadata, constant.DefaultNamespace, shard, s2)
+
+	// An election request is sent again too: its caller gets the new leader
+	rpc.GetNode(s2).NewTermResponse(3, 0, nil)
+	rpc.GetNode(s3).NewTermResponse(3, -1, nil)
+	rpc.GetNode(s2).BecomeLeaderResponse(nil)
+
+	metadata.failures.Store(1)
+	newLeader := make(chan string, 1)
+	go func() {
+		newLeader <- sc.Election(&action.ElectionAction{Shard: shard})
+	}()
+
+	rpc.GetNode(s2).ExpectNewTermRequest(t, shard, 4, true)
+	rpc.GetNode(s3).ExpectNewTermRequest(t, shard, 4, true)
+	rpc.GetNode(s2).ExpectBecomeLeaderRequest(t, shard, 4, 3)
+	select {
+	case leader := <-newLeader:
+		assert.Equal(t, s2.GetNameOrDefault(), leader)
+	case <-time.After(10 * time.Second):
+		t.Fatal("the election request was not completed")
+	}
+}
+
+// The periodic tasks skip a round whose shard status load fails, instead of
+// panicking as if the shard was missing.
+func TestController_PeriodicTasksSkipShardStatusLoadError(t *testing.T) {
+	metadata := &shardStatusFailingMetadata{
+		Metadata: newTestMetadata(t, memory.NewProvider(metadatacodec.ClusterStatusCodec, metadatacommon.WatchDisabled, ""),
+			&proto.ClusterConfiguration{}),
+	}
+	metadata.failures.Store(1)
+	s := &controller{
+		namespace:     constant.DefaultNamespace,
+		shard:         5,
+		metadataStore: metadata,
+		rpc:           rpctest.NewRpcProvider(),
+		ctx:           t.Context(),
+		logger:        slog.Default(),
+	}
+	assert.NotPanics(t, s.handlePeriodicTasks)
+	assert.Zero(t, metadata.failures.Load(), "the status load failed")
+}
+
 func TestController_StartingWithLeaderAlreadyPresent(t *testing.T) {
 	var shard int64 = 5
-	rpc := mockutils.NewRpcProvider()
+	rpc := rpctest.NewRpcProvider()
 
 	s1 := &proto.DataServerIdentity{Public: "s1:9091", Internal: "s1:8191"}
 	s2 := &proto.DataServerIdentity{Public: "s2:9091", Internal: "s2:8191"}
@@ -466,7 +546,7 @@ func TestController_StartingWithLeaderAlreadyPresent(t *testing.T) {
 // controller starts, e.g. on a coordinator restart, nor on an election request.
 func TestController_DoesNotElectFinalizingSplitParent(t *testing.T) {
 	var shard int64 = 5
-	rpc := mockutils.NewRpcProvider()
+	rpc := rpctest.NewRpcProvider()
 
 	s1 := &proto.DataServerIdentity{Public: "s1:9091", Internal: "s1:8191"}
 	s2 := &proto.DataServerIdentity{Public: "s2:9091", Internal: "s2:8191"}
@@ -514,7 +594,7 @@ func TestController_DoesNotElectFinalizingSplitParent(t *testing.T) {
 
 func TestController_RetriesElectionWhenDataServerNotInitialized(t *testing.T) {
 	var shard int64 = 5
-	rpc := mockutils.NewRpcProvider()
+	rpc := rpctest.NewRpcProvider()
 
 	s1 := &proto.DataServerIdentity{Public: "s1:9091", Internal: "s1:8191"}
 	s2 := &proto.DataServerIdentity{Public: "s2:9091", Internal: "s2:8191"}
@@ -560,7 +640,7 @@ func TestController_RetriesElectionWhenDataServerNotInitialized(t *testing.T) {
 
 func TestController_NewTermWithNonRespondingServer(t *testing.T) {
 	var shard int64 = 5
-	rpc := mockutils.NewRpcProvider()
+	rpc := rpctest.NewRpcProvider()
 
 	s1 := &proto.DataServerIdentity{Public: "s1:9091", Internal: "s1:8191"}
 	s2 := &proto.DataServerIdentity{Public: "s2:9091", Internal: "s2:8191"}
@@ -607,7 +687,7 @@ func TestController_NewTermWithNonRespondingServer(t *testing.T) {
 
 func TestController_NewTermFollowerUntilItRecovers(t *testing.T) {
 	var shard int64 = 5
-	rpc := mockutils.NewRpcProvider()
+	rpc := rpctest.NewRpcProvider()
 
 	s1 := &proto.DataServerIdentity{Public: "s1:9091", Internal: "s1:8191"}
 	s2 := &proto.DataServerIdentity{Public: "s2:9091", Internal: "s2:8191"}
@@ -659,7 +739,7 @@ func TestController_NewTermFollowerUntilItRecovers(t *testing.T) {
 
 func TestController_VerifyFollowersWereAllFenced(t *testing.T) {
 	var shard int64 = 5
-	rpc := mockutils.NewRpcProvider()
+	rpc := rpctest.NewRpcProvider()
 
 	s1 := &proto.DataServerIdentity{Public: "s1:9091", Internal: "s1:8191"}
 	s2 := &proto.DataServerIdentity{Public: "s2:9091", Internal: "s2:8191"}
@@ -698,7 +778,7 @@ func TestController_VerifyFollowersWereAllFenced(t *testing.T) {
 
 func TestController_NotificationsDisabled(t *testing.T) {
 	var shard int64 = 5
-	rpc := mockutils.NewRpcProvider()
+	rpc := rpctest.NewRpcProvider()
 
 	s1 := &proto.DataServerIdentity{Public: "s1:9091", Internal: "s1:8191"}
 	s2 := &proto.DataServerIdentity{Public: "s2:9091", Internal: "s2:8191"}
@@ -740,7 +820,7 @@ func TestController_NotificationsDisabled(t *testing.T) {
 
 func TestController_SwapNodeWithLeaderElectionFailure(t *testing.T) {
 	var shard int64 = 5
-	rpc := mockutils.NewRpcProvider()
+	rpc := rpctest.NewRpcProvider()
 
 	s1 := &proto.DataServerIdentity{Public: "s1:9091", Internal: "s1:8191"}
 	s2 := &proto.DataServerIdentity{Public: "s2:9091", Internal: "s2:8191"}
@@ -839,7 +919,7 @@ func TestController_SwapNodeWithLeaderElectionFailure(t *testing.T) {
 
 func TestController_LeaderElectionShouldNotFailIfRemoveFails(t *testing.T) {
 	var shard int64 = 5
-	rpc := mockutils.NewRpcProvider()
+	rpc := rpctest.NewRpcProvider()
 
 	s1 := &proto.DataServerIdentity{Public: "s1:9091", Internal: "s1:8191"}
 	s2 := &proto.DataServerIdentity{Public: "s2:9091", Internal: "s2:8191"}
@@ -955,7 +1035,7 @@ func TestController_LeaderElectionShouldNotFailIfRemoveFails(t *testing.T) {
 
 func TestController_ShardsDataLostWithChangeEnsemble(t *testing.T) {
 	var shardId = rand.Int63()
-	rpc := mockutils.NewRpcProvider()
+	rpc := rpctest.NewRpcProvider()
 
 	s1 := &proto.DataServerIdentity{Public: "s1:9091", Internal: "s1:8191"}
 	s2 := &proto.DataServerIdentity{Public: "s2:9091", Internal: "s2:8191"}
@@ -1055,7 +1135,7 @@ func TestController_ShardsDataLostWithChangeEnsemble(t *testing.T) {
 // no follower to commit its head entry and BecomeLeader cannot complete.
 func TestController_ChangeEnsembleWaitsForNewEnsembleQuorum(t *testing.T) {
 	var shard int64 = 5
-	rpc := mockutils.NewRpcProvider()
+	rpc := rpctest.NewRpcProvider()
 
 	s1 := &proto.DataServerIdentity{Public: "s1:9091", Internal: "s1:8191"}
 	s2 := &proto.DataServerIdentity{Public: "s2:9091", Internal: "s2:8191"}
@@ -1136,7 +1216,7 @@ func TestController_ChangeEnsembleWaitsForNewEnsembleQuorum(t *testing.T) {
 // not elect s3: s1 would be truncated when it rejoins, and s2 gets deleted.
 func TestController_ChangeEnsembleKeepsEntryOfRemovedFollower(t *testing.T) {
 	var shard int64 = 5
-	rpc := mockutils.NewRpcProvider()
+	rpc := rpctest.NewRpcProvider()
 
 	s1 := &proto.DataServerIdentity{Public: "s1:9091", Internal: "s1:8191"}
 	s2 := &proto.DataServerIdentity{Public: "s2:9091", Internal: "s2:8191"}
@@ -1228,7 +1308,7 @@ func TestController_ChangeEnsembleKeepsEntryOfRemovedFollower(t *testing.T) {
 // with the ack of s2, and s2 is slow to answer the fence of the new term.
 func TestController_ChangeEnsembleKeepsEntryOfRemovedLeader(t *testing.T) {
 	var shard int64 = 5
-	rpc := mockutils.NewRpcProvider()
+	rpc := rpctest.NewRpcProvider()
 
 	s1 := &proto.DataServerIdentity{Public: "s1:9091", Internal: "s1:8191"}
 	s2 := &proto.DataServerIdentity{Public: "s2:9091", Internal: "s2:8191"}
@@ -1319,7 +1399,7 @@ func TestController_ChangeEnsembleKeepsEntryOfRemovedLeader(t *testing.T) {
 // the new ensemble alone, which a leader of the current ensemble could miss.
 func TestController_ChangeEnsembleNotAbortedAfterBecomeLeader(t *testing.T) {
 	var shard int64 = 5
-	rpc := mockutils.NewRpcProvider()
+	rpc := rpctest.NewRpcProvider()
 
 	s1 := &proto.DataServerIdentity{Public: "s1:9091", Internal: "s1:8191"}
 	s2 := &proto.DataServerIdentity{Public: "s2:9091", Internal: "s2:8191"}
@@ -1420,7 +1500,7 @@ func TestController_ChangeEnsembleNotAbortedAfterBecomeLeader(t *testing.T) {
 // Test feature negotiation with all nodes supporting the same features.
 func TestController_FeatureNegotiation_AllNodesSupport(t *testing.T) {
 	var shard int64 = 5
-	rpc := mockutils.NewRpcProvider()
+	rpc := rpctest.NewRpcProvider()
 
 	s1 := &proto.DataServerIdentity{Public: "s1:9091", Internal: "s1:8191"}
 	s2 := &proto.DataServerIdentity{Public: "s2:9091", Internal: "s2:8191"}
@@ -1475,7 +1555,7 @@ func TestController_FeatureNegotiation_AllNodesSupport(t *testing.T) {
 // Test feature negotiation with mixed node versions (one old node).
 func TestController_FeatureNegotiation_MixedVersions(t *testing.T) {
 	var shard int64 = 5
-	rpc := mockutils.NewRpcProvider()
+	rpc := rpctest.NewRpcProvider()
 
 	s1 := &proto.DataServerIdentity{Public: "s1:9091", Internal: "s1:8191"}
 	s2 := &proto.DataServerIdentity{Public: "s2:9091", Internal: "s2:8191"}
@@ -1529,7 +1609,7 @@ func TestController_FeatureNegotiation_MixedVersions(t *testing.T) {
 
 func TestController_ChangeEnsembleRejectsFeatureSupportRegression(t *testing.T) {
 	var shard int64 = 5
-	rpc := mockutils.NewRpcProvider()
+	rpc := rpctest.NewRpcProvider()
 
 	s1 := &proto.DataServerIdentity{Public: "s1:9091", Internal: "s1:8191"}
 	s2 := &proto.DataServerIdentity{Public: "s2:9091", Internal: "s2:8191"}
@@ -1635,7 +1715,8 @@ func TestController_ChangeEnsembleRejectsMissingFeatureInfo(t *testing.T) {
 				logger: slog.Default(),
 			}
 
-			err := s.validateChangeEnsembleFeatures(action.NewChangeEnsembleAction(shard, s1, s4))
+			shardMeta, _ := testShardMetadata(s.metadataStore, constant.DefaultNamespace, shard)
+			err := s.validateChangeEnsembleFeatures(shardMeta, action.NewChangeEnsembleAction(shard, s1, s4))
 			assert.ErrorIs(t, err, ErrNotReadyForChangeEnsemble)
 		})
 	}
@@ -1676,14 +1757,15 @@ func TestController_ChangeEnsembleRejectsInvalidAction(t *testing.T) {
 		{name: "duplicate to", from: s1, to: s2},
 	}
 
+	shardMeta, _ := testShardMetadata(metadata, constant.DefaultNamespace, shard)
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := s.validateChangeEnsembleFeatures(action.NewChangeEnsembleAction(shard, tt.from, tt.to))
+			err := s.validateChangeEnsembleFeatures(shardMeta, action.NewChangeEnsembleAction(shard, tt.from, tt.to))
 			assert.ErrorIs(t, err, ErrInvalidChangeEnsemble)
 		})
 	}
 
-	assert.NoError(t, s.validateChangeEnsembleFeatures(action.NewChangeEnsembleAction(shard, s1, s4)))
+	assert.NoError(t, s.validateChangeEnsembleFeatures(shardMeta, action.NewChangeEnsembleAction(shard, s1, s4)))
 }
 
 // A change of the ensemble of the parent or of a child of a split is rejected
@@ -1710,7 +1792,8 @@ func TestController_ChangeEnsembleRejectsSplitShard(t *testing.T) {
 				logger:                              slog.Default(),
 			}
 
-			err := s.validateChangeEnsembleFeatures(action.NewChangeEnsembleAction(test.shard, test.from, spare))
+			shardMeta, _ := testShardMetadata(metadata, constant.DefaultNamespace, test.shard)
+			err := s.validateChangeEnsembleFeatures(shardMeta, action.NewChangeEnsembleAction(test.shard, test.from, spare))
 			assert.ErrorIs(t, err, ErrNotReadyForChangeEnsemble)
 		})
 	}
@@ -1722,7 +1805,7 @@ func TestController_ChangeEnsembleRejectsSplitShard(t *testing.T) {
 // it was. Once the split is aborted, the ensemble of the shard can change
 // again.
 func TestController_ChangeEnsembleStopsWhenSplitStarts(t *testing.T) {
-	rpc := mockutils.NewRpcProvider()
+	rpc := rpctest.NewRpcProvider()
 	spare := &proto.DataServerIdentity{Public: "spare:9091", Internal: "spare:8191"}
 	metadata := newTestMetadata(t, memory.NewProvider(metadatacodec.ClusterStatusCodec, metadatacommon.WatchDisabled, ""), &proto.ClusterConfiguration{})
 	election := newHoldingMetadata(metadata, func() bool { return true })
@@ -1756,7 +1839,8 @@ func TestController_ChangeEnsembleStopsWhenSplitStarts(t *testing.T) {
 	requireClosed(t, election.held, "the election to start")
 
 	// ...when the split of the shard starts
-	require.NoError(t, metadata.UpdateShardStatuses(constant.DefaultNamespace, func(shards map[int64]*proto.ShardMetadata) bool {
+	require.NoError(t, metadata.PatchNamespaceStatus(constant.DefaultNamespace, func(status *proto.NamespaceStatus) bool {
+		shards := status.Shards
 		shards[0].Split = &proto.SplitMetadata{
 			Phase:         proto.SplitPhaseBootstrap,
 			ChildShardIds: []int64{1, 2},
@@ -1781,7 +1865,8 @@ func TestController_ChangeEnsembleStopsWhenSplitStarts(t *testing.T) {
 
 	// The split is aborted, and the balancer moves the shard again: the
 	// stopped election must not hold the change back as not ready
-	require.NoError(t, metadata.UpdateShardStatuses(constant.DefaultNamespace, func(shards map[int64]*proto.ShardMetadata) bool {
+	require.NoError(t, metadata.PatchNamespaceStatus(constant.DefaultNamespace, func(status *proto.NamespaceStatus) bool {
+		shards := status.Shards
 		shards[0].Split = nil
 		return true
 	}))
@@ -1800,7 +1885,7 @@ func TestController_ChangeEnsembleStopsWhenSplitStarts(t *testing.T) {
 func TestController_PeriodicTasksPersistOnlyDirtyState(t *testing.T) {
 	var shard int64 = 5
 	metadata := newTestMetadata(t, memory.NewProvider(metadatacodec.ClusterStatusCodec, metadatacommon.WatchDisabled, ""), &proto.ClusterConfiguration{})
-	rpc := mockutils.NewRpcProvider()
+	rpc := rpctest.NewRpcProvider()
 	pendingDeleteNode := &proto.DataServerIdentity{Public: "s2:9091", Internal: "s2:8191"}
 
 	shardMeta := &proto.ShardMetadata{
@@ -1823,30 +1908,35 @@ func TestController_PeriodicTasksPersistOnlyDirtyState(t *testing.T) {
 		logger:        slog.Default(),
 	}
 
-	borrowedBefore, exists := metadata.GetShardStatus(constant.DefaultNamespace, shard)
+	borrowedBefore, exists, err := metadata.GetShardStatus(constant.DefaultNamespace, shard)
+	require.NoError(t, err)
 	assert.True(t, exists)
 
 	// Steady state without pending-delete nodes: no persist
 	s.handlePeriodicTasks()
-	borrowedAfter, _ := metadata.GetShardStatus(constant.DefaultNamespace, shard)
+	borrowedAfter, _, err := metadata.GetShardStatus(constant.DefaultNamespace, shard)
+	require.NoError(t, err)
 	assert.Same(t, borrowedBefore.UnsafeBorrow(), borrowedAfter.UnsafeBorrow())
 
 	updatedShardMeta := gproto.CloneOf(shardMeta)
 	updatedShardMeta.PendingDeleteShardNodes = []*proto.DataServerIdentity{pendingDeleteNode}
 	require.NoError(t, metadata.UpdateShardStatus(constant.DefaultNamespace, shard, updatedShardMeta))
-	borrowedBefore, _ = metadata.GetShardStatus(constant.DefaultNamespace, shard)
+	borrowedBefore, _, err = metadata.GetShardStatus(constant.DefaultNamespace, shard)
+	require.NoError(t, err)
 
 	rpc.GetNode(pendingDeleteNode).DeleteShardResponse(nil)
 	s.handlePeriodicTasks()
 	rpc.GetNode(pendingDeleteNode).ExpectDeleteShardRequest(t, shard, shardMeta.Term)
 
-	borrowedAfter, _ = metadata.GetShardStatus(constant.DefaultNamespace, shard)
+	borrowedAfter, _, err = metadata.GetShardStatus(constant.DefaultNamespace, shard)
+	require.NoError(t, err)
 	assert.NotSame(t, borrowedBefore.UnsafeBorrow(), borrowedAfter.UnsafeBorrow())
 	assert.Empty(t, borrowedAfter.UnsafeBorrow().PendingDeleteShardNodes)
 
 	borrowedBefore = borrowedAfter
 	s.handlePeriodicTasks()
-	borrowedAfter, _ = metadata.GetShardStatus(constant.DefaultNamespace, shard)
+	borrowedAfter, _, err = metadata.GetShardStatus(constant.DefaultNamespace, shard)
+	require.NoError(t, err)
 	assert.Same(t, borrowedBefore.UnsafeBorrow(), borrowedAfter.UnsafeBorrow())
 }
 
@@ -1857,7 +1947,7 @@ func TestController_PeriodicTasksPersistOnlyDirtyState(t *testing.T) {
 func assertPeriodicTasksKeepUpdate(t *testing.T, metadata coordmetadata.Metadata, shard int64,
 	removed *proto.DataServerIdentity, update func()) {
 	t.Helper()
-	rpc := mockutils.NewRpcProvider()
+	rpc := rpctest.NewRpcProvider()
 	periodic := newHoldingMetadata(metadata, func() bool { return true })
 	s := &controller{
 		namespace:     constant.DefaultNamespace,
@@ -1950,8 +2040,9 @@ func TestController_PeriodicTasksKeepSplitUpdates(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			_, metadata, _ := setupSplitTest(t, proto.SplitPhaseCutover)
 			updateParent := func(update func(parent *proto.ShardMetadata)) {
-				require.NoError(t, metadata.UpdateShardStatuses(constant.DefaultNamespace,
-					func(shards map[int64]*proto.ShardMetadata) bool {
+				require.NoError(t, metadata.PatchNamespaceStatus(constant.DefaultNamespace,
+					func(status *proto.NamespaceStatus) bool {
+						shards := status.Shards
 						update(shards[0])
 						return true
 					}))
@@ -2040,9 +2131,80 @@ func TestController_SyncServerAddressDiscardsElectionWhenQueueIsFull(t *testing.
 	assert.Len(t, s.electionOp, chanBufferSize)
 }
 
+// deleteShardStatusFailingMetadata fails the shard status deletions while
+// failures is positive, each failed deletion decrementing it.
+type deleteShardStatusFailingMetadata struct {
+	coordmetadata.Metadata
+	failures atomic.Int32
+}
+
+func (m *deleteShardStatusFailingMetadata) DeleteShardStatus(namespace string, shard int64) error {
+	if m.failures.Add(-1) >= 0 {
+		return errors.New("store unavailable")
+	}
+	return m.Metadata.DeleteShardStatus(namespace, shard)
+}
+
+// A shard deletion whose status deletion fails keeps the shard controller
+// running, and sends the deletion again to the event loop.
+func TestController_DeleteShardRetriesStatusDeletion(t *testing.T) {
+	var shard int64 = 5
+	rpc := rpctest.NewRpcProvider()
+	metadata := &deleteShardStatusFailingMetadata{
+		Metadata: newTestMetadata(t, memory.NewProvider(metadatacodec.ClusterStatusCodec, metadatacommon.WatchDisabled, ""),
+			&proto.ClusterConfiguration{}),
+	}
+	metadata.failures.Store(1)
+
+	leader := &proto.DataServerIdentity{Public: "s1:9091", Internal: "s1:8191"}
+	require.NoError(t, metadata.CreateNamespaceStatus(constant.DefaultNamespace, &proto.NamespaceStatus{
+		Shards: map[int64]*proto.ShardMetadata{
+			shard: {
+				Status:   proto.ShardStatusDeleting,
+				Term:     1,
+				Leader:   leader,
+				Ensemble: []*proto.DataServerIdentity{leader},
+			},
+		},
+	}))
+
+	s := &controller{
+		namespace:     constant.DefaultNamespace,
+		shard:         shard,
+		metadataStore: metadata,
+		rpc:           rpc,
+		deleteOp:      make(chan any, chanBufferSize),
+		logger:        slog.Default(),
+	}
+	s.ctx, s.ctxCancel = context.WithCancel(context.Background())
+	defer s.ctxCancel()
+
+	rpc.GetNode(leader).DeleteShardResponse(nil)
+	s.deleteShardWithRetries()
+	rpc.GetNode(leader).ExpectDeleteShardRequest(t, shard, 1)
+	assert.False(t, s.terminating.Load())
+	_, exists, err := metadata.GetShardStatus(constant.DefaultNamespace, shard)
+	require.NoError(t, err)
+	assert.True(t, exists)
+
+	select {
+	case <-s.deleteOp:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the shard deletion was not sent again")
+	}
+
+	rpc.GetNode(leader).DeleteShardResponse(nil)
+	s.deleteShardWithRetries()
+	rpc.GetNode(leader).ExpectDeleteShardRequest(t, shard, 1)
+	assert.True(t, s.terminating.Load())
+	_, exists, err = metadata.GetShardStatus(constant.DefaultNamespace, shard)
+	require.NoError(t, err)
+	assert.False(t, exists)
+}
+
 func TestController_DeleteShardAllowsNilEventListener(t *testing.T) {
 	var shard int64 = 5
-	rpc := mockutils.NewRpcProvider()
+	rpc := rpctest.NewRpcProvider()
 	metadata := newTestMetadata(t, memory.NewProvider(metadatacodec.ClusterStatusCodec, metadatacommon.WatchDisabled, ""), &proto.ClusterConfiguration{})
 
 	leader := &proto.DataServerIdentity{Public: "s1:9091", Internal: "s1:8191"}
@@ -2081,7 +2243,8 @@ func TestController_DeleteShardAllowsNilEventListener(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("deleteShardWithRetries did not complete")
 	}
-	_, exists := metadata.GetShardStatus(constant.DefaultNamespace, shard)
+	_, exists, err := metadata.GetShardStatus(constant.DefaultNamespace, shard)
+	require.NoError(t, err)
 	assert.False(t, exists)
 	assert.True(t, s.terminating.Load())
 }
@@ -2118,7 +2281,7 @@ func (s *testFeaturesSupplier) supply(dataServers []*proto.DataServerIdentity) m
 // entries with different semantics and silently diverge.
 func TestController_ElectionRejectsEnsembleMissingEnabledFeature(t *testing.T) {
 	var shard int64 = 5
-	rpc := mockutils.NewRpcProvider()
+	rpc := rpctest.NewRpcProvider()
 
 	s1 := &proto.DataServerIdentity{Public: "s1:9091", Internal: "s1:8191"}
 	s2 := &proto.DataServerIdentity{Public: "s2:9091", Internal: "s2:8191"}
@@ -2164,7 +2327,7 @@ func TestController_ElectionRejectsEnsembleMissingEnabledFeature(t *testing.T) {
 // them in the NewTerm options of every member and passes them to the leader.
 func TestController_ElectionPinsNegotiatedFeatures(t *testing.T) {
 	var shard int64 = 5
-	rpc := mockutils.NewRpcProvider()
+	rpc := rpctest.NewRpcProvider()
 
 	s1 := &proto.DataServerIdentity{Public: "s1:9091", Internal: "s1:8191"}
 	s2 := &proto.DataServerIdentity{Public: "s2:9091", Internal: "s2:8191"}
@@ -2212,7 +2375,7 @@ func TestController_ElectionPinsNegotiatedFeatures(t *testing.T) {
 // the enabled features, and the member is checked when it joins the term.
 func TestController_ElectionPinsEnabledFeaturesWithUnknownMember(t *testing.T) {
 	var shard int64 = 5
-	rpc := mockutils.NewRpcProvider()
+	rpc := rpctest.NewRpcProvider()
 
 	s1 := &proto.DataServerIdentity{Public: "s1:9091", Internal: "s1:8191"}
 	s2 := &proto.DataServerIdentity{Public: "s2:9091", Internal: "s2:8191"}
@@ -2269,7 +2432,7 @@ func TestController_ElectionPinsEnabledFeaturesWithUnknownMember(t *testing.T) {
 // until the next election.
 func TestController_ElectionPinsFeaturesOfHandshakeDuringFencing(t *testing.T) {
 	var shard int64 = 5
-	rpc := mockutils.NewRpcProvider()
+	rpc := rpctest.NewRpcProvider()
 
 	s1 := &proto.DataServerIdentity{Public: "s1:9091", Internal: "s1:8191"}
 	s2 := &proto.DataServerIdentity{Public: "s2:9091", Internal: "s2:8191"}
@@ -2332,7 +2495,7 @@ func TestController_ElectionPinsFeaturesOfHandshakeDuringFencing(t *testing.T) {
 // must pin the features that the whole ensemble supports once they are known.
 func TestController_ElectionPinsFeaturesDiscoveredAfterElection(t *testing.T) {
 	var shard int64 = 5
-	rpc := mockutils.NewRpcProvider()
+	rpc := rpctest.NewRpcProvider()
 
 	s1 := &proto.DataServerIdentity{Public: "s1:9091", Internal: "s1:8191"}
 	s2 := &proto.DataServerIdentity{Public: "s2:9091", Internal: "s2:8191"}
@@ -2397,7 +2560,7 @@ func TestController_ElectionPinsFeaturesDiscoveredAfterElection(t *testing.T) {
 // features when they change.
 func TestController_FeaturesDiscoveredWithoutNewFeaturesKeepsTerm(t *testing.T) {
 	var shard int64 = 5
-	rpc := mockutils.NewRpcProvider()
+	rpc := rpctest.NewRpcProvider()
 
 	s1 := &proto.DataServerIdentity{Public: "s1:9091", Internal: "s1:8191"}
 	s2 := &proto.DataServerIdentity{Public: "s2:9091", Internal: "s2:8191"}
@@ -2454,7 +2617,7 @@ func TestController_FeaturesDiscoveredWithoutNewFeaturesKeepsTerm(t *testing.T) 
 // completes before the election negotiates the features of the term.
 func TestController_FeaturesDiscoveredAlreadyPinnedKeepsTerm(t *testing.T) {
 	var shard int64 = 5
-	rpc := mockutils.NewRpcProvider()
+	rpc := rpctest.NewRpcProvider()
 
 	s1 := &proto.DataServerIdentity{Public: "s1:9091", Internal: "s1:8191"}
 	s2 := &proto.DataServerIdentity{Public: "s2:9091", Internal: "s2:8191"}
@@ -2507,7 +2670,7 @@ func TestController_FeaturesDiscoveredAlreadyPinnedKeepsTerm(t *testing.T) {
 // meantime (e.g. all of them at coordinator startup).
 func TestController_FeaturesDiscoveredDuringElectionAreNotDropped(t *testing.T) {
 	var shard int64 = 5
-	rpc := mockutils.NewRpcProvider()
+	rpc := rpctest.NewRpcProvider()
 
 	s1 := &proto.DataServerIdentity{Public: "s1:9091", Internal: "s1:8191"}
 	s2 := &proto.DataServerIdentity{Public: "s2:9091", Internal: "s2:8191"}
@@ -2606,7 +2769,7 @@ func (r *dataServerEventsRelay) FeaturesDiscovered(dataServer *proto.DataServerI
 // The data server controllers report the features, as in the coordinator.
 func TestController_RollingUpgradePinsNewFeatures(t *testing.T) {
 	var shard int64 = 5
-	rpc := mockutils.NewRpcProvider()
+	rpc := rpctest.NewRpcProvider()
 
 	s1 := &proto.DataServerIdentity{Public: "s1:9091", Internal: "s1:8191"}
 	s2 := &proto.DataServerIdentity{Public: "s2:9091", Internal: "s2:8191"}
@@ -2621,7 +2784,8 @@ func TestController_RollingUpgradePinsNewFeatures(t *testing.T) {
 	for _, dataServer := range ensemble {
 		rpc.GetNode(dataServer).SetNodeFeatures(previous)
 		dataServers[dataServer.GetNameOrDefault()] = dataservercontroller.NewController(context.Background(),
-			&proto.DataServer{Identity: dataServer}, mockutils.NewShardAssignmentsProvider(), relay, rpc, "test-instance")
+			&proto.DataServer{Identity: dataServer}, rpctest.NewShardAssignmentsProvider(), relay, rpc, "test-instance",
+			oxiatime.SlowInitialInterval, health.DefaultCheckPolicy)
 	}
 	defer func() {
 		for _, dataServer := range dataServers {
@@ -2631,12 +2795,12 @@ func TestController_RollingUpgradePinsNewFeatures(t *testing.T) {
 	// The health watch of a data server controller discards a report as
 	// stale if its ping loop changed the status while the watch waited for
 	// it: the data server reports its health until the controller acts on it.
-	setHealth := func(dataServer *proto.DataServerIdentity, health grpc_health_v1.HealthCheckResponse_ServingStatus,
-		status dataservercontroller.Status) {
+	setHealth := func(dataServer *proto.DataServerIdentity, servingStatus grpc_health_v1.HealthCheckResponse_ServingStatus,
+		status dataservercontroller.State) {
 		t.Helper()
 		require.Eventually(t, func() bool {
-			rpc.GetNode(dataServer).HealthClient.SetStatus(health)
-			return dataServers[dataServer.GetNameOrDefault()].Status() == status
+			rpc.GetNode(dataServer).HealthClient.SetStatus(servingStatus)
+			return dataServers[dataServer.GetNameOrDefault()].GetStatus().GetState() == status
 		}, 10*time.Second, 100*time.Millisecond)
 	}
 	for _, dataServer := range ensemble {
@@ -2645,7 +2809,7 @@ func TestController_RollingUpgradePinsNewFeatures(t *testing.T) {
 	supply := func(servers []*proto.DataServerIdentity) map[string][]proto.Feature {
 		features := make(map[string][]proto.Feature, len(servers))
 		for _, server := range servers {
-			features[server.GetNameOrDefault()] = dataServers[server.GetNameOrDefault()].SupportedFeatures()
+			features[server.GetNameOrDefault()] = dataServers[server.GetNameOrDefault()].GetFeatures()
 		}
 		return features
 	}
@@ -2727,7 +2891,7 @@ func TestController_RollingUpgradePinsNewFeatures(t *testing.T) {
 // coordinator, which keeps the leader of a shard in steady state after
 // verifying the ensemble, without negotiating the features of its term.
 func newRestartedTestController(t *testing.T, metadata coordmetadata.Metadata, shard int64,
-	ensemble []*proto.DataServerIdentity, supplier *testFeaturesSupplier, rpc *mockutils.RpcProvider,
+	ensemble []*proto.DataServerIdentity, supplier *testFeaturesSupplier, rpc *rpctest.RpcProvider,
 	periodicTasksInterval time.Duration) Controller {
 	t.Helper()
 
@@ -2757,7 +2921,7 @@ func newRestartedTestController(t *testing.T, metadata coordmetadata.Metadata, s
 // its term, and a new term must pin the ones that the ensemble supports.
 func TestController_PinsFeaturesOfEnsembleUpgradedWhileCoordinatorDown(t *testing.T) {
 	var shard int64 = 5
-	rpc := mockutils.NewRpcProvider()
+	rpc := rpctest.NewRpcProvider()
 
 	s1 := &proto.DataServerIdentity{Public: "s1:9091", Internal: "s1:8191"}
 	s2 := &proto.DataServerIdentity{Public: "s2:9091", Internal: "s2:8191"}
@@ -2807,21 +2971,21 @@ func TestController_FeaturesDiscoveredAfterRestartKeepsTerm(t *testing.T) {
 
 	for _, tt := range []struct {
 		name         string
-		leaderStatus func(leader *mockutils.PerNodeChannels)
+		leaderStatus func(leader *rpctest.PerNodeChannels)
 	}{{
 		name: "term pins the features",
-		leaderStatus: func(leader *mockutils.PerNodeChannels) {
+		leaderStatus: func(leader *rpctest.PerNodeChannels) {
 			leader.GetStatusResponseWithTermFeatures(3, proto.ServingStatus_LEADER, 10, 10, upgraded)
 		},
 	}, {
 		name: "leader predates the report",
-		leaderStatus: func(leader *mockutils.PerNodeChannels) {
+		leaderStatus: func(leader *rpctest.PerNodeChannels) {
 			leader.GetStatusResponse(3, proto.ServingStatus_LEADER, 10, 10)
 		},
 	}} {
 		t.Run(tt.name, func(t *testing.T) {
 			var shard int64 = 5
-			rpc := mockutils.NewRpcProvider()
+			rpc := rpctest.NewRpcProvider()
 
 			s1 := &proto.DataServerIdentity{Public: "s1:9091", Internal: "s1:8191"}
 			s2 := &proto.DataServerIdentity{Public: "s2:9091", Internal: "s2:8191"}
@@ -2852,7 +3016,7 @@ func TestController_FeaturesDiscoveredAfterRestartKeepsTerm(t *testing.T) {
 // moment.
 func TestController_RetriesTermFeaturesCheck(t *testing.T) {
 	var shard int64 = 5
-	rpc := mockutils.NewRpcProvider()
+	rpc := rpctest.NewRpcProvider()
 
 	s1 := &proto.DataServerIdentity{Public: "s1:9091", Internal: "s1:8191"}
 	s2 := &proto.DataServerIdentity{Public: "s2:9091", Internal: "s2:8191"}
@@ -2899,7 +3063,7 @@ func TestController_RetriesTermFeaturesCheck(t *testing.T) {
 // the leader can validate them.
 func TestController_RejoiningFollowerFeaturesReported(t *testing.T) {
 	var shard int64 = 5
-	rpc := mockutils.NewRpcProvider()
+	rpc := rpctest.NewRpcProvider()
 
 	s1 := &proto.DataServerIdentity{Public: "s1:9091", Internal: "s1:8191"}
 	s2 := &proto.DataServerIdentity{Public: "s2:9091", Internal: "s2:8191"}
@@ -2953,7 +3117,7 @@ func TestController_RejoiningFollowerFeaturesReported(t *testing.T) {
 // moves above it and fences at term 1 instead.
 func TestController_ElectionMovesAboveAWrittenTerm(t *testing.T) {
 	var shard int64 = 5
-	rpc := mockutils.NewRpcProvider()
+	rpc := rpctest.NewRpcProvider()
 	s1 := &proto.DataServerIdentity{Public: "s1:9091", Internal: "s1:8191"}
 	metadata := newTestMetadata(t, memory.NewProvider(metadatacodec.ClusterStatusCodec, metadatacommon.WatchDisabled, ""), &proto.ClusterConfiguration{})
 
@@ -2989,7 +3153,7 @@ func TestController_ElectionMovesAboveAWrittenTerm(t *testing.T) {
 // was raised reaches it, one member at a time.
 func TestController_ChangeEnsembleWithoutSourceGrowsTheEnsemble(t *testing.T) {
 	var shard int64 = 5
-	rpc := mockutils.NewRpcProvider()
+	rpc := rpctest.NewRpcProvider()
 	s1 := &proto.DataServerIdentity{Public: "s1:9091", Internal: "s1:8191"}
 	s2 := &proto.DataServerIdentity{Public: "s2:9091", Internal: "s2:8191"}
 	metadata := newTestMetadata(t, memory.NewProvider(metadatacodec.ClusterStatusCodec, metadatacommon.WatchDisabled, ""), &proto.ClusterConfiguration{})
@@ -3025,7 +3189,8 @@ func TestController_ChangeEnsembleWithoutSourceGrowsTheEnsemble(t *testing.T) {
 	assert.Eventually(t, func() bool {
 		return shardStatus(metadata, constant.DefaultNamespace, shard) == proto.ShardStatusSteadyState
 	}, 10*time.Second, 100*time.Millisecond)
-	borrowed, _ := metadata.GetShardStatus(constant.DefaultNamespace, shard)
+	borrowed, _, err := metadata.GetShardStatus(constant.DefaultNamespace, shard)
+	require.NoError(t, err)
 	assert.Len(t, borrowed.UnsafeBorrow().GetEnsemble(), 2, "the ensemble grew by the new member")
 	assert.Empty(t, borrowed.UnsafeBorrow().GetRemovedNodes(), "growth removes nobody")
 
