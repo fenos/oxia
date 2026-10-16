@@ -39,6 +39,7 @@ import (
 	"github.com/oxia-db/oxia/oxiad/coordinator/rpc"
 	"github.com/oxia-db/oxia/oxiad/coordinator/runtime/action"
 	"github.com/oxia-db/oxia/oxiad/coordinator/runtime/autosplit"
+	backupscheduler "github.com/oxia-db/oxia/oxiad/coordinator/runtime/backup"
 	"github.com/oxia-db/oxia/oxiad/coordinator/runtime/balancer"
 	"github.com/oxia-db/oxia/oxiad/coordinator/runtime/balancer/model"
 	"github.com/oxia-db/oxia/oxiad/coordinator/runtime/balancer/selector"
@@ -82,6 +83,8 @@ type runtime struct {
 
 	loadBalancer     balancer.LoadBalancer
 	autoSplitMonitor *autosplit.Monitor
+	// backupScheduler is nil when the RPC provider has no OxiaBackup service
+	backupScheduler  *backupscheduler.Scheduler
 	ensembleSelector selector.Selector[*ensemble.Context, []string]
 
 	assignmentsWatch *commonwatch.Watch[*proto.ShardAssignments]
@@ -218,12 +221,12 @@ func (c *runtime) DeleteDataServer(name string) {
 	c.drainingNodes[name] = nc
 }
 
-func (c *runtime) SyncShardControllerServerAddresses() {
+func (c *runtime) RefreshShardControllers() {
 	c.Lock()
 	defer c.Unlock()
 
 	for _, sc := range c.shardControllers {
-		sc.SyncServerAddress()
+		sc.Refresh()
 	}
 }
 
@@ -315,7 +318,7 @@ func (c *runtime) DeleteNamespace(namespace string) {
 	defer c.Unlock()
 	for shard := range namespaceStatus.GetShards() {
 		if s, exist := c.shardControllers[shard]; exist {
-			s.DeleteShard()
+			s.Delete()
 		}
 	}
 }
@@ -431,6 +434,9 @@ func (c *runtime) Close() error {
 	if c.autoSplitMonitor != nil {
 		c.autoSplitMonitor.Close()
 	}
+	if c.backupScheduler != nil {
+		c.backupScheduler.Close()
+	}
 
 	// Snapshot the controller maps under the lock: shard-controller callbacks
 	// (e.g. ShardDeleted, running on a detached goroutine) mutate them
@@ -515,14 +521,7 @@ func (c *runtime) startBackgroundActionWorker() {
 	for {
 		select {
 		case ac := <-c.loadBalancer.Action():
-			switch ac.Type() {
-			case action.SwapNode:
-				c.handleActionChangeEnsemble(ac)
-			case action.Election:
-				c.handleActionElection(ac)
-			default:
-				panic("unknown action type")
-			}
+			c.dispatchAction(ac)
 
 		case <-c.ctx.Done():
 			return
@@ -530,43 +529,18 @@ func (c *runtime) startBackgroundActionWorker() {
 	}
 }
 
-func (c *runtime) handleActionElection(ac action.Action) {
-	var electionAc *action.ElectionAction
-	var ok bool
-	if electionAc, ok = ac.(*action.ElectionAction); !ok {
-		panic("unexpected action type")
-	}
+func (c *runtime) dispatchAction(ac action.Action) {
 	c.logger.Info("Applying swap action", slog.Any("swap-action", ac))
 
 	c.RLock()
-	sc, ok := c.shardControllers[electionAc.Shard]
+	sc, ok := c.shardControllers[ac.GetShard()]
 	c.RUnlock()
 	if !ok {
-		c.logger.Warn("Shard controller not found", slog.Int64("shard", electionAc.Shard))
-		electionAc.Done("")
+		c.logger.Warn("Shard controller not found", slog.Int64("shard", ac.GetShard()))
+		ac.Error(constant.ErrResourceUnavailable)
 		return
 	}
-	electionAc.Done(sc.Election(electionAc))
-}
-
-func (c *runtime) handleActionChangeEnsemble(ac action.Action) {
-	var changeEnsembleAction *action.ChangeEnsembleAction
-	var ok bool
-	if changeEnsembleAction, ok = ac.(*action.ChangeEnsembleAction); !ok {
-		panic("unexpected action type")
-	}
-	c.logger.Info("Applying swap action", slog.Any("swap-action", ac))
-
-	c.RLock()
-	sc, ok := c.shardControllers[changeEnsembleAction.Shard]
-	c.RUnlock()
-	if !ok {
-		c.logger.Warn("Shard controller not found", slog.Int64("shard", changeEnsembleAction.Shard))
-		changeEnsembleAction.Error(constant.ErrResourceUnavailable)
-		return
-	}
-
-	sc.ChangeEnsemble(changeEnsembleAction)
+	sc.Dispatch(ac)
 }
 
 // This is called while already holding the lock on the coordinator.
@@ -815,6 +789,7 @@ func New(
 	autoSplitInterval := config.UnsafeBorrow().GetAutoSplitWithDefaults().GetCollectionIntervalDurationOrDefault()
 	c.autoSplitMonitor = autosplit.NewMonitor(c.metadata, c.rpc, c, autoSplitInterval)
 	c.autoSplitMonitor.Start()
+	c.startBackupScheduler()
 
 	return c, nil
 }

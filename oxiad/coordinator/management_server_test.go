@@ -111,7 +111,7 @@ func (r *testRuntime) Metadata() coordmetadata.Metadata { return r.metadata }
 
 func (*testRuntime) RecomputeAssignments() {}
 
-func (*testRuntime) SyncShardControllerServerAddresses() {}
+func (*testRuntime) RefreshShardControllers() {}
 
 func newTestMetadata(t *testing.T, config *proto.ClusterConfiguration) coordmetadata.Metadata {
 	t.Helper()
@@ -1325,4 +1325,16 @@ func TestManagementServerDeleteDataServerFailedPrecondition(t *testing.T) {
 	_, found, err := management.metadata.GetDataServer(serverName1)
 	require.NoError(t, err)
 	assert.True(t, found)
+}
+
+func (*testRuntime) RequestBackup(string, *int64) (int, error) {
+	return 0, coordruntime.ErrBackupsUnsupported
+}
+
+func (*testRuntime) ListBackups(context.Context, string, *int64, string) ([]*proto.BackupInfo, error) {
+	return nil, coordruntime.ErrBackupsUnsupported
+}
+
+func (*testRuntime) RestoreNamespace(context.Context, *proto.RestoreNamespaceRequest) (*proto.RestoreNamespaceResponse, error) {
+	return nil, coordruntime.ErrBackupsUnsupported
 }
