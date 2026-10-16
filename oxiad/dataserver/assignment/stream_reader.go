@@ -149,7 +149,9 @@ func ProcessStream[T any, U any](
 	labels map[string]string,
 	log *slog.Logger) StreamReader {
 	reader := &streamReader[T, U]{
-		closeCh:       make(chan error),
+		// One slot: Run may have returned on the context before the reader
+		// goroutine reports its error, and the report must not park it.
+		closeCh:       make(chan error, 1),
 		stream:        stream,
 		sender:        sender,
 		handleMessage: handleMessage,
