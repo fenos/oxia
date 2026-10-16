@@ -116,11 +116,12 @@ func (s *streamReader[T, U]) close(err error) {
 		)
 	}
 
-	if s.closeCh != nil {
-		s.closeCh <- err
-		close(s.closeCh)
-		s.closeCh = nil
-	}
+	// Reported once, by the one reader goroutine, into a channel with a
+	// slot for it: Run may already have returned on the context and be
+	// gone, and the field itself is never written, so nothing races
+	// Run's read of it.
+	s.closeCh <- err
+	close(s.closeCh)
 }
 
 func ReadStream[T any](
