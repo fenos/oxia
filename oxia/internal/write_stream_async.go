@@ -76,7 +76,9 @@ type asyncWriteStream struct {
 	// settled, and closed once they are: no write is sent meanwhile
 	settled chan struct{}
 	// resendBackoff spaces the attempts to send the writes in flight again,
-	// also when the new leader rejects them too; a response resets it
+	// also when the new leader rejects them too; a response resets it. The
+	// goroutine settling a stream uses it outside the lock, so the end of a
+	// stream leaves it to that goroutine (see endLocked)
 	resendBackoff backoff.BackOff
 	// hint is the leader hint of the last stream that ended unprocessed: the
 	// next stream follows it unless its send brings its own; a response
@@ -205,6 +207,10 @@ func (s *asyncWriteStream) endLocked() {
 		s.cancel()
 	}
 	s.stream, s.cancel = nil, nil
+	// A goroutine settling the ended stream may still be waiting on the
+	// backoff, outside the lock: it keeps it, and the next stream starts its
+	// own.
+	s.resendBackoff = nil
 	if s.settled != nil {
 		close(s.settled)
 		s.settled = nil

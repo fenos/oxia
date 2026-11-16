@@ -151,3 +151,51 @@ func TestAsyncWriteStreamPartialResendRejectedAtSetupIsRetried(t *testing.T) {
 	require.Eventually(t, func() bool { return len(accepted.sentKeys()) == 2 }, 10*time.Second, time.Millisecond)
 	assert.Equal(t, []string{"a", "b"}, accepted.sentKeys())
 }
+
+// A stream aborted while its writes wait to be sent again leaves its backoff
+// to the goroutine waiting on it: the next stream settles with its own, and
+// retries its first rejection at once. Sharing one would race the two
+// goroutines on the backoff (caught by -race).
+func TestAsyncWriteStreamAbortLeavesTheBackoffToTheEndedStream(t *testing.T) {
+	ctx := t.Context()
+	first := newScriptedStream(ctx, 1, setupRejection())
+	rejectedAgain := newScriptedStream(ctx, 1, setupRejection())
+	next := newScriptedStream(ctx, 1, setupRejection())
+	resent := newScriptedStream(ctx, 1, io.EOF)
+	streams := &scriptedStreams{streams: []*scriptedStream{first, rejectedAgain, next, resent}}
+	stream := newAsyncWriteStream(ctx, 0, streams.open)
+
+	shard := int64(0)
+	a, err := stream.send(ctx, nil, request(putRequest(&shard, "a")))
+	require.NoError(t, err)
+
+	// The first rejection is sent again at once, and taken
+	close(first.release)
+	require.Eventually(t, func() bool { return len(rejectedAgain.sentKeys()) == 1 && !stream.settling() },
+		10*time.Second, time.Millisecond)
+
+	// The second waits for the backoff
+	close(rejectedAgain.release)
+	require.Eventually(t, stream.settling, 10*time.Second, time.Millisecond)
+
+	stream.abort(errClientClosed)
+	waitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	_, err = a.response.Wait(waitCtx)
+	require.ErrorIs(t, err, errClientClosed)
+
+	_, err = stream.send(ctx, nil, request(putRequest(&shard, "b")))
+	require.NoError(t, err)
+	close(next.release)
+
+	require.Eventually(t, func() bool { return len(resent.sentKeys()) == 1 }, 10*time.Second, time.Millisecond)
+	assert.Equal(t, []string{"b"}, resent.sentKeys())
+}
+
+// settling reports whether the writes in flight on an ended stream are being
+// settled.
+func (s *asyncWriteStream) settling() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.settled != nil
+}
