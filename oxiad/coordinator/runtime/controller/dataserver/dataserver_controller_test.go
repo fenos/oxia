@@ -554,6 +554,48 @@ func TestDataServerControllerBecomeAvailableReportsChangedFeatures(t *testing.T)
 	assert.Len(t, nal.FeaturesDiscoveredEvents, 0, "a handshake must not report the features it already knew")
 }
 
+// A data server drained before this coordinator bound it, e.g. by the first
+// reconciliation of a coordinator that took over while the shards were moving
+// off the data server, is bound once it serves: the elections of the shards it
+// still takes part in need its features. It stays Draining, and is bound once.
+func TestDataServerControllerBecomeAvailableBindsADrainingDataServer(t *testing.T) {
+	addr := &proto.DataServerIdentity{
+		Public:   "my-server:9190",
+		Internal: "my-server:8190",
+	}
+	dataServer := &proto.DataServer{Identity: addr, Metadata: &proto.DataServerMetadata{}}
+
+	sap := rpctest.NewShardAssignmentsProvider()
+	nal := rpctest.NewNodeAvailabilityListener()
+	rpc := rpctest.NewRpcProvider()
+	node := rpc.GetNode(addr)
+	node.SetNodeFeatures([]proto.Feature{proto.Feature_FEATURE_DB_CHECKSUM})
+	node.HealthClient.SetStatus(grpc_health_v1.HealthCheckResponse_NOT_SERVING)
+	nc := NewController(context.Background(), dataServer, sap, nal, rpc, "test-instance", 1*time.Second, testHealthPolicy)
+
+	nc.Drain()
+	assert.Equal(t, Draining, nc.GetStatus().GetState())
+	assert.Equal(t, int64(0), node.HandshakeCount.Load())
+
+	node.HealthClient.SetStatus(grpc_health_v1.HealthCheckResponse_SERVING)
+
+	select {
+	case discovered := <-nal.FeaturesDiscoveredEvents:
+		assert.Equal(t, addr, discovered)
+	case <-time.After(10 * time.Second):
+		assert.Fail(t, "the draining data server was never bound")
+	}
+	assert.Equal(t, []proto.Feature{proto.Feature_FEATURE_DB_CHECKSUM}, nc.GetFeatures())
+	assert.Equal(t, Draining, nc.GetStatus().GetState())
+
+	// Wait for a few more health check cycles: the bound node is not
+	// handshaken again
+	time.Sleep(5 * testHealthPolicy.ProbeInterval)
+	assert.Equal(t, int64(1), node.HandshakeCount.Load())
+
+	assert.NoError(t, nc.Close())
+}
+
 func TestDataServerControllerSendAssignmentsDispatchWithRetriesSendsUpdates(t *testing.T) {
 	addr := &proto.DataServerIdentity{
 		Public:   "my-server:9190",

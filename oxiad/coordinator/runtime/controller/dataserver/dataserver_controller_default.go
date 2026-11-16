@@ -76,6 +76,13 @@ type controller struct {
 	// flight: the watch and ping paths can both observe SERVING for the same
 	// status epoch (e.g. at startup), and only the first one binds the node.
 	handshaking bool
+	// bound is set by the first handshake that succeeds. A data server that
+	// was drained before it (e.g. by the first reconciliation of a
+	// coordinator that took over while the shards were moving off the data
+	// server) still needs one, or its features stay unknown and every
+	// election of a shard it takes part in aborts. Owned by the health paths,
+	// under mu.
+	bound bool
 }
 
 func (n *controller) GetDataServer() commonobject.Borrowed[*proto.DataServer] {
@@ -430,9 +437,11 @@ func (n *controller) becomeAvailable(observedEpoch int64) {
 		n.mu.Unlock()
 		return
 	}
-	if status.GetState() != NotRunning || n.handshaking {
-		// Nothing to do: the node is Running or Draining, or the other health
-		// path is already binding it for this same observation.
+	state := status.GetState()
+	if n.handshaking || state == Running || (state == Draining && n.bound) {
+		// Nothing to do: the node is bound, or the other health path is
+		// already binding it for this same observation. A Draining node that
+		// was never bound is bound now, and stays Draining.
 		n.mu.Unlock()
 		return
 	}
@@ -480,6 +489,7 @@ func (n *controller) becomeAvailable(observedEpoch int64) {
 	featuresChanged := len(feature.Missing(features, n.supportedFeatures)) > 0 ||
 		len(feature.Missing(n.supportedFeatures, features)) > 0
 	n.supportedFeatures = features
+	n.bound = true
 	if status = n.status.Load(); status.GetState() == NotRunning && status.epoch == observedEpoch {
 		status.Advance(Running)
 		n.status.Publish(status)

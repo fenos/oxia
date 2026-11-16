@@ -29,6 +29,9 @@ import (
 //	           health check failed
 //
 //	removed from the configuration (Drain): Running or NotRunning --> Draining
+//
+// A data server drained before its first handshake is still handshaken once
+// it serves, so that its features are known, and stays Draining.
 type State uint32
 
 const (
