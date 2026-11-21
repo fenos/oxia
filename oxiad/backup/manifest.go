@@ -67,6 +67,25 @@ type Manifest struct {
 	CreatedAt    time.Time `json:"created_at"`
 	SSTs         []File    `json:"ssts"`
 	Files        []File    `json:"files"`
+	// Compression is set only by the earlier builds that compressed the files
+	// of a backup, under the same format version: their keys and sizes are of
+	// the compressed objects, which this code can't restore. Their backups
+	// stay listed, and expire, but a restore refuses them (see Restorable).
+	Compression string `json:"compression,omitempty"`
+}
+
+// Restorable returns nil if this code can restore the backup, and else why
+// not.
+func (m *Manifest) Restorable() error {
+	if m.Compression == "" {
+		return nil
+	}
+	return compressedBackupError(m.ID)
+}
+
+func compressedBackupError(id string) error {
+	return fmt.Errorf("%w: backup %s was taken by an earlier version of oxia that compressed its files: "+
+		"restore it with that version", errs.ErrFailedPrecondition, id)
 }
 
 // Validate checks that the manifest describes a backup this code can
@@ -114,6 +133,18 @@ type Summary struct {
 	// NamespaceConfig is the configuration of the namespace recorded in the
 	// manifest, for a restore to recreate it.
 	NamespaceConfig json.RawMessage
+	// Compressed is set for a backup taken by an earlier version that
+	// compressed its files, see Manifest.Compression.
+	Compressed bool
+}
+
+// Restorable returns nil if this code can restore the backup, and else why
+// not.
+func (s Summary) Restorable() error {
+	if !s.Compressed {
+		return nil
+	}
+	return compressedBackupError(s.ID.String())
 }
 
 // Summary returns the summary of the manifest, which must be valid.
@@ -129,6 +160,7 @@ func (m *Manifest) Summary() Summary {
 		CommitOffset:    m.CommitOffset,
 		SSTCount:        len(m.SSTs),
 		NamespaceConfig: m.NamespaceConfig,
+		Compressed:      m.Compression != "",
 	}
 	for _, f := range m.SSTs {
 		s.SizeBytes += f.Size

@@ -76,6 +76,28 @@ func TestRestoreJobRunRejectsACorruptedFile(t *testing.T) {
 	assert.False(t, installer.completed)
 }
 
+// A backup taken by an earlier version that compressed its files is refused
+// before anything is downloaded.
+func TestRestoreJobRunRefusesACompressedBackup(t *testing.T) {
+	store := blob.NewMemory()
+	host := newFakeHost(t)
+	host.addShard(1, 1)
+	last, err := runBackup(t, store, host, 1, &Record{Lineage: "abcd"}, testPolicy(), time.Now())
+	require.NoError(t, err)
+	key := "ns/shard-1/backups/" + last.ID + ".json"
+	m, err := backup.ReadManifest(t.Context(), store, key)
+	require.NoError(t, err)
+	m.Compression = "zstd"
+	require.NoError(t, backup.WriteManifest(t.Context(), store, m))
+
+	j, installer := newRestoreJob(t, store, last, fullRange())
+	_, err = j.run(context.Background())
+	assert.ErrorIs(t, err, errs.ErrFailedPrecondition)
+	assert.ErrorContains(t, err, "restore it with that version")
+	assert.Empty(t, installer.files)
+	assert.False(t, installer.completed)
+}
+
 func TestRestoreJobRunFailsOnAMissingBackup(t *testing.T) {
 	store := blob.NewMemory()
 	j, installer := newRestoreJob(t, store, &LastBackup{ID: "2026-10-03T14-00-00Z-abcd"}, fullRange())

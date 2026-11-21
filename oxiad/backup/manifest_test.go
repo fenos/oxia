@@ -81,6 +81,26 @@ func TestWriteManifestThenReadManifestRoundTrips(t *testing.T) {
 	assert.Equal(t, m, read)
 }
 
+// A backup taken by an earlier version that compressed its files is read, so
+// that it is listed and expires, but it can't be restored.
+func TestACompressedBackupIsReadButNotRestorable(t *testing.T) {
+	store := blob.NewMemory()
+	m := newManifest("orders", 12, "abcd", time.Date(2026, 10, 3, 14, 0, 0, 0, time.UTC))
+	require.NoError(t, m.Restorable())
+	require.NoError(t, m.Summary().Restorable())
+
+	m.Compression = "zstd"
+	require.NoError(t, WriteManifest(t.Context(), store, m))
+	read, err := ReadManifest(t.Context(), store, m.Summary().ManifestKey())
+	require.NoError(t, err)
+	assert.ErrorIs(t, read.Restorable(), errs.ErrFailedPrecondition)
+	assert.ErrorContains(t, read.Restorable(), "earlier version of oxia that compressed its files")
+	s := read.Summary()
+	assert.True(t, s.Compressed)
+	assert.ErrorIs(t, s.Restorable(), errs.ErrFailedPrecondition)
+	assert.ErrorContains(t, s.Restorable(), m.ID)
+}
+
 func TestWriteManifestRejectsInvalidManifest(t *testing.T) {
 	store := blob.NewMemory()
 	m := newManifest("orders", 12, "abcd", time.Date(2026, 10, 3, 14, 0, 0, 0, time.UTC))

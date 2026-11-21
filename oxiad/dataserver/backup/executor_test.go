@@ -379,6 +379,34 @@ func TestExecutorListBackupsReturnsTheBackupsOfANamespace(t *testing.T) {
 	assert.ErrorContains(t, err, "no destination")
 }
 
+// A backup taken by an earlier version that compressed its files is listed,
+// but the listing of a restore, of the newest backup at or before a time,
+// refuses it with the reason, rather than the restore failing once it
+// downloads it.
+func TestExecutorListBackupsRefusesACompressedBackupToARestore(t *testing.T) {
+	host := newFakeHost(t)
+	host.addShard(1, 1)
+	clock := newTestClock()
+	e, destination, store := newTestExecutor(t, host, clock)
+	done := awaitBackup(t, e, backupRequest(destination, 1))
+	require.Equal(t, proto.BackupJobState_BACKUP_JOB_STATE_DONE, done.State)
+	key := "ns/shard-1/backups/" + done.LastBackup.BackupId + ".json"
+	m, err := backup.ReadManifest(t.Context(), store, key)
+	require.NoError(t, err)
+	m.Compression = "zstd"
+	require.NoError(t, backup.WriteManifest(t.Context(), store, m))
+
+	backups, err := collectBackups(t.Context(), e, &proto.ListBackupsRequest{Destination: destination, Namespace: "ns"})
+	require.NoError(t, err)
+	require.Len(t, backups, 1, "listed, and expires as any other")
+
+	asOf := clock.Now().UnixMilli()
+	_, err = collectBackups(t.Context(), e, &proto.ListBackupsRequest{Destination: destination, Namespace: "ns",
+		NewestAtOrBeforeMillis: &asOf})
+	assert.ErrorIs(t, err, errs.ErrFailedPrecondition)
+	assert.ErrorContains(t, err, "restore it with that version")
+}
+
 func TestExecutorRestoreShardInstallsABackupAndReportsItOnce(t *testing.T) {
 	host := newFakeHost(t)
 	host.addShard(1, 2)

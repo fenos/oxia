@@ -45,6 +45,9 @@ func (j *restoreJob) run(ctx context.Context) (restoreResult, error) {
 	if err != nil {
 		return restoreResult{}, err
 	}
+	if err := manifest.Restorable(); err != nil {
+		return restoreResult{}, err
+	}
 	for _, f := range manifest.SSTs {
 		if err := j.download(ctx, f); err != nil {
 			return restoreResult{}, err

@@ -460,6 +460,13 @@ func (e *Executor) ListBackups(ctx context.Context, req *proto.ListBackupsReques
 		}
 		if req.NewestAtOrBeforeMillis != nil {
 			summaries = newestAtOrBefore(summaries, time.UnixMilli(req.GetNewestAtOrBeforeMillis()))
+			// The backup a restore would install: refuse it now rather than
+			// once the restore downloads it
+			for _, s := range summaries {
+				if err := s.Restorable(); err != nil {
+					return err
+				}
+			}
 		}
 		if len(summaries) == 0 {
 			continue
