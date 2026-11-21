@@ -24,6 +24,7 @@ import (
 	"testing"
 	"time"
 
+	"go.uber.org/multierr"
 	"golang.org/x/exp/maps"
 	gproto "google.golang.org/protobuf/proto"
 
@@ -1218,4 +1219,145 @@ func requireClosed(t *testing.T, ch <-chan struct{}, what string) {
 	case <-time.After(10 * time.Second):
 		require.FailNow(t, "timed out waiting for "+what)
 	}
+}
+
+// newTermTestElection stores a shard at term 2 led by the first of servers, and
+// returns an election of it, which fences at term 3.
+func newTermTestElection(t *testing.T, metadata coordmetadata.Metadata, base coordmetadata.Metadata,
+	rpc coordrpc.ControllerRPCProvider, servers ...*proto.DataServerIdentity) *election {
+	t.Helper()
+	var shard int64 = 5
+	shardMeta := &proto.ShardMetadata{Status: proto.ShardStatusSteadyState, Term: 2, Leader: servers[0],
+		Ensemble: servers}
+	storeTestShardMetadata(t, base, constant.DefaultNamespace, shard, namespaceConfig, shardMeta)
+	return newTestElection(t, metadata, rpc, shard, shardMeta)
+}
+
+// The data servers that reject the fence report the term they are at: the
+// election moves the shard to the highest one, so that the next election fences
+// above it, instead of counting up one term per attempt.
+func TestElectionStartMovesToTheTermADataServerReported(t *testing.T) {
+	s1, s2, s3 := testDataServer("s1"), testDataServer("s2"), testDataServer("s3")
+	metadata := newTestMetadata(t, memory.NewProvider(metadatacodec.ClusterStatusCodec, metadatacommon.WatchDisabled, ""),
+		&proto.ClusterConfiguration{})
+	rpc := rpctest.NewRpcProvider()
+	rpc.GetNode(s1).NewTermResponse(0, 0, constant.InvalidTermAt(7))
+	rpc.GetNode(s2).NewTermResponse(0, 0, constant.InvalidTermAt(9))
+	rpc.GetNode(s3).NewTermResponse(0, 0, errors.New("unreachable"))
+	e := newTermTestElection(t, metadata, metadata, rpc, s1, s2, s3)
+
+	_, err := e.Start()
+	require.ErrorIs(t, err, constant.ErrInvalidTerm)
+	assert.EqualValues(t, 9, shardTerm(metadata, constant.DefaultNamespace, 5))
+}
+
+// A reported term that isn't ahead of the election leaves the term alone.
+func TestElectionStartKeepsTheTermWhenTheReportedOneIsBehind(t *testing.T) {
+	s1 := testDataServer("s1")
+	metadata := newTestMetadata(t, memory.NewProvider(metadatacodec.ClusterStatusCodec, metadatacommon.WatchDisabled, ""),
+		&proto.ClusterConfiguration{})
+	rpc := rpctest.NewRpcProvider()
+	rpc.GetNode(s1).NewTermResponse(0, 0, constant.InvalidTermAt(1))
+	e := newTermTestElection(t, metadata, metadata, rpc, s1)
+
+	_, err := e.Start()
+	require.ErrorIs(t, err, constant.ErrInvalidTerm)
+	assert.EqualValues(t, 3, shardTerm(metadata, constant.DefaultNamespace, 5))
+}
+
+// A log that holds entries of the term of the election ends it: the shard
+// moves to the highest written term, so that the next election fences above
+// it, and no leader is chosen under a term that was led already.
+func TestElectionStartMovesAboveAWrittenTerm(t *testing.T) {
+	s1, s2, s3 := testDataServer("s1"), testDataServer("s2"), testDataServer("s3")
+	metadata := newTestMetadata(t, memory.NewProvider(metadatacodec.ClusterStatusCodec, metadatacommon.WatchDisabled, ""),
+		&proto.ClusterConfiguration{})
+	rpc := rpctest.NewRpcProvider()
+	rpc.GetNode(s1).NewTermResponse(5, 10, nil)
+	rpc.GetNode(s2).NewTermResponse(2, 8, nil)
+	rpc.GetNode(s3).NewTermResponse(-1, -1, nil)
+	e := newTermTestElection(t, metadata, metadata, rpc, s1, s2, s3)
+
+	_, err := e.Start()
+	require.ErrorIs(t, err, errTermAlreadyWritten)
+	stored := requireShardMetadata(t, metadata, constant.DefaultNamespace, 5)
+	assert.EqualValues(t, 5, stored.GetTerm())
+	assert.Nil(t, stored.GetLeader())
+}
+
+// A head entry at exactly the term of the election ends it too; the stored
+// term, already that one, stays.
+func TestElectionStartMovesAboveTheTermOfTheElectionWhenWritten(t *testing.T) {
+	s1 := testDataServer("s1")
+	metadata := newTestMetadata(t, memory.NewProvider(metadatacodec.ClusterStatusCodec, metadatacommon.WatchDisabled, ""),
+		&proto.ClusterConfiguration{})
+	rpc := rpctest.NewRpcProvider()
+	rpc.GetNode(s1).NewTermResponse(3, 0, nil)
+	e := newTermTestElection(t, metadata, metadata, rpc, s1)
+
+	_, err := e.Start()
+	require.ErrorIs(t, err, errTermAlreadyWritten)
+	assert.EqualValues(t, 3, shardTerm(metadata, constant.DefaultNamespace, 5))
+}
+
+// A term that can't be stored fails the election with both errors.
+func TestElectionStartReturnsTheErrorOfMovingTheTerm(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		response func(rpc *rpctest.RpcProvider, s1 *proto.DataServerIdentity)
+		err      error
+	}{
+		{name: "reported term", err: constant.ErrInvalidTerm, response: func(rpc *rpctest.RpcProvider, s1 *proto.DataServerIdentity) {
+			rpc.GetNode(s1).NewTermResponse(0, 0, constant.InvalidTermAt(9))
+		}},
+		{name: "written term", err: errTermAlreadyWritten, response: func(rpc *rpctest.RpcProvider, s1 *proto.DataServerIdentity) {
+			rpc.GetNode(s1).NewTermResponse(9, 0, nil)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s1 := testDataServer("s1")
+			base := newTestMetadata(t, memory.NewProvider(metadatacodec.ClusterStatusCodec, metadatacommon.WatchDisabled, ""),
+				&proto.ClusterConfiguration{})
+			metadata := &hookedMetadata{Metadata: base}
+			writes := 0
+			metadata.patchShardStatus = func(namespace string, shard int64, modify func(*proto.ShardMetadata) (bool, error)) error {
+				// The new term is written, the term to move to is not
+				if writes++; writes > 1 {
+					return errors.New("store unavailable")
+				}
+				return base.PatchShardStatus(namespace, shard, modify)
+			}
+			rpc := rpctest.NewRpcProvider()
+			tc.response(rpc, s1)
+			e := newTermTestElection(t, metadata, base, rpc, s1)
+
+			_, err := e.Start()
+			require.ErrorIs(t, err, tc.err)
+			assert.ErrorContains(t, err, "failed to persist the term to move to")
+			assert.EqualValues(t, 3, shardTerm(base, constant.DefaultNamespace, 5))
+		})
+	}
+}
+
+func TestHighestTermHint(t *testing.T) {
+	_, found := highestTermHint(errors.New("unreachable"))
+	assert.False(t, found)
+
+	term, found := highestTermHint(errors.Wrap(multierr.Combine(
+		constant.InvalidTermAt(4),
+		errors.Wrap(constant.InvalidTermAt(11), "fence"),
+		errors.New("unreachable"),
+		constant.InvalidTermAt(6),
+	), "election failed"))
+	assert.True(t, found)
+	assert.EqualValues(t, 11, term)
+}
+
+func TestHighestWrittenTerm(t *testing.T) {
+	assert.EqualValues(t, -1, highestWrittenTerm())
+	assert.EqualValues(t, -1, highestWrittenTerm(sharding.Candidates{testDataServer("s1"): candidate(-1, -1)}))
+	assert.EqualValues(t, 7, highestWrittenTerm(
+		sharding.Candidates{testDataServer("s1"): candidate(3, 10), testDataServer("s2"): candidate(-1, -1)},
+		sharding.Candidates{testDataServer("removed"): candidate(7, 2)},
+	))
 }

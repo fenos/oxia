@@ -16,6 +16,7 @@ package constant
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"strconv"
 
@@ -35,6 +36,10 @@ const (
 	// answered every write it appended before rejecting one, and appended
 	// none after it.
 	ErrorMetadataUnprocessed = "unprocessed"
+	// ErrorMetadataTerm is the term that a server is at, sent with an invalid
+	// term rejection, so that the caller can move to it instead of counting
+	// up one term per attempt.
+	ErrorMetadataTerm = "term"
 )
 
 type ErrorMetadata map[string]string
@@ -49,6 +54,15 @@ func (m ErrorMetadata) GetLeaderHint() (int64, string, bool) {
 		return 0, "", false
 	}
 	return shard, leader, true
+}
+
+// GetTermHint reports the term that the rejecting server is at, when it said.
+func (m ErrorMetadata) GetTermHint() (int64, bool) {
+	term, err := strconv.ParseInt(m[ErrorMetadataTerm], 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return term, true
 }
 
 func (m ErrorMetadata) GetCoordinatorLeaderHint() (string, bool) {
@@ -91,7 +105,35 @@ var (
 	ErrUnsupportedFeatures     = errors.New("oxia: unsupported features")
 )
 
+// InvalidTermError is ErrInvalidTerm with the term that the server is at: a
+// caller that lost track of it moves there in one round.
+type InvalidTermError struct {
+	Current int64
+}
+
+func (e InvalidTermError) Error() string {
+	return fmt.Sprintf("%s: server is at term %d", ErrInvalidTerm.Error(), e.Current)
+}
+
+// Is makes the error match ErrInvalidTerm.
+func (InvalidTermError) Is(target error) bool {
+	return target == ErrInvalidTerm
+}
+
+// InvalidTermAt rejects a term below current, and says which term the server
+// is at.
+func InvalidTermAt(current int64) error {
+	return InvalidTermError{Current: current}
+}
+
 type GrpcStatusOption func(ErrorMetadata)
+
+// WithTermHint sends the term of the rejecting server with the error.
+func WithTermHint(term int64) GrpcStatusOption {
+	return func(metadata ErrorMetadata) {
+		metadata[ErrorMetadataTerm] = strconv.FormatInt(term, 10)
+	}
+}
 
 func WithLeaderHint(shard int64, leader string) GrpcStatusOption {
 	return func(metadata ErrorMetadata) {
@@ -136,6 +178,10 @@ func IntoGrpcStatusError(err error, opts ...GrpcStatusOption) error { //nolint:r
 		if opt != nil {
 			opt(metadata)
 		}
+	}
+	var invalidTerm InvalidTermError
+	if errors.As(err, &invalidTerm) {
+		WithTermHint(invalidTerm.Current)(metadata)
 	}
 	if len(metadata) == 0 {
 		metadata = nil
@@ -214,6 +260,9 @@ func FromGrpcError(err error) (error, ErrorMetadata) { //nolint:revive,staticche
 		case ReasonShardNotFound:
 			return ErrShardNotFound, info.Metadata
 		case ReasonInvalidTerm:
+			if current, ok := ErrorMetadata(info.Metadata).GetTermHint(); ok {
+				return InvalidTermError{Current: current}, info.Metadata
+			}
 			return ErrInvalidTerm, info.Metadata
 		case ReasonInvalidStatus:
 			return ErrInvalidStatus, info.Metadata

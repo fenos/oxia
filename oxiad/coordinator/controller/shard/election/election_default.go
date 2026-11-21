@@ -658,10 +658,23 @@ func (e *election) Start() (candidateLeader *proto.DataServerIdentity, err error
 		e.meta.Ensemble,
 		e.meta.EnsembleChange)
 	if err != nil {
-		return nil, err
+		return nil, e.moveToReportedTerm(err)
 	}
 	if err = e.checkNegotiatedFeatures(negotiatedFeatures, enabledFeatures, ensembleHeads); err != nil {
 		return nil, err
+	}
+	if written := highestWrittenTerm(ensembleHeads, retainedHeads); written >= e.meta.Term {
+		// A log holds entries of this term already: a leadership at it
+		// happened that the shard status doesn't know of, e.g. the status was
+		// restored from a backup, or a standalone data directory is adopted.
+		// Leading again under a term that was written to would lead the shard
+		// twice under one term, so the next election fences above it
+		e.logger.Info("The term of the election was already written to, moving above it",
+			slog.Int64("term", e.meta.Term), slog.Int64("written-term", written))
+		if err := e.moveTerm(written); err != nil {
+			return nil, multierr.Append(errTermAlreadyWritten, err)
+		}
+		return nil, errTermAlreadyWritten
 	}
 	candidateLeader, followers := e.chooseLeader(ensembleHeads, retainedHeads)
 	e.logger.Info(
@@ -729,6 +742,81 @@ func (e *election) Start() (candidateLeader *proto.DataServerIdentity, err error
 		)
 	})
 	return candidateLeader, nil
+}
+
+// errTermAlreadyWritten ends an election whose term a log of the ensemble
+// already holds entries of: the next election fences above that term.
+var errTermAlreadyWritten = errors.New("election failed: the term was already written to")
+
+// moveToReportedTerm moves the term of the shard to the highest term that a
+// data server rejecting the fence reported, when it is ahead of the election:
+// the next election fences one above it instead of counting up one term per
+// attempt. It returns the error of the fence, with the error of the move.
+func (e *election) moveToReportedTerm(fenceErr error) error {
+	reported, ok := highestTermHint(fenceErr)
+	if !ok || reported <= e.meta.Term {
+		return fenceErr
+	}
+	e.logger.Info("A data server is at a later term than the election, moving to it",
+		slog.Int64("term", e.meta.Term), slog.Int64("reported-term", reported))
+	return multierr.Append(fenceErr, e.moveTerm(reported))
+}
+
+// moveTerm stores term as the term of the shard, unless it has a later one
+// already, so that the next election starts above it.
+func (e *election) moveTerm(term int64) error {
+	if err := e.metadataStore.PatchShardStatus(e.namespace, e.shard, func(current *proto.ShardMetadata) (bool, error) {
+		if current.GetTerm() >= term {
+			return false, nil
+		}
+		current.Term = term
+		return true, nil
+	}); err != nil {
+		return errors.Wrap(err, "failed to persist the term to move to")
+	}
+	return nil
+}
+
+// highestTermHint finds the highest term that a data server rejecting the
+// fence reported in err, which joins the errors of the members.
+func highestTermHint(err error) (int64, bool) {
+	var (
+		highest int64
+		found   bool
+	)
+	var walk func(error)
+	walk = func(err error) {
+		var invalidTerm constant.InvalidTermError
+		if errors.As(err, &invalidTerm) && (!found || invalidTerm.Current > highest) {
+			highest, found = invalidTerm.Current, true
+		}
+		switch unwrapped := err.(type) { //nolint:errorlint // walking the tree of errors, not matching one
+		case interface{ Unwrap() []error }:
+			for _, inner := range unwrapped.Unwrap() {
+				walk(inner)
+			}
+		case interface{ Unwrap() error }:
+			walk(unwrapped.Unwrap())
+		default:
+			// A leaf: nothing beneath it
+		}
+	}
+	walk(err)
+	return highest, found
+}
+
+// highestWrittenTerm is the highest term of the head entries of the fenced
+// data servers, or -1 when every log is empty.
+func highestWrittenTerm(heads ...sharding.Candidates) int64 {
+	highest := constant.I64NegativeOne
+	for _, candidates := range heads {
+		for _, candidate := range candidates {
+			if head := candidate.HeadEntryId; head.GetOffset() >= 0 && head.GetTerm() > highest {
+				highest = head.GetTerm()
+			}
+		}
+	}
+	return highest
 }
 
 // checkNegotiatedFeatures validates the feature set pinned by the new term

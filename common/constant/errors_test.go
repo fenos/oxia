@@ -167,6 +167,29 @@ func TestFromGrpcErrorIgnoresForeignErrorInfo(t *testing.T) {
 	assert.Nil(t, metadata)
 }
 
+// The term that a server rejecting a fence is at travels with the error, and
+// comes back as an InvalidTermError, which is still ErrInvalidTerm.
+func TestInvalidTermAtCarriesTheTermOfTheServer(t *testing.T) {
+	err := InvalidTermAt(7)
+	assert.ErrorIs(t, err, ErrInvalidTerm)
+	assert.Equal(t, "oxia: invalid term: server is at term 7", err.Error())
+
+	translated, metadata := FromGrpcError(IntoGrpcStatusError(err))
+	assert.ErrorIs(t, translated, ErrInvalidTerm)
+	var invalidTerm InvalidTermError
+	require.ErrorAs(t, translated, &invalidTerm)
+	assert.EqualValues(t, 7, invalidTerm.Current)
+	term, ok := metadata.GetTermHint()
+	assert.True(t, ok)
+	assert.EqualValues(t, 7, term)
+
+	// Without the term, the error is the plain one
+	translated, _ = FromGrpcError(IntoGrpcStatusError(ErrInvalidTerm))
+	assert.Equal(t, ErrInvalidTerm, translated)
+	_, ok = ErrorMetadata(nil).GetTermHint()
+	assert.False(t, ok)
+}
+
 func TestIsRetryable(t *testing.T) {
 	assert.True(t, IsRetryable(io.EOF))
 	assert.True(t, IsRetryable(ErrAborted))

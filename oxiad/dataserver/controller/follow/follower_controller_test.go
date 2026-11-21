@@ -357,10 +357,12 @@ func TestFollower_NewTerm(t *testing.T) {
 	assert.Equal(t, proto.ServingStatus_FENCED, fc.Status())
 	assert.EqualValues(t, 1, fc.Term())
 
-	// We cannot fence with earlier term
+	// We cannot fence with earlier term, and the rejection says which term
+	// the follower is at
 	fr, err := fc.NewTerm(&proto.NewTermRequest{Term: 0})
 	assert.Nil(t, fr)
-	assert.Equal(t, constant.ErrInvalidTerm, err)
+	assert.ErrorIs(t, err, constant.ErrInvalidTerm)
+	assert.Equal(t, constant.InvalidTermAt(1), err)
 	assert.Equal(t, proto.ServingStatus_FENCED, fc.Status())
 	assert.EqualValues(t, 1, fc.Term())
 
