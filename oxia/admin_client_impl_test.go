@@ -19,6 +19,7 @@ import (
 	"errors"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -33,40 +34,44 @@ import (
 )
 
 type mockAdminRpcClient struct {
-	listDataServersResponse *proto.ListDataServersResponse
-	listDataServersCtx      context.Context
-	listDataServersErr      error
-	getDataServerResponse   *proto.GetDataServerResponse
-	getDataServerErr        error
-	createDataServerResp    *proto.CreateDataServerResponse
-	createDataServerErr     error
-	patchDataServerResp     *proto.PatchDataServerResponse
-	patchDataServerErr      error
-	deleteDataServerResp    *proto.DeleteDataServerResponse
-	deleteDataServerErr     error
-	drainedReq              *proto.DrainedDataServerRequest
-	drainedErr              error
-	createNamespaceResp     *proto.CreateNamespaceResponse
-	createNamespaceErr      error
-	patchNamespaceResp      *proto.PatchNamespaceResponse
-	patchNamespaceReq       *proto.PatchNamespaceRequest
-	patchNamespaceErr       error
-	deleteNamespaceResp     *proto.DeleteNamespaceResponse
-	deleteNamespaceErr      error
-	listNamespacesResp      *proto.ListNamespacesResponse
-	listNamespacesErr       error
-	getNamespaceResp        *proto.GetNamespaceResponse
-	getNamespaceErr         error
-	splitShardReq           *proto.SplitShardRequest
-	splitShardResp          *proto.SplitShardResponse
-	splitShardErr           error
-	requestBackupReq        *proto.RequestBackupRequest
-	requestBackupResp       *proto.RequestBackupResponse
-	requestBackupErr        error
-	listBackupsReq          *proto.ListBackupsRequest
-	listBackupsResp         *proto.ListBackupsResponse
-	listBackupsErr          error
-	listBackupsRecvErr      error
+	listDataServersResponse  *proto.ListDataServersResponse
+	listDataServersCtx       context.Context
+	listDataServersErr       error
+	getDataServerResponse    *proto.GetDataServerResponse
+	getDataServerErr         error
+	createDataServerResp     *proto.CreateDataServerResponse
+	createDataServerErr      error
+	patchDataServerResp      *proto.PatchDataServerResponse
+	patchDataServerErr       error
+	deleteDataServerResp     *proto.DeleteDataServerResponse
+	deleteDataServerErr      error
+	drainedReq               *proto.DrainedDataServerRequest
+	drainedErr               error
+	createNamespaceResp      *proto.CreateNamespaceResponse
+	createNamespaceErr       error
+	patchNamespaceResp       *proto.PatchNamespaceResponse
+	patchNamespaceReq        *proto.PatchNamespaceRequest
+	patchNamespaceErr        error
+	deleteNamespaceResp      *proto.DeleteNamespaceResponse
+	deleteNamespaceErr       error
+	listNamespacesResp       *proto.ListNamespacesResponse
+	listNamespacesErr        error
+	getNamespaceResp         *proto.GetNamespaceResponse
+	getNamespaceErr          error
+	splitShardReq            *proto.SplitShardRequest
+	splitShardResp           *proto.SplitShardResponse
+	splitShardErr            error
+	requestBackupReq         *proto.RequestBackupRequest
+	requestBackupResp        *proto.RequestBackupResponse
+	requestBackupErr         error
+	listBackupsReq           *proto.ListBackupsRequest
+	listBackupsResp          *proto.ListBackupsResponse
+	listBackupsErr           error
+	listBackupsRecvErr       error
+	restoreNamespaceReq      *proto.RestoreNamespaceRequest
+	restoreNamespaceDeadline bool
+	restoreNamespaceResp     *proto.RestoreNamespaceResponse
+	restoreNamespaceErr      error
 }
 
 func (m *mockAdminRpcClient) ListDataServers(ctx context.Context, _ *proto.ListDataServersRequest, _ ...grpc.CallOption) (*proto.ListDataServersResponse, error) {
@@ -775,6 +780,12 @@ func (s *listBackupsClientStream) Recv() (*proto.ListBackupsResponse, error) {
 	return res, nil
 }
 
+func (m *mockAdminRpcClient) RestoreNamespace(ctx context.Context, req *proto.RestoreNamespaceRequest, _ ...grpc.CallOption) (*proto.RestoreNamespaceResponse, error) {
+	m.restoreNamespaceReq = req
+	_, m.restoreNamespaceDeadline = ctx.Deadline()
+	return m.restoreNamespaceResp, m.restoreNamespaceErr
+}
+
 func TestAdminClientRequestBackupAndListBackups(t *testing.T) {
 	shard := int64(7)
 	adminClient := &mockAdminRpcClient{
@@ -811,4 +822,28 @@ func TestAdminClientRequestBackupAndListBackups(t *testing.T) {
 	}}}
 	_, err = midway.ListBackups(context.Background(), "ns", nil, "")
 	assert.ErrorContains(t, err, "bucket unavailable")
+}
+
+func TestAdminClientRestoreNamespace(t *testing.T) {
+	asOf := time.Date(2026, 10, 3, 12, 0, 0, 0, time.UTC)
+	adminClient := &mockAdminRpcClient{
+		restoreNamespaceResp: &proto.RestoreNamespaceResponse{Shards: []*proto.RestoredShard{{Shard: 9, SourceShard: 1}}},
+	}
+	admin := &adminClientImpl{adminAddr: "admin-addr", clientPool: &mockAdminClientPool{adminClient: adminClient}}
+
+	shards, err := admin.RestoreNamespace(context.Background(), "orders", asOf, "orders-restored", "s3://bucket/prefix")
+	require.NoError(t, err)
+	require.Len(t, shards, 1)
+	assert.EqualValues(t, 9, shards[0].GetShard())
+	assert.Equal(t, "orders", adminClient.restoreNamespaceReq.GetSourceNamespace())
+	assert.Equal(t, "orders-restored", adminClient.restoreNamespaceReq.GetTargetNamespace())
+	assert.Equal(t, asOf.UnixMilli(), adminClient.restoreNamespaceReq.GetAsOfMillis())
+	assert.Equal(t, "s3://bucket/prefix", adminClient.restoreNamespaceReq.GetDestination())
+	assert.False(t, adminClient.restoreNamespaceDeadline, "the coordinator lists the manifests first: the caller bounds the call")
+
+	failing := &adminClientImpl{adminAddr: "admin-addr", clientPool: &mockAdminClientPool{adminClient: &mockAdminRpcClient{
+		restoreNamespaceErr: grpcstatus.Error(codes.AlreadyExists, "namespace exists"),
+	}}}
+	_, err = failing.RestoreNamespace(context.Background(), "orders", asOf, "orders-restored", "")
+	assert.Error(t, err)
 }
