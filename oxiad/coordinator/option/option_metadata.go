@@ -142,6 +142,9 @@ func (mpo ProviderOptions) Validate() error {
 		if mpo.Raft.Address == "" {
 			return errors.New("raft-address must be set with metadata=raft")
 		}
+		if len(mpo.Raft.Peers) > 0 && len(mpo.Raft.BootstrapNodes) > 0 {
+			return errors.New("raft-peers and raft-bootstrap-nodes are mutually exclusive")
+		}
 	case metadataconstant.NameFile, metadataconstant.NameMemory:
 	default:
 		return errors.New(`must be one of "memory", "configmap", "raft" or "file"`)

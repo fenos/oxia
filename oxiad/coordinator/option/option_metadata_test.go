@@ -224,6 +224,11 @@ func TestProviderOptionsValidate(t *testing.T) {
 		{name: "configmap without namespace", opts: ProviderOptions{ProviderName: ProviderConfigMap}, err: "k8s-namespace"},
 		{name: "raft", opts: ProviderOptions{ProviderName: ProviderRaft, Raft: RaftMetadata{Address: "localhost:0"}}},
 		{name: "raft without address", opts: ProviderOptions{ProviderName: ProviderRaft}, err: "raft-address"},
+		{name: "raft with peers", opts: ProviderOptions{ProviderName: ProviderRaft, Raft: RaftMetadata{Address: "localhost:0",
+			Peers: []string{"localhost:0"}}}},
+		{name: "raft with peers and bootstrap nodes", opts: ProviderOptions{ProviderName: ProviderRaft, Raft: RaftMetadata{
+			Address: "localhost:0", Peers: []string{"localhost:0"}, BootstrapNodes: []string{"localhost:0"}}},
+			err: "mutually exclusive"},
 		{name: "unknown", opts: ProviderOptions{ProviderName: "etcd"}, err: "must be one of"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

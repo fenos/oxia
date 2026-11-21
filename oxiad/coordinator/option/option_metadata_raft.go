@@ -19,6 +19,15 @@ package option
 // coordinator is a member of the group, and the leader of the group manages
 // the cluster.
 type RaftMetadata struct {
+	// Peers are the Raft addresses of the whole group, in one order that
+	// every coordinator shares. The membership follows the list: the first
+	// peer founds the group when it has no Raft state, and whichever peer
+	// leads adds the listed coordinators as non-voters, promotes them once
+	// they prove reachable, and removes the coordinators that are no longer
+	// listed. A coordinator absent from its own list is retiring: it hands
+	// the leadership over whenever it holds it. Mutually exclusive with
+	// BootstrapNodes.
+	Peers []string `yaml:"peers,omitempty" json:"peers,omitempty" jsonschema:"description=Raft addresses of the whole group in one shared order: the first founds the group and the leader keeps the membership equal to the list. Mutually exclusive with bootstrapNodes,example=coordinator-0:8080"`
 	// BootstrapNodes are the Raft addresses of the coordinators that form the
 	// group, including this one. They are used only when this coordinator
 	// starts without any Raft state: a coordinator that has some keeps the

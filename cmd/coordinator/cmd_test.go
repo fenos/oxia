@@ -623,3 +623,16 @@ func (h *recordingHandler) waitFor(message string) bool {
 		}
 	}
 }
+
+// The flag parses a list of raft addresses.
+func TestCoordinatorRaftPeersFlag(t *testing.T) {
+	flag := Cmd.Flags().Lookup("raft-peers")
+	require.NotNil(t, flag)
+	t.Cleanup(func() {
+		require.NoError(t, flag.Value.(pflag.SliceValue).Replace(nil))
+		flag.Changed = false
+	})
+
+	require.NoError(t, Cmd.ParseFlags([]string{"--raft-peers=node1:6645,node2:6645,node3:6645"}))
+	assert.Equal(t, []string{"node1:6645", "node2:6645", "node3:6645"}, flag.Value.(pflag.SliceValue).GetSlice())
+}

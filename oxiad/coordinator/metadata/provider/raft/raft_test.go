@@ -108,7 +108,7 @@ func TestNewFailsToCheckExistingState(t *testing.T) {
 	skipWithoutFailpoints(t)
 	dataDir := t.TempDir()
 	failpointErr := errors.New("failpoint")
-	_, err := newRaft(testRaftAddress, []string{testRaftAddress}, dataDir, nil, failpoint.New(map[string]func() error{
+	_, err := newRaft(Config{Address: testRaftAddress, BootstrapNodes: []string{testRaftAddress}, DataDir: dataDir}, nil, failpoint.New(map[string]func() error{
 		"new.hasExistingState": func() error { return failpointErr },
 	}))
 	require.ErrorIs(t, err, failpointErr)

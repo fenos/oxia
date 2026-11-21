@@ -107,13 +107,24 @@ func TestProviderLoadLatestPanicsOnUndecodableState(t *testing.T) {
 }
 
 func TestProviderGetLeaderNameUnavailable(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	r := &Raft{logger: logger, sc: newStateContainer(logger, nil)}
+	r, _ := newInmemRaft(t)
 	p := NewProvider(t.Context(), r, metadatacodec.ClusterStatusCodec, metadatacommon.WatchDisabled)
 	defer func() { require.NoError(t, p.Close()) }()
 
 	_, err := p.GetLeaderName()
 	require.ErrorIs(t, err, errs.ErrUnavailable)
+}
+
+// The leader is named by its raft identity once the group has one.
+func TestProviderGetLeaderNameNamesTheLeader(t *testing.T) {
+	r := newInmemLeader(t)
+	p := NewProvider(t.Context(), r, metadatacodec.ClusterStatusCodec, metadatacommon.WatchDisabled)
+	defer func() { require.NoError(t, p.Close()) }()
+
+	require.Eventually(t, func() bool { return r.LeaderID() != "" }, 5*time.Second, 10*time.Millisecond)
+	name, err := p.GetLeaderName()
+	require.NoError(t, err)
+	assert.Equal(t, r.LeaderID(), name)
 }
 
 func TestProviderStoreFailsOnFollower(t *testing.T) {
