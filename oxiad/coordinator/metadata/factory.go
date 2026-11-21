@@ -112,6 +112,17 @@ func (f *Factory) CreateMetadata(ctx context.Context) Metadata {
 	return newDefaultMetadata(ctx, statusProvider, configProvider, coordinatorName)
 }
 
+// Membership is the raft group behind the metadata of this coordinator, with
+// the raft provider; false with every other provider.
+func (f *Factory) Membership() (raft.Membership, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.raft == nil {
+		return nil, false
+	}
+	return f.raft, true
+}
+
 // Close closes the metadata providers. It is safe to call more than once,
 // and concurrently.
 func (f *Factory) Close() error {

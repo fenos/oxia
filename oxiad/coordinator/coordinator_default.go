@@ -73,7 +73,40 @@ type coordinator struct {
 	stopErr error
 }
 
-func New(ctx context.Context, optionsWatch *commonwatch.Watch[*option.Options]) (_ Coordinator, err error) {
+// Option configures how New starts a coordinator, for an application that
+// embeds it.
+type Option func(*startOptions)
+
+type startOptions struct {
+	onMetadata func(*coordmetadata.Factory)
+}
+
+// WithOnMetadata hands the metadata factory to handler as soon as it exists:
+// before the wait for the leadership, so that the caller of a coordinator that
+// doesn't lead can read the raft membership too. The factory belongs to the
+// coordinator, and closes with it, or with a failed New.
+func WithOnMetadata(handler func(*coordmetadata.Factory)) Option {
+	return func(so *startOptions) {
+		so.onMetadata = handler
+	}
+}
+
+func newStartOptions(opts []Option) startOptions {
+	var start startOptions
+	for _, opt := range opts {
+		opt(&start)
+	}
+	return start
+}
+
+func (so startOptions) handMetadata(factory *coordmetadata.Factory) {
+	if so.onMetadata != nil {
+		so.onMetadata(factory)
+	}
+}
+
+func New(ctx context.Context, optionsWatch *commonwatch.Watch[*option.Options], opts ...Option) (_ Coordinator, err error) {
+	start := newStartOptions(opts)
 	options := optionsWatch.Load()
 	options.WithDefault()
 	if err := options.Validate(); err != nil {
@@ -141,6 +174,7 @@ func New(ctx context.Context, optionsWatch *commonwatch.Watch[*option.Options]) 
 	if err != nil {
 		return nil, err
 	}
+	start.handMetadata(metadataFactory)
 	metadata = metadataFactory.CreateMetadata(ctx)
 
 	managementSv := options.Server.Public

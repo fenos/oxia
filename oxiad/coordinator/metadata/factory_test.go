@@ -15,6 +15,7 @@
 package metadata
 
 import (
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -23,6 +24,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	metadatacommon "github.com/oxia-db/oxia/oxiad/common/metadata"
+	"github.com/oxia-db/oxia/oxiad/coordinator/metadata/provider/raft"
 	"github.com/oxia-db/oxia/oxiad/coordinator/option"
 )
 
@@ -38,6 +40,36 @@ func TestNewFactoryFromOptionsCreatesMemoryProviders(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotNil(t, factory.statusProvider)
 	assert.NotNil(t, factory.configProvider)
+	require.NoError(t, factory.Close())
+}
+
+// The factory of the raft provider exposes the raft group; the others have
+// none.
+func TestFactoryMembership(t *testing.T) {
+	memory, err := New(t.Context(), &option.Options{Metadata: option.MetadataOptions{
+		ProviderOptions: option.ProviderOptions{ProviderName: metadatacommon.NameMemory},
+	}})
+	require.NoError(t, err)
+	_, ok := memory.Membership()
+	assert.False(t, ok)
+	require.NoError(t, memory.Close())
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	address := listener.Addr().String()
+	require.NoError(t, listener.Close())
+	factory, err := New(t.Context(), &option.Options{Metadata: option.MetadataOptions{
+		ProviderOptions: option.ProviderOptions{
+			ProviderName: metadatacommon.NameRaft,
+			Raft:         option.RaftMetadata{Address: address, Peers: []string{address}, DataDir: t.TempDir()},
+		},
+	}})
+	require.NoError(t, err)
+	membership, ok := factory.Membership()
+	require.True(t, ok)
+	members, err := membership.Members()
+	require.NoError(t, err)
+	assert.Equal(t, []raft.Member{{Address: address, Voter: true}}, members)
 	require.NoError(t, factory.Close())
 }
 

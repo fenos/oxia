@@ -238,6 +238,20 @@ func TestCoordinatorAppliesLogLevelChanges(t *testing.T) {
 	logging.ReconfigureLogger(&commonoption.LogOptions{Level: originalLevel.String()})
 }
 
+// The caller gets the metadata factory before the coordinator leads; it has no
+// raft membership on the memory provider.
+func TestNewHandsTheMetadataToTheCaller(t *testing.T) {
+	var handed *coordmetadata.Factory
+	server, err := New(t.Context(), commonwatch.New(newTestOptions()),
+		WithOnMetadata(func(factory *coordmetadata.Factory) { handed = factory }))
+	require.NoError(t, err)
+	defer func() { require.NoError(t, server.Close()) }()
+
+	require.NotNil(t, handed)
+	_, ok := handed.Membership()
+	assert.False(t, ok)
+}
+
 // Close releases the coordinator once: closing it again does nothing.
 func TestCoordinatorCloseTwice(t *testing.T) {
 	server, err := New(t.Context(), commonwatch.New(newTestOptions()))
