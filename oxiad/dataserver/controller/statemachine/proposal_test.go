@@ -107,7 +107,7 @@ func TestControlProposalApplyReturnsDBError(t *testing.T) {
 		},
 	})
 
-	_, err := proposal.Apply(db, database.NoOpCallback)
+	_, err := proposal.Apply(db, 0, database.NoOpCallback)
 	assert.ErrorIs(t, err, constant.ErrUnsupportedFeatures)
 }
 

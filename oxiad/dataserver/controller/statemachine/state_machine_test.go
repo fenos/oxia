@@ -65,7 +65,7 @@ func TestApplyProposal_Write(t *testing.T) {
 		},
 	})
 
-	response, err := proposal.Apply(db, database.NoOpCallback)
+	response, err := proposal.Apply(db, 0, database.NoOpCallback)
 	assert.NoError(t, err)
 	assert.NotNil(t, response.WriteResponse)
 	assert.Equal(t, 1, len(response.WriteResponse.Puts))
@@ -91,7 +91,7 @@ func TestApplyProposal_Control_FeatureEnable(t *testing.T) {
 		},
 	})
 
-	response, err := proposal.Apply(db, database.NoOpCallback)
+	response, err := proposal.Apply(db, 0, database.NoOpCallback)
 	assert.NoError(t, err)
 	assert.Nil(t, response.WriteResponse)
 
@@ -106,7 +106,7 @@ func TestApplyProposal_Write_MultipleKeys(t *testing.T) {
 		Puts: []*proto.PutRequest{
 			{Key: "a", Value: []byte("v1")},
 		},
-	}).Apply(db, database.NoOpCallback)
+	}).Apply(db, 0, database.NoOpCallback)
 	assert.NoError(t, err)
 
 	// Second write: put "b", delete non-existing "c", delete existing "a"
@@ -118,7 +118,7 @@ func TestApplyProposal_Write_MultipleKeys(t *testing.T) {
 			{Key: "c", ExpectedVersionId: pb.Int64(-1)}, // should fail: key doesn't exist
 			{Key: "a"}, // should succeed
 		},
-	}).Apply(db, database.NoOpCallback)
+	}).Apply(db, 0, database.NoOpCallback)
 	assert.NoError(t, err)
 
 	assert.Equal(t, 1, len(response.WriteResponse.Puts))
@@ -300,7 +300,7 @@ func TestApplyProposal_ThenApplyLogEntry(t *testing.T) {
 		},
 	})
 
-	_, err := proposal.Apply(leaderDB, database.NoOpCallback)
+	_, err := proposal.Apply(leaderDB, 0, database.NoOpCallback)
 	assert.NoError(t, err)
 
 	// Follower replays the same entry from the WAL
@@ -353,7 +353,7 @@ func TestApplyLogEntry_RejectedWrite(t *testing.T) {
 			Timestamp: proposal.GetTimestamp(),
 		}
 
-		_, err := proposal.Apply(leaderDB, database.NoOpCallback)
+		_, err := proposal.Apply(leaderDB, 0, database.NoOpCallback)
 		if offset == 1 {
 			assert.ErrorIs(t, err, errs.ErrDBWriteRejected)
 		} else {
@@ -650,4 +650,30 @@ func (f *fakeUpdateOperationCallback) OnPut(batch kvstore.WriteBatch, notificati
 		return f.onPut()
 	}
 	return f.UpdateOperationCallback.OnPut(batch, notifications, req, se, features)
+}
+
+// A log entry records its own term as the last applied, Raft's last included
+// term, not the term the replica is fenced at: a new leader commits the
+// entries of the terms before its own, and its followers apply them, after its
+// election. A term inflated to the fenced one would rank the replica ahead of
+// one with committed entries past it.
+func TestApplyLogEntryRecordsTheTermOfTheEntry(t *testing.T) {
+	db := newTestDB(t)
+	assert.NoError(t, db.UpdateTerm(3, database.TermOptions{}))
+
+	for offset := range int64(2) {
+		_, err := ApplyLogEntry(db, &proto.LogEntry{
+			Term:   1,
+			Offset: offset,
+			Value: marshalProposal(t, NewWriteProposal(offset, &proto.WriteRequest{
+				Puts: []*proto.PutRequest{{Key: "a", Value: []byte("0")}},
+			})),
+		}, database.NoOpCallback)
+		assert.NoError(t, err)
+	}
+
+	commit, err := db.ReadCommitEntryId()
+	assert.NoError(t, err)
+	assert.EqualValues(t, 1, commit.GetTerm())
+	assert.EqualValues(t, 1, commit.GetOffset())
 }

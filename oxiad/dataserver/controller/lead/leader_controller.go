@@ -1533,7 +1533,7 @@ func (lc *leaderController) proposeLocked(ctx context.Context, proposalSupplier 
 		tracker.WaitForCommitOffsetAsync(ctx, newOffset, concurrent.NewOnce[any](
 			func(_ any) {
 				defer timer.DoneCtx(ctx)
-				response, err := lc.applyCommitted(termCtx, walLog, proposal)
+				response, err := lc.applyCommitted(termCtx, walLog, term, proposal)
 				if err != nil {
 					lc.waitGroup.Done()
 					cb.OnCompleteError(err)
@@ -1562,14 +1562,15 @@ func (lc *leaderController) proposeLocked(ctx context.Context, proposalSupplier 
 // database past it, so the database would miss it for good. The entries left
 // when the term ends are applied from the wal, by the next leader, and by this
 // node as a follower.
-func (lc *leaderController) applyCommitted(ctx context.Context, w wal.Wal, proposal statemachine.Proposal) (statemachine.ApplyResponse, error) {
+func (lc *leaderController) applyCommitted(ctx context.Context, w wal.Wal, term int64,
+	proposal statemachine.Proposal) (statemachine.ApplyResponse, error) {
 	if ctx.Err() != nil {
 		// An earlier entry could have failed to apply, and must come first
 		return statemachine.ApplyResponse{}, errors.Wrapf(constant.ErrResourceUnavailable,
 			"oxia: the term ended before applying the entry %d", proposal.GetOffset())
 	}
 
-	response, err := proposal.Apply(lc.db, WrapperUpdateOperationCallback)
+	response, err := proposal.Apply(lc.db, term, WrapperUpdateOperationCallback)
 	if !isApplied(err) {
 		response, err = lc.retryApply(ctx, w, proposal.GetOffset(), err)
 	}
@@ -1635,7 +1636,7 @@ func (lc *leaderController) applyFromWal(w wal.Wal, offset int64) (statemachine.
 	if err != nil {
 		return statemachine.ApplyResponse{}, err
 	}
-	return proposal.Apply(lc.db, WrapperUpdateOperationCallback)
+	return proposal.Apply(lc.db, entry.Term, WrapperUpdateOperationCallback)
 }
 
 //nolint:revive

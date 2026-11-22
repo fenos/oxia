@@ -149,7 +149,7 @@ func (h *fakeHost) apply(s *fakeShard) {
 	require.NoError(h.t, err)
 	for offset := commitOffset + 1; offset < int64(len(s.writes)); offset++ {
 		put := &proto.PutRequest{Key: fmt.Sprintf("key-%d", offset), Value: s.writes[offset]}
-		_, err := s.db.ProcessWrite(&proto.WriteRequest{Puts: []*proto.PutRequest{put}}, offset, 0, database.NoOpCallback)
+		_, err := s.db.ProcessWrite(&proto.WriteRequest{Puts: []*proto.PutRequest{put}}, 0, offset, 0, database.NoOpCallback)
 		require.NoError(h.t, err)
 	}
 }

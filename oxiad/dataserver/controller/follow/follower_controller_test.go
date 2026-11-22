@@ -290,7 +290,7 @@ func TestFollower_RestoreCommitOffset(t *testing.T) {
 	_, err = db.ProcessWrite(&proto.WriteRequest{Puts: []*proto.PutRequest{{
 		Key:   "xx",
 		Value: []byte(""),
-	}}}, 9, 0, database.NoOpCallback)
+	}}}, 0, 9, 0, database.NoOpCallback)
 	assert.NoError(t, err)
 
 	assert.NoError(t, db.UpdateTerm(6, database.TermOptions{}))
@@ -842,7 +842,7 @@ func prepareTestDb(t *testing.T, term int64) kvstore.Snapshot {
 				Key:   fmt.Sprintf("key-%d", i),
 				Value: []byte(fmt.Sprintf("value-%d", i)),
 			}},
-		}, int64(i), 0, database.NoOpCallback)
+		}, 0, int64(i), 0, database.NoOpCallback)
 		assert.NoError(t, err)
 	}
 	assert.NoError(t, db.UpdateTerm(term, database.TermOptions{}))
@@ -1732,7 +1732,7 @@ func TestFollower_SplitHashRangeFiltering(t *testing.T) {
 				Key:   key,
 				Value: []byte(fmt.Sprintf("snapshot-%s", key)),
 			}},
-		}, int64(i), 0, database.NoOpCallback)
+		}, 0, int64(i), 0, database.NoOpCallback)
 		assert.NoError(t, err)
 	}
 	assert.NoError(t, snapshotDb.UpdateTerm(1, database.TermOptions{}))
@@ -2159,7 +2159,7 @@ func installSplitTestSnapshotWith(t *testing.T, fc FollowerController, term int6
 	for i, key := range []string{"a", "b", "c", "d", "e", "f"} {
 		_, err := parentDb.ProcessWrite(&proto.WriteRequest{
 			Puts: []*proto.PutRequest{{Key: key, Value: []byte("snapshot-" + key)}},
-		}, int64(i), 0, database.NoOpCallback)
+		}, 0, int64(i), 0, database.NoOpCallback)
 		require.NoError(t, err)
 	}
 	require.NoError(t, parentDb.UpdateTerm(term, termOptions))
@@ -2756,7 +2756,7 @@ func TestFollower_InstallSnapshotWhileApplyingEntries(t *testing.T) {
 		_, err = leaderDb.ProcessWrite(&proto.WriteRequest{Puts: []*proto.PutRequest{{
 			Key:   "k",
 			Value: []byte(fmt.Sprintf("v%d", i)),
-		}}}, i, 0, database.NoOpCallback)
+		}}}, 0, i, 0, database.NoOpCallback)
 		require.NoError(t, err)
 	}
 	require.NoError(t, leaderDb.UpdateTerm(1, database.TermOptions{}))
@@ -2870,7 +2870,7 @@ func TestFollower_InstallSnapshotBelowAppliedEntries(t *testing.T) {
 	_, err = leaderDb.ProcessWrite(&proto.WriteRequest{Puts: []*proto.PutRequest{{
 		Key:   "k",
 		Value: []byte("s0"),
-	}}}, 0, 0, database.NoOpCallback)
+	}}}, 0, 0, 0, database.NoOpCallback)
 	require.NoError(t, err)
 	require.NoError(t, leaderDb.UpdateTerm(1, database.TermOptions{}))
 	snapshot, err := leaderDb.Snapshot()
@@ -4453,4 +4453,44 @@ func (l *hookSnapshotLoader) Complete() error {
 		return err
 	}
 	return l.SnapshotLoader.Complete()
+}
+
+// The entries of the terms before a new leader's own, which it sends after its
+// election, apply on a follower with their own terms: its database records the
+// term of the last entry it applied, not the term it is fenced at, and a
+// follower seeded from a snapshot of it reports that term.
+func TestFollower_RecordsTheTermOfTheEntriesItApplies(t *testing.T) {
+	var shardId int64
+	kvFactory, err := kvstore.NewPebbleKVFactory(kvstore.NewFactoryOptionsForTest(t))
+	assert.NoError(t, err)
+	walFactory := wal.NewWalFactory(&wal.FactoryOptions{BaseWalDir: t.TempDir()})
+
+	fc, err := NewFollowerController(&option.StorageOptions{}, constant.DefaultNamespace, shardId, walFactory, kvFactory, nil)
+	assert.NoError(t, err)
+	_, err = fc.NewTerm(&proto.NewTermRequest{Term: 3})
+	assert.NoError(t, err)
+
+	stream := rpc.NewMockServerReplicateStream()
+	go func() {
+		// cancelled due to fc.Close() below
+		assert.ErrorIs(t, fc.AppendEntries(stream, 3), context.Canceled)
+		stream.Cancel()
+	}()
+	for offset := range int64(2) {
+		req := createAddRequest(t, 1, offset, map[string]string{"a": "0"}, offset)
+		req.Term = 3
+		stream.AddRequest(req)
+		assert.EqualValues(t, offset, stream.GetResponse().Offset)
+	}
+	assert.Eventually(t, func() bool {
+		return fc.CommitOffset() == 1
+	}, 10*time.Second, 10*time.Millisecond)
+
+	commit, err := fc.(*followerController).db.ReadCommitEntryId()
+	assert.NoError(t, err)
+	assertProtoEqual(t, &proto.EntryId{Term: 1, Offset: 1}, commit)
+
+	assert.NoError(t, fc.Close())
+	assert.NoError(t, kvFactory.Close())
+	assert.NoError(t, walFactory.Close())
 }

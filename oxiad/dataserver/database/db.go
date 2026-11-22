@@ -48,7 +48,11 @@ import (
 )
 
 const (
-	commitOffsetKey        = constant.InternalKeyPrefix + "commit-offset"
+	commitOffsetKey = constant.InternalKeyPrefix + "commit-offset"
+	// commitTermKey holds the term of the entry at the commit offset, Raft's
+	// lastIncludedTerm of a snapshot: the database applies only committed
+	// entries, so with the offset it is the head of the committed log.
+	commitTermKey          = constant.InternalKeyPrefix + "commit-term"
 	commitLastVersionIdKey = constant.InternalKeyPrefix + "last-version-id"
 	commitChecksumKey      = constant.InternalKeyPrefix + "checksum"
 	featureFlagKeyPrefix   = constant.InternalKeyPrefix + "features"
@@ -115,12 +119,19 @@ type DB interface {
 	ReadChecksum() crc.Checksum
 	ResetChecksum()
 
-	ProcessWrite(b *proto.WriteRequest, commitOffset int64, timestamp uint64, updateOperationCallback UpdateOperationCallback) (*proto.WriteResponse, error)
+	// ProcessWrite applies a write request, the entry of term commitTerm at
+	// commitOffset, and records that entry as the last applied. The term is
+	// the entry's own, not the one the replica is fenced at.
+	ProcessWrite(b *proto.WriteRequest, commitTerm int64, commitOffset int64, timestamp uint64,
+		updateOperationCallback UpdateOperationCallback) (*proto.WriteResponse, error)
 	// ProcessSplitParentWrite applies a write request of the parent of a split
 	// child as the parent applied it (see DeferredSplitFilter)
-	ProcessSplitParentWrite(b *proto.WriteRequest, commitOffset int64, timestamp uint64,
+	ProcessSplitParentWrite(b *proto.WriteRequest, commitTerm int64, commitOffset int64, timestamp uint64,
 		updateOperationCallback UpdateOperationCallback) (*proto.WriteResponse, error)
-	ProcessControlRequest(controlRequest *proto.ControlRequest, commitOffset int64, timestamp uint64, updateOperationCallback UpdateOperationCallback) (*Meta, error)
+	// ProcessControlRequest applies a control request, the entry of term
+	// commitTerm at commitOffset, as ProcessWrite does
+	ProcessControlRequest(controlRequest *proto.ControlRequest, commitTerm int64, commitOffset int64, timestamp uint64,
+		updateOperationCallback UpdateOperationCallback) (*Meta, error)
 
 	Get(request *proto.GetRequest) (*proto.GetResponse, error)
 	List(request *proto.ListRequest) (kvstore.KeyIterator, error)
@@ -139,6 +150,12 @@ type DB interface {
 	CompareKeys(a, b string) int
 
 	ReadCommitOffset() (int64, error)
+
+	// ReadCommitEntryId returns the last entry applied: its offset, and its
+	// term, wal.InvalidTerm for a database whose last entry a binary that
+	// didn't record it applied. Each entry applied records both in the same
+	// batch.
+	ReadCommitEntryId() (*proto.EntryId, error)
 
 	// Flush makes the writes to the database durable: it runs without a WAL of
 	// its own, so it loses the writes since its last flush in a crash.
@@ -512,7 +529,7 @@ func featureFlagKey(f proto.Feature) string {
 	return fmt.Sprintf("%s/%010d", featureFlagKeyPrefix, f)
 }
 
-func (d *db) ProcessControlRequest(cmd *proto.ControlRequest, commitOffset int64, timestamp uint64,
+func (d *db) ProcessControlRequest(cmd *proto.ControlRequest, commitTerm int64, commitOffset int64, timestamp uint64,
 	updateOperationCallback UpdateOperationCallback) (*Meta, error) {
 	meta := &Meta{
 		Checksum: new(d.ReadChecksum()),
@@ -541,7 +558,7 @@ func (d *db) ProcessControlRequest(cmd *proto.ControlRequest, commitOffset int64
 	batch := d.kv.NewWriteBatch()
 	defer batch.Close()
 
-	if err := d.addASCIILong(commitOffsetKey, commitOffset, batch, timestamp); err != nil {
+	if err := d.addCommitEntry(batch, commitTerm, commitOffset, timestamp); err != nil {
 		return nil, err
 	}
 	for _, f := range featuresToEnable {
@@ -582,7 +599,8 @@ func (d *db) ProcessControlRequest(cmd *proto.ControlRequest, commitOffset int64
 	return meta, nil
 }
 
-func (d *db) ProcessWrite(b *proto.WriteRequest, commitOffset int64, timestamp uint64, updateOperationCallback UpdateOperationCallback) (*proto.WriteResponse, error) {
+func (d *db) ProcessWrite(b *proto.WriteRequest, commitTerm int64, commitOffset int64, timestamp uint64,
+	updateOperationCallback UpdateOperationCallback) (*proto.WriteResponse, error) {
 	splitFilter := d.deferredSplitFilter.Load()
 	if splitFilter != nil {
 		// A write of the child's own terms: the notification batches before
@@ -591,10 +609,10 @@ func (d *db) ProcessWrite(b *proto.WriteRequest, commitOffset int64, timestamp u
 			return nil, err
 		}
 	}
-	return d.processWrite(b, commitOffset, timestamp, updateOperationCallback, splitFilter)
+	return d.processWrite(b, commitTerm, commitOffset, timestamp, updateOperationCallback, splitFilter)
 }
 
-func (d *db) processWrite(b *proto.WriteRequest, commitOffset int64, timestamp uint64,
+func (d *db) processWrite(b *proto.WriteRequest, commitTerm int64, commitOffset int64, timestamp uint64,
 	updateOperationCallback UpdateOperationCallback, splitFilter *DeferredSplitFilter) (*proto.WriteResponse, error) {
 	timer := d.batchWriteLatencyHisto.Timer()
 	defer timer.Done()
@@ -608,7 +626,7 @@ func (d *db) processWrite(b *proto.WriteRequest, commitOffset int64, timestamp u
 	notifications, res, sequenceUpdates, err := d.applyWriteRequest(b, batch, baseVersionId, commitOffset, timestamp,
 		updateOperationCallback, splitFilter)
 	if isRejectedWrite(err) {
-		return nil, d.rejectWrite(err, commitOffset, timestamp)
+		return nil, d.rejectWrite(err, commitTerm, commitOffset, timestamp)
 	}
 	if err != nil {
 		return nil, err
@@ -637,6 +655,11 @@ func (d *db) processWrite(b *proto.WriteRequest, commitOffset int64, timestamp u
 		if err := d.addASCIILong(commitChecksumKey, int64(committedChecksum), batch, timestamp); err != nil {
 			return nil, err
 		}
+	}
+	// After the checksum: a replica on a binary that doesn't record the term
+	// computes the same checksum for the same entries
+	if err := d.addASCIILong(commitTermKey, commitTerm, batch, timestamp); err != nil {
+		return nil, err
 	}
 
 	if err := batch.Commit(); err != nil {
@@ -697,11 +720,11 @@ func deserializeFailure(key string, err error, closeErr error) error {
 // data, the notifications and the checksum stay the same as on a replica that
 // dropped the request without recording it, like the leaders of the previous
 // versions.
-func (d *db) rejectWrite(cause error, commitOffset int64, timestamp uint64) error {
+func (d *db) rejectWrite(cause error, commitTerm int64, commitOffset int64, timestamp uint64) error {
 	batch := d.kv.NewWriteBatch()
 	defer batch.Close()
 
-	if err := d.addASCIILong(commitOffsetKey, commitOffset, batch, timestamp); err != nil {
+	if err := d.addCommitEntry(batch, commitTerm, commitOffset, timestamp); err != nil {
 		return err
 	}
 	if err := batch.Commit(); err != nil {
@@ -956,6 +979,27 @@ func (d *db) CompareKeys(a, b string) int {
 
 func (d *db) ReadCommitOffset() (int64, error) {
 	return d.readASCIILongOrDefault(commitOffsetKey, constant.I64NegativeOne)
+}
+
+func (d *db) ReadCommitEntryId() (*proto.EntryId, error) {
+	offset, err := d.ReadCommitOffset()
+	if err != nil {
+		return nil, err
+	}
+	term, err := d.readASCIILongOrDefault(commitTermKey, wal.InvalidTerm)
+	if err != nil {
+		return nil, err
+	}
+	return &proto.EntryId{Term: term, Offset: offset}, nil
+}
+
+// addCommitEntry records the entry of term commitTerm at commitOffset as the
+// last applied, in batch, for the batches that write no checksum.
+func (d *db) addCommitEntry(batch kvstore.WriteBatch, commitTerm int64, commitOffset int64, timestamp uint64) error {
+	if err := d.addASCIILong(commitOffsetKey, commitOffset, batch, timestamp); err != nil {
+		return err
+	}
+	return d.addASCIILong(commitTermKey, commitTerm, batch, timestamp)
 }
 
 func (d *db) Flush() error {

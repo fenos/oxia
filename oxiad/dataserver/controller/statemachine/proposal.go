@@ -31,7 +31,9 @@ type Proposal interface {
 
 	ToLogEntry(vtEntry *proto.LogEntryValue)
 
-	Apply(db database.DB, callback database.UpdateOperationCallback) (ApplyResponse, error)
+	// Apply applies the proposal to db as the entry of the given term at its
+	// offset: the term the leader appended it at
+	Apply(db database.DB, term int64, callback database.UpdateOperationCallback) (ApplyResponse, error)
 }
 
 type ApplyResponse struct {
@@ -59,8 +61,8 @@ func (wp *WriteProposal) ToLogEntry(vtEntry *proto.LogEntryValue) {
 	vtEntry.Value = &proto.LogEntryValue_Requests{Requests: &proto.WriteRequests{Writes: []*proto.WriteRequest{wp.request}}}
 }
 
-func (wp *WriteProposal) Apply(db database.DB, callback database.UpdateOperationCallback) (ApplyResponse, error) {
-	resp, err := db.ProcessWrite(wp.request, wp.offset, wp.timestamp, callback)
+func (wp *WriteProposal) Apply(db database.DB, term int64, callback database.UpdateOperationCallback) (ApplyResponse, error) {
+	resp, err := db.ProcessWrite(wp.request, term, wp.offset, wp.timestamp, callback)
 	return ApplyResponse{WriteResponse: resp}, err
 }
 
@@ -92,8 +94,8 @@ func (c *ControlProposal) ToLogEntry(vtEntry *proto.LogEntryValue) {
 	vtEntry.Value = &proto.LogEntryValue_ControlRequest{ControlRequest: c.request}
 }
 
-func (c *ControlProposal) Apply(db database.DB, cb database.UpdateOperationCallback) (ApplyResponse, error) {
-	meta, err := db.ProcessControlRequest(c.request, c.offset, c.timestamp, cb)
+func (c *ControlProposal) Apply(db database.DB, term int64, cb database.UpdateOperationCallback) (ApplyResponse, error) {
+	meta, err := db.ProcessControlRequest(c.request, term, c.offset, c.timestamp, cb)
 	if err != nil {
 		return ApplyResponse{}, err
 	}

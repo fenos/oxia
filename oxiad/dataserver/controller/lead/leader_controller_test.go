@@ -1266,7 +1266,7 @@ func TestLeaderController_AddFollower_Truncate(t *testing.T) {
 			Value:  value,
 		}))
 
-		_, err = db.ProcessWrite(wr, i-1, 0, database.NoOpCallback)
+		_, err = db.ProcessWrite(wr, 0, i-1, 0, database.NoOpCallback)
 		assert.NoError(t, err)
 	}
 
@@ -3489,7 +3489,7 @@ func TestLeaderController_BecomeLeaderWithFollowerSeededFromSnapshot(t *testing.
 						&proto.LogEntry{Term: 1, Offset: i, Value: value}, &previousCrc)
 					require.NoError(t, err)
 				}
-				_, err = db.ProcessWrite(wr, i, 0, database.NoOpCallback)
+				_, err = db.ProcessWrite(wr, 0, i, 0, database.NoOpCallback)
 				require.NoError(t, err)
 			}
 			require.NoError(t, walObject.Sync(context.Background()))
@@ -3747,7 +3747,7 @@ func newLeaderWithWalAfter(t *testing.T, walFirstOffset int64, walTermTwoOffset 
 				&proto.LogEntry{Term: term, Offset: i, Value: value}, &previousCrc)
 			require.NoError(t, err)
 		}
-		_, err = db.ProcessWrite(wr, i, 0, database.NoOpCallback)
+		_, err = db.ProcessWrite(wr, 0, i, 0, database.NoOpCallback)
 		require.NoError(t, err)
 	}
 	require.NoError(t, walObject.Sync(context.Background()))
@@ -5384,7 +5384,7 @@ func newSnapshotSeededLeader(t *testing.T, rpcClient *rpc.MockRpcClient) (Leader
 	require.NoError(t, err)
 	for i := int64(0); i < 10; i++ {
 		wr := &proto.WriteRequest{Puts: []*proto.PutRequest{{Key: "my-key", Value: []byte("")}}}
-		_, err = db.ProcessWrite(wr, i, 0, database.NoOpCallback)
+		_, err = db.ProcessWrite(wr, 0, i, 0, database.NoOpCallback)
 		require.NoError(t, err)
 	}
 	require.NoError(t, db.UpdateTerm(1, database.TermOptions{}))

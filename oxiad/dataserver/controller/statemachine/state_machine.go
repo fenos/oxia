@@ -55,7 +55,8 @@ func ApplyLogEntry(db database.DB, entry *proto.LogEntry, updateOperationCallbac
 
 	switch logEntryValue.Value.(type) {
 	case *proto.LogEntryValue_ControlRequest:
-		meta, err := db.ProcessControlRequest(logEntryValue.GetControlRequest(), entry.Offset, entry.Timestamp, updateOperationCallback)
+		meta, err := db.ProcessControlRequest(logEntryValue.GetControlRequest(), entry.Term, entry.Offset, entry.Timestamp,
+			updateOperationCallback)
 		if err != nil {
 			return ApplyResponse{}, err
 		}
@@ -70,9 +71,10 @@ func ApplyLogEntry(db database.DB, entry *proto.LogEntry, updateOperationCallbac
 		for _, writeRequest := range logEntryValue.GetRequests().Writes {
 			var err error
 			if parentEntry {
-				_, err = db.ProcessSplitParentWrite(writeRequest, entry.Offset, entry.Timestamp, updateOperationCallback)
+				_, err = db.ProcessSplitParentWrite(writeRequest, entry.Term, entry.Offset, entry.Timestamp,
+					updateOperationCallback)
 			} else {
-				_, err = db.ProcessWrite(writeRequest, entry.Offset, entry.Timestamp, updateOperationCallback)
+				_, err = db.ProcessWrite(writeRequest, entry.Term, entry.Offset, entry.Timestamp, updateOperationCallback)
 			}
 			// A rejected request has no effect, as on the leader, which answered
 			// the client with the error: the entry is applied all the same
@@ -107,7 +109,8 @@ func ApplyLogEntryWithSplitFilter(
 
 	switch logEntryValue.Value.(type) {
 	case *proto.LogEntryValue_ControlRequest:
-		meta, err := db.ProcessControlRequest(logEntryValue.GetControlRequest(), entry.Offset, entry.Timestamp, updateOperationCallback)
+		meta, err := db.ProcessControlRequest(logEntryValue.GetControlRequest(), entry.Term, entry.Offset, entry.Timestamp,
+			updateOperationCallback)
 		if err != nil {
 			return ApplyResponse{}, err
 		}
@@ -122,7 +125,7 @@ func ApplyLogEntryWithSplitFilter(
 				// Still call ProcessWrite with an empty request to advance commit offset.
 				filtered = &proto.WriteRequest{Shard: writeRequest.Shard}
 			}
-			if _, err := db.ProcessWrite(filtered, entry.Offset, entry.Timestamp, updateOperationCallback); err != nil &&
+			if _, err := db.ProcessWrite(filtered, entry.Term, entry.Offset, entry.Timestamp, updateOperationCallback); err != nil &&
 				!errors.Is(err, errs.ErrDBWriteRejected) {
 				return ApplyResponse{}, err
 			}
