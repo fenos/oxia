@@ -303,6 +303,15 @@ func TestBackupJobRunFailsWhenCanceled(t *testing.T) {
 	assert.Empty(t, manifestKeys(store))
 }
 
+// A cancellation from outside fails the uploads also when no upload is left
+// to report it: the run above can find every upload canceled, or none.
+func TestBackupJobUploadAllFailsWhenCanceledWithNothingToReportIt(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, err := (&backupJob{}).uploadAll(ctx, nil)
+	assert.ErrorIs(t, err, context.Canceled)
+}
+
 func TestCompareNamesOrdersPebbleFileNamesNumerically(t *testing.T) {
 	assert.Equal(t, 0, compareNames("000010.sst", "000010.sst"))
 	assert.Negative(t, compareNames("000009.sst", "000010.sst"))
