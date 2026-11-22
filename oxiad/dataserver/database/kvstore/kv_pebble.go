@@ -205,38 +205,48 @@ func (p *PebbleFactory) NewSnapshotLoader(ctx context.Context, namespace string,
 }
 
 // installAdmission admits the installs of snapshots on a data server: one at a
-// time, or the installs of one group side by side, each of its own shard. Two
-// installs of one shard never run side by side: they share its stage. Owner:
-// the factory. The loaders acquire it when they are created and release it
-// when they close; mu guards it.
+// time, or a run of the installs of one group side by side. Owner: the
+// factory. The loaders acquire it when they are created and release it when
+// they close; mu guards it.
+//
+// A run starts with its first install, whose room check covers the group: the
+// others join once it passed, and a run whose check fails ends with it. A
+// shard joins a run once, so that a run ends once its installs are done, and
+// so two installs of one shard, which share its stage, never run side by side.
 type installAdmission struct {
 	mu sync.Mutex
-	// group is the group of the installs admitted, "" for a lone install
+	// group is the group of the run, "" for a lone install
 	group string
-	// shards are the shards of the installs admitted
-	shards map[string]struct{}
-	// changed is closed, and replaced, when an install admitted ends
+	// running are the shards of the installs of the run
+	running map[string]struct{}
+	// joined are the shards that joined the run, running or not
+	joined map[string]struct{}
+	// checked is whether the room check of the first install of the run passed
+	checked bool
+	// changed is closed, and replaced, when the run changes
 	changed chan struct{}
 }
 
 func newInstallAdmission() *installAdmission {
-	return &installAdmission{shards: map[string]struct{}{}, changed: make(chan struct{})}
+	return &installAdmission{running: map[string]struct{}{}, joined: map[string]struct{}{},
+		changed: make(chan struct{})}
 }
 
 // acquire waits, as long as ctx allows, until the install of shard can run in
-// group, and reports whether it is the first of its group.
+// group, and reports whether it is the first of its run: the first reports
+// its room check with roomChecked.
 func (a *installAdmission) acquire(ctx context.Context, group string, shard string) (bool, error) {
 	for {
 		a.mu.Lock()
-		_, installing := a.shards[shard]
+		_, joined := a.joined[shard]
 		switch {
-		case len(a.shards) == 0:
-			a.group = group
-			a.shards[shard] = struct{}{}
+		case len(a.running) == 0:
+			a.group, a.checked = group, false
+			a.running[shard], a.joined[shard] = struct{}{}, struct{}{}
 			a.mu.Unlock()
 			return true, nil
-		case group != "" && group == a.group && !installing:
-			a.shards[shard] = struct{}{}
+		case group != "" && group == a.group && a.checked && !joined:
+			a.running[shard], a.joined[shard] = struct{}{}, struct{}{}
 			a.mu.Unlock()
 			return false, nil
 		}
@@ -250,13 +260,27 @@ func (a *installAdmission) acquire(ctx context.Context, group string, shard stri
 	}
 }
 
+// roomChecked records that the room check of the first install of the run
+// passed: the others of its group may join.
+func (a *installAdmission) roomChecked() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.checked = true
+	a.changeLocked()
+}
+
 func (a *installAdmission) release(shard string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	delete(a.shards, shard)
-	if len(a.shards) == 0 {
-		a.group = ""
+	delete(a.running, shard)
+	if len(a.running) == 0 {
+		a.group, a.checked = "", false
+		clear(a.joined)
 	}
+	a.changeLocked()
+}
+
+func (a *installAdmission) changeLocked() {
 	close(a.changed)
 	a.changed = make(chan struct{})
 }
@@ -1453,7 +1477,7 @@ func newPebbleSnapshotLoader(ctx context.Context, pf *PebbleFactory, namespace s
 		return nil, err
 	}
 	// A stage left by a loader that didn't install it holds another snapshot.
-	// The first install of a group checked the room for the others
+	// The first install of a run checks the room for its group
 	err = pf.runInstallSteps(
 		installStep{"remove-stage", func() error { return sl.fs.RemoveAll(sl.paths.stage) }},
 		installStep{"create-stage", func() error { return sl.fs.MkdirAll(sl.paths.stage, 0755) }},
@@ -1461,7 +1485,11 @@ func newPebbleSnapshotLoader(ctx context.Context, pf *PebbleFactory, namespace s
 			if !first {
 				return nil
 			}
-			return checkInstallRoom(sl.fs, sl.paths.stage, options.Size)
+			if err := checkInstallRoom(sl.fs, sl.paths.stage, options.Size); err != nil {
+				return err
+			}
+			pf.installs.roomChecked()
+			return nil
 		}},
 	)
 	if err != nil {

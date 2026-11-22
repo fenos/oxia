@@ -146,9 +146,9 @@ type SnapshotLoaderOptions struct {
 	Size int64
 	// Group names the installs that run side by side, while the others wait
 	// their turn: e.g. the children of one split, which receive the snapshot
-	// of their parent together. The first install of a group checks the room
-	// for the whole group, so its Size is the group's: the others join it
-	// without a check.
+	// of their parent together. The first install of a run of the group
+	// checks the room for the whole group, so its Size is the group's: the
+	// others join once it passed, each shard once a run.
 	Group string
 }
 

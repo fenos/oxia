@@ -29,6 +29,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 	"unsafe"
 
 	"github.com/oxia-db/oxia/oxiad/common/errs"
@@ -1377,6 +1378,79 @@ func TestPebbleNewSnapshotLoaderRefusesWhileAnInstallIsMarked(t *testing.T) {
 	loader, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, SnapshotLoaderOptions{})
 	require.NoError(t, err, "the slot is free again")
 	assert.NoError(t, loader.Close())
+}
+
+// The installs of a group join once the room check of its first passed. A
+// refused check ends the run of the group: each install that waited is then
+// checked on its own.
+func TestPebbleNewSnapshotLoaderJoinsAGroupOnceItsRoomIsChecked(t *testing.T) {
+	skipWithoutFailpoints(t)
+	inCheck := make(chan struct{})
+	unblock := make(chan struct{})
+	var blocked atomic.Bool
+	fs := memFSWithRoom()
+	factory := newMemFactory(t, fs, failpoint.New(map[string]func() error{
+		"snapshot.install.check-room": func() error {
+			if blocked.CompareAndSwap(false, true) {
+				close(inCheck)
+				<-unblock
+			}
+			return nil
+		},
+	}))
+	huge := SnapshotLoaderOptions{Group: "split", Size: math.MaxInt64 / 4}
+
+	firstErr := make(chan error, 1)
+	go func() {
+		_, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, huge)
+		firstErr <- err
+	}()
+	<-inCheck
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := factory.NewSnapshotLoader(ctx, constant.DefaultNamespace, 2, huge)
+	assert.ErrorIs(t, err, context.Canceled, "a member waits for the room check of the first")
+
+	close(unblock)
+	assert.ErrorIs(t, <-firstErr, errs.ErrUnavailable)
+	for _, shard := range []int64{2, 1} {
+		_, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, shard, huge)
+		assert.ErrorIs(t, err, errs.ErrUnavailable, "shard %d is checked on its own", shard)
+	}
+}
+
+// A shard joins a run of its group once: an install that waits for the group
+// gets in once its members are done, however they come and go.
+func TestPebbleNewSnapshotLoaderJoinsARunOfItsGroupOnce(t *testing.T) {
+	factory := newMemFactory(t, memFSWithRoom(), nil)
+	group := SnapshotLoaderOptions{Group: "split"}
+	first, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, group)
+	require.NoError(t, err)
+	second, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 2, group)
+	require.NoError(t, err)
+
+	lone := make(chan error, 1)
+	go func() {
+		loader, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 3, SnapshotLoaderOptions{})
+		if err == nil {
+			err = loader.Close()
+		}
+		lone <- err
+	}()
+
+	require.NoError(t, first.Close())
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = factory.NewSnapshotLoader(ctx, constant.DefaultNamespace, 1, group)
+	assert.ErrorIs(t, err, context.Canceled, "a shard that left the run waits for it to end")
+
+	require.NoError(t, second.Close())
+	select {
+	case err := <-lone:
+		assert.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		require.FailNow(t, "the lone install waited past the run of the group")
+	}
 }
 
 func TestPebbleNewSnapshotLoaderWaitsForTheInstallInProgress(t *testing.T) {

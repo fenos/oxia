@@ -354,6 +354,40 @@ func TestInstallerCompleteReportsTheFailuresOfTheWALClear(t *testing.T) {
 	}
 }
 
+// A restore of a shard whose last snapshot install got as far as its marker
+// completes that install first: the loader refuses to start while a marker
+// stands.
+func TestNewInstallerCompletesAMarkedInstall(t *testing.T) {
+	shard := int64(7)
+	source := newLeaderWithEntries(t, shard, "a")
+	checkpoint, err := source.Checkpoint(shard)
+	require.NoError(t, err)
+	defer func() { assert.NoError(t, checkpoint.Close()) }()
+	kvFactory, err := kvstore.NewPebbleKVFactory(kvstore.NewFactoryOptionsForTest(t))
+	require.NoError(t, err)
+	defer func() { assert.NoError(t, kvFactory.Close()) }()
+	walFactory := newTestWalFactory(t)
+
+	marked, err := newInstaller(context.Background(), &option.StorageOptions{}, constant.DefaultNamespace, shard,
+		&failingWalFactory{Factory: walFactory, clearErr: errors.New("the WAL can't be cleared")}, kvFactory)
+	require.NoError(t, err)
+	installCheckpoint(t, marked, checkpoint)
+	_, _, err = marked.Complete(&proto.HashRange{Min: 0, Max: ^uint32(0)})
+	require.Error(t, err)
+	require.NoError(t, marked.Close())
+
+	errFailed := errors.New("disk failed")
+	_, err = newInstaller(context.Background(), &option.StorageOptions{}, constant.DefaultNamespace, shard,
+		&failingWalFactory{Factory: walFactory, newWalErr: errFailed}, kvFactory)
+	assert.ErrorIs(t, err, errFailed)
+	assert.ErrorContains(t, err, "failed to complete the install of a snapshot")
+
+	installer, err := newInstaller(context.Background(), &option.StorageOptions{}, constant.DefaultNamespace, shard,
+		walFactory, kvFactory)
+	require.NoError(t, err)
+	assert.NoError(t, installer.Close())
+}
+
 func TestNewInstallerReportsTheFailuresOfThePreparation(t *testing.T) {
 	errFailed := errors.New("disk failed")
 	pebbleFactory, err := kvstore.NewPebbleKVFactory(kvstore.NewFactoryOptionsForTest(t))

@@ -56,11 +56,18 @@ type installer struct {
 	loader         kvstore.SnapshotLoader
 }
 
-// newInstaller prepares the snapshot loader. A restore doesn't know the size
-// of the database up front: the loader only checks the headroom it leaves on
-// the disk.
+// newInstaller prepares the snapshot loader, once the last install of a
+// snapshot of the shard completed, if it got as far as its marker: the closed
+// follower of the shard may have left one. A restore doesn't know the size of
+// the database up front: the loader only checks the headroom it leaves on the
+// disk.
 func newInstaller(ctx context.Context, storageOptions *option.StorageOptions, namespace string, shardId int64,
 	walFactory wal.Factory, kvFactory kvstore.Factory) (Installer, error) {
+	if err := kvFactory.RecoverSnapshotInstall(namespace, shardId, func() error {
+		return wal.ClearShard(walFactory, namespace, shardId)
+	}); err != nil {
+		return nil, errors.Wrap(err, "failed to complete the install of a snapshot")
+	}
 	loader, err := kvFactory.NewSnapshotLoader(ctx, namespace, shardId, kvstore.SnapshotLoaderOptions{})
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to create the snapshot loader")
