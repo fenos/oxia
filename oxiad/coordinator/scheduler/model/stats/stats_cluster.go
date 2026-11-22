@@ -71,12 +71,13 @@ func New(dataServers map[string]commonobject.Borrowed[*proto.DataServer],
 				}
 			}
 			ns.Shards[id] = &ShardStats{
-				Ensemble:      ensemble,
-				Leader:        shard.GetLeader().GetNameOrDefault(),
-				Changing:      shard.GetEnsembleChange() != nil,
-				Steady:        shard.GetStatusOrDefault() == proto.ShardStatusSteadyState && shard.GetLeader() != nil,
-				Splitting:     shard.GetSplit() != nil,
-				PendingDelete: pendingDelete,
+				Ensemble:         ensemble,
+				Leader:           shard.GetLeader().GetNameOrDefault(),
+				Changing:         shard.GetEnsembleChange() != nil,
+				Steady:           shard.GetStatusOrDefault() == proto.ShardStatusSteadyState && shard.GetLeader() != nil,
+				EnsembleCaughtUp: shard.GetEnsembleCaughtUp(),
+				Splitting:        shard.GetSplit() != nil,
+				PendingDelete:    pendingDelete,
 				Splittable: shard.GetStatusOrDefault() == proto.ShardStatusSteadyState &&
 					hashRange.GetMax()-hashRange.GetMin() >= 1 && len(shard.GetPendingDeleteShardNodes()) == 0,
 			}

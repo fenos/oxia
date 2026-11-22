@@ -19,10 +19,13 @@ type ShardStats struct {
 	Leader   string
 	Changing bool
 	// Steady is whether the shard has a leader and no election in progress
-	Steady     bool
-	Splitting  bool
-	Splittable bool
-	Overshoot  float64
+	Steady bool
+	// EnsembleCaughtUp is whether every member of the ensemble caught up with
+	// the leader since its election
+	EnsembleCaughtUp bool
+	Splitting        bool
+	Splittable       bool
+	Overshoot        float64
 	// PendingDelete are the data servers whose copy of the shard is still to
 	// be deleted: none of them can be added to the ensemble until it is
 	PendingDelete []string

@@ -459,11 +459,11 @@ func zonedCluster(zones, perZone, used, namespaces, shards int) *stats.ClusterSt
 }
 
 // grown has namespace a at replication factor 3, with its steady shard 1 on n0
-// alone, which leads it.
+// alone, which leads it, caught up.
 func grown(dataServers int) *stats.ClusterStats {
 	s := cluster(dataServers)
 	shard := addShard(s, "a", 1, "n0")
-	shard.Leader, shard.Steady = "n0", true
+	shard.Leader, shard.Steady, shard.EnsembleCaughtUp = "n0", true, true
 	s.Namespaces["a"].ReplicationFactor = 3
 	return s
 }
@@ -493,13 +493,15 @@ func TestPlannerPlanGrowsAShardShortOfItsReplicationFactor(t *testing.T) {
 }
 
 // A shard grows only when it is steady, with no change or split in progress,
-// and its growth isn't held; one at the replication factor doesn't.
+// its whole ensemble caught up, and its growth isn't held; one at the
+// replication factor doesn't.
 func TestPlannerPlanGrowsOnlyASteadyShard(t *testing.T) {
 	for name, unsettle := range map[string]func(*stats.ShardStats){
-		"in election": func(shard *stats.ShardStats) { shard.Steady = false },
-		"changing":    func(shard *stats.ShardStats) { shard.Changing = true },
-		"splitting":   func(shard *stats.ShardStats) { shard.Splitting = true },
-		"held":        func(shard *stats.ShardStats) { shard.GrowthHeld = true },
+		"in election":          func(shard *stats.ShardStats) { shard.Steady = false },
+		"ensemble catching up": func(shard *stats.ShardStats) { shard.EnsembleCaughtUp = false },
+		"changing":             func(shard *stats.ShardStats) { shard.Changing = true },
+		"splitting":            func(shard *stats.ShardStats) { shard.Splitting = true },
+		"held":                 func(shard *stats.ShardStats) { shard.GrowthHeld = true },
 		"at the replication factor": func(shard *stats.ShardStats) {
 			shard.Ensemble = []string{"n0", "n1", "n2"}
 		},
@@ -515,6 +517,30 @@ func TestPlannerPlanGrowsOnlyASteadyShard(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A shard short of its replication factor with a member that doesn't catch up,
+// e.g. one that is down, isn't grown: the election of its growth couldn't
+// reach a caught-up majority. It grows once that member caught up, or once it
+// is swapped out for one that did.
+func TestPlannerPlanGrowsAShardOnceItsMembersCaughtUp(t *testing.T) {
+	s := grown(4)
+	shard := s.GetShard(1)
+	shard.Ensemble = []string{"n0", "n1"}
+	shard.EnsembleCaughtUp = false
+
+	ops, _ := defaultPlanner().Plan(s)
+	for _, op := range describe(ops) {
+		assert.NotContains(t, op, "grow", "n1 is down")
+	}
+
+	shard.EnsembleCaughtUp = true
+	ops, _ = defaultPlanner().Plan(s)
+	assert.Equal(t, []string{"grow 1 n2"}, describe(ops), "n1 recovered")
+
+	shard.Ensemble = []string{"n0", "n3"}
+	ops, _ = defaultPlanner().Plan(s)
+	assert.Equal(t, []string{"grow 1 n1"}, describe(ops), "n1 was swapped out for n3, which caught up")
 }
 
 // A shard that no data server can take grows nowhere, and the other ops are
