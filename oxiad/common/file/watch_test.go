@@ -26,6 +26,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -136,6 +137,38 @@ func TestReloadOnChangeRunsOnWithoutAWatch(t *testing.T) {
 			assert.Fail(t, "reloaded without a watch")
 		})
 	})
+}
+
+// The watcher reports the events of the directory in an order that depends
+// on the platform: fileChanged decides on each one from the links as they
+// are.
+func TestFileChangedSignalsAMoveBetweenResolvedFiles(t *testing.T) {
+	dir := t.TempDir()
+	for _, version := range []string{"..v1", "..v2"} {
+		require.NoError(t, os.Mkdir(filepath.Join(dir, version), 0o700))
+		require.NoError(t, os.WriteFile(filepath.Join(dir, version, "config.yaml"), []byte(version), 0o600))
+	}
+	require.NoError(t, os.Symlink("..v1", filepath.Join(dir, "..data")))
+	path := filepath.Join(dir, "config.yaml")
+	require.NoError(t, os.Symlink(filepath.Join("..data", "config.yaml"), path))
+	v1 := linkTarget(path)
+	require.NotEmpty(t, v1)
+	other := fsnotify.Event{Name: filepath.Join(dir, "..data"), Op: fsnotify.Create}
+
+	target, changed := fileChanged(other, path, v1)
+	assert.False(t, changed, "the path still resolves to the same file")
+	assert.Equal(t, v1, target)
+
+	require.NoError(t, os.Remove(filepath.Join(dir, "..data")))
+	require.NoError(t, os.Symlink("..v2", filepath.Join(dir, "..data")))
+	target, changed = fileChanged(other, path, v1)
+	assert.True(t, changed, "the path resolves to another file")
+	assert.Equal(t, linkTarget(path), target)
+	assert.NotEqual(t, v1, target)
+
+	target, changed = fileChanged(fsnotify.Event{Name: path, Op: fsnotify.Write}, path, target)
+	assert.True(t, changed, "the file itself changed")
+	assert.Equal(t, linkTarget(path), target)
 }
 
 func TestWatchFileClosesWhenTheWatchFails(t *testing.T) {
