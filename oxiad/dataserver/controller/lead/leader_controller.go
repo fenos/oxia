@@ -984,8 +984,23 @@ func (lc *leaderController) truncateFollowerIfNeeded(follower string, shardId in
 		}
 		return constant2.InvalidEntryId, nil
 	}
-	if lc.leaderElectionHeadEntryId.Term == wal.InvalidTerm && lc.resetsSeededFollower(followerHeadEntryId) {
-		return constant2.InvalidEntryId, nil
+	if lc.leaderElectionHeadEntryId.Term == wal.InvalidTerm {
+		if lc.seededTerm != wal.InvalidTerm && followerHeadEntryId.Term == lc.seededTerm &&
+			lc.canStreamAfter(followerHeadEntryId.Offset) {
+			// A follower of a leader seeded from a snapshot whose head is an
+			// entry of the term of the snapshot's last entry, that the leader
+			// can stream after: with an empty wal, the snapshot's last entry
+			// itself. The same index and term mean the same log up to it, so
+			// the follower holds the committed entries and gets the next ones.
+			// Starting it over from a snapshot would wipe its copy of them
+			// until the snapshot is installed: with every follower of a split
+			// child in sync right after the split, a leader lost meanwhile
+			// would leave the shard without them.
+			return followerHeadEntryId, nil
+		}
+		if lc.resetsSeededFollower(followerHeadEntryId) {
+			return constant2.InvalidEntryId, nil
+		}
 	}
 
 	if followerHeadEntryId.Term == lc.leaderElectionHeadEntryId.Term &&

@@ -5439,7 +5439,7 @@ func forgetCommitTerm(t *testing.T, kvFactory kvstore.Factory, shard int64) {
 // that never decrease, so an entry of an earlier term past the snapshot's last
 // entry was never committed.
 func TestLeaderController_BecomeLeaderSeededFromSnapshotWithAFollowerWithEntries(t *testing.T) {
-	for _, follower := range []*proto.EntryId{{Term: 1, Offset: 5}, {Term: 1, Offset: 9}, {Term: 0, Offset: 15}} {
+	for _, follower := range []*proto.EntryId{{Term: 1, Offset: 5}, {Term: 0, Offset: 15}} {
 		t.Run(fmt.Sprintf("follower at %v", follower), func(t *testing.T) {
 			rpcClient := rpc.NewMockRpcClient()
 			lc, closeAll := newSnapshotSeededLeader(t, rpcClient)
@@ -5499,6 +5499,42 @@ func TestLeaderController_SeededFromSnapshotRefusesAFollowerAheadOfTheSnapshot(t
 			FollowerHeadEntryId: head,
 		})
 		assert.ErrorIs(t, err, constant.ErrInvalidTerm, "follower at %v", head)
+	}
+	assert.Empty(t, rpcClient.SendSnapshotStream.Requests, "the follower got a snapshot")
+	assert.Empty(t, rpcClient.TruncateReqs, "the follower got truncated")
+}
+
+// A leader seeded from a snapshot keeps a follower whose head is the
+// snapshot's last entry, with its term: the same index and term mean the same
+// log up to it, so the follower holds the committed entries and gets the next
+// ones. Starting it over from a snapshot would wipe its copy of them, as with
+// every follower of a split child right after the split, and a leader lost
+// meanwhile would leave the shard without them.
+func TestLeaderController_SeededFromSnapshotStreamsAFollowerInSync(t *testing.T) {
+	rpcClient := rpc.NewMockRpcClient()
+	// A snapshot sent by mistake completes, so that the leader can close
+	rpcClient.SendSnapshotStream.Response <- &proto.SnapshotResponse{AckOffset: 9}
+	lc, closeAll := newSnapshotSeededLeader(t, rpcClient)
+	defer closeAll()
+
+	_, err := lc.BecomeLeader(context.Background(), &proto.BecomeLeaderRequest{
+		Shard:             1,
+		Term:              2,
+		ReplicationFactor: 2,
+		FollowerMaps:      map[string]*proto.EntryId{"f1": {Term: 1, Offset: 9}},
+	})
+	require.NoError(t, err)
+	shard := int64(1)
+	lc.Write(context.Background(), &proto.WriteRequest{
+		Shard: &shard,
+		Puts:  []*proto.PutRequest{{Key: "other-key", Value: []byte("")}},
+	}, concurrent.NewOnce(func(*proto.WriteResponse) {}, func(error) {}))
+
+	select {
+	case req := <-rpcClient.AppendReqs:
+		assert.EqualValues(t, 10, req.Entry.Offset)
+	case <-time.After(10 * time.Second):
+		assert.Fail(t, "the leader sent no entry to the follower")
 	}
 	assert.Empty(t, rpcClient.SendSnapshotStream.Requests, "the follower got a snapshot")
 	assert.Empty(t, rpcClient.TruncateReqs, "the follower got truncated")
