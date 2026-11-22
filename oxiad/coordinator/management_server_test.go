@@ -615,6 +615,29 @@ func TestManagementServerGetDataServerReportsDrainingBeforeStored(t *testing.T) 
 	assert.Equal(t, []string{"removed", "unstored"}, names)
 }
 
+// A deleted data server that the runtime still has RUNNING, before its
+// controller sees the configuration, still holds its replicas: it is reported
+// DRAINING, not as gone.
+func TestManagementServerGetDataServerReportsDrainingBeforeTheDrainStarts(t *testing.T) {
+	metadata := newTestMetadata(t, &proto.ClusterConfiguration{})
+	management := newReadyManagementServer(metadata, &testRuntime{
+		metadata: metadata,
+		statuses: map[string]*proto.DataServerStatus{
+			"leaving": {State: proto.DataServerState_DATA_SERVER_STATE_RUNNING},
+		},
+	})
+
+	res, err := management.GetDataServer(context.Background(), &proto.GetDataServerRequest{DataServer: "leaving"})
+	require.NoError(t, err)
+	assert.Equal(t, proto.DataServerState_DATA_SERVER_STATE_DRAINING, res.GetDataServer().GetDataServerStatus().GetState())
+
+	list, err := management.ListDataServers(context.Background(), &proto.ListDataServersRequest{})
+	require.NoError(t, err)
+	require.Len(t, list.GetDataServers(), 1)
+	assert.Equal(t, "leaving", list.GetDataServers()[0].GetDataServer().GetIdentity().GetName())
+	assert.Equal(t, proto.DataServerState_DATA_SERVER_STATE_DRAINING, list.GetDataServers()[0].GetDataServerStatus().GetState())
+}
+
 func TestManagementServerGetDataServerStatusLoadError(t *testing.T) {
 	management := newReadyManagementServer(&failingMetadata{
 		Metadata:  newTestMetadata(t, &proto.ClusterConfiguration{}),

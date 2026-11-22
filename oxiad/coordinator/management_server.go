@@ -150,15 +150,10 @@ func (management *ManagementServer) ListDataServers(_ context.Context, _ *proto.
 			!dataserver.IsRemoved(storedStatuses[name].UnsafeBorrow().GetState()) {
 			continue
 		}
-		// A data server that left the configuration: only its name is known.
-		// Its controller stores it DRAINING once it starts draining it: until
-		// then, only the runtime reports it
-		state := storedStatuses[name].UnsafeBorrow().GetState()
+		// A data server that left the configuration: only its name is known
 		live := statuses[name]
-		if !dataserver.IsRemoved(state) && live != nil {
-			state = live.GetState()
-		}
-		if !dataserver.IsRemoved(state) {
+		state, leaving := leftDataServerState(storedStatuses[name].UnsafeBorrow().GetState(), live)
+		if !leaving {
 			continue
 		}
 		views = append(views, &proto.DataServerView{
@@ -193,13 +188,10 @@ func (management *ManagementServer) GetDataServer(_ context.Context, req *proto.
 	// A data server that left is reported as such, also when the
 	// configuration has it again
 	if state := stored.UnsafeBorrow().GetState(); !found || dataserver.IsRemoved(state) {
-		// Only its name is known. Its controller stores it DRAINING once it
-		// starts draining it: until then, only the runtime reports it
+		// Only its name is known
 		live, _ := runtime.GetLiveDataServerStatus(req.DataServer)
-		if !dataserver.IsRemoved(state) && live != nil {
-			state = live.GetState()
-		}
-		if !dataserver.IsRemoved(state) {
+		state, leaving := leftDataServerState(state, live)
+		if !leaving {
 			return nil, grpcstatus.Errorf(codes.NotFound, dataServerNotFound, req.DataServer)
 		}
 		return &proto.GetDataServerResponse{DataServer: &proto.DataServerView{
@@ -221,6 +213,25 @@ func (management *ManagementServer) GetDataServer(_ context.Context, req *proto.
 			DataServerStatus: status,
 		},
 	}, nil
+}
+
+// leftDataServerState returns the state of a data server that left the
+// configuration, from its stored state and the status the runtime has of it,
+// if any, and whether it is still leaving. Its controller stores it DRAINING
+// once it starts draining it: until then, only the runtime reports it. A data
+// server that the runtime still has RUNNING left the configuration before its
+// controller saw it: it still holds its replicas, and is reported DRAINING.
+func leftDataServerState(stored proto.DataServerState, live *proto.DataServerStatus) (proto.DataServerState, bool) {
+	switch {
+	case dataserver.IsRemoved(stored):
+		return stored, true
+	case live == nil:
+		return stored, false
+	case dataserver.IsRemoved(live.GetState()):
+		return live.GetState(), true
+	default:
+		return proto.DataServerState_DATA_SERVER_STATE_DRAINING, true
+	}
 }
 
 func (management *ManagementServer) CreateDataServer(_ context.Context, req *proto.CreateDataServerRequest) (*proto.CreateDataServerResponse, error) {
