@@ -4043,7 +4043,7 @@ func TestFollowerControllerInstallSnapshotWaitsForAnotherShardOutsideTheLock(t *
 		t.Run(test.name, func(t *testing.T) {
 			walFactory, kvFactory := newHookFactories(t)
 			fc := newFencedFollower(t, walFactory, kvFactory)
-			occupant, err := kvFactory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 99, 0)
+			occupant, err := kvFactory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 99, kvstore.SnapshotLoaderOptions{})
 			require.NoError(t, err)
 
 			stream := rpc.NewMockServerSendSnapshotStream()
@@ -4071,6 +4071,53 @@ func TestFollowerControllerInstallSnapshotWaitsForAnotherShardOutsideTheLock(t *
 			assert.ErrorIs(t, <-installErr, test.err)
 			assert.NoError(t, fc.Close())
 		})
+	}
+}
+
+// The children of one split receive the snapshot of their parent together:
+// they install side by side, while the install of another shard waits.
+func TestFollowerControllerInstallSnapshotInstallsTheChildrenOfASplitSideBySide(t *testing.T) {
+	walFactory, kvFactory := newHookFactories(t)
+	parent := &proto.HashRange{Min: 0, Max: math.MaxUint32}
+	children := map[int64]*proto.HashRange{1: {Min: 0, Max: 0x7FFFFFFF}, 2: {Min: 0x80000000, Max: math.MaxUint32}}
+	followers := map[int64]FollowerController{}
+	for _, shard := range []int64{1, 2, 3} {
+		fc, err := NewFollowerController(&option.StorageOptions{}, constant.DefaultNamespace, shard, walFactory,
+			kvFactory, nil)
+		require.NoError(t, err)
+		_, err = fc.NewTerm(&proto.NewTermRequest{Shard: shard, Term: 1})
+		require.NoError(t, err)
+		if child, ok := children[shard]; ok {
+			fc.SetSplitHashRange(child, parent, 1)
+		}
+		followers[shard] = fc
+	}
+	chunks := snapshotChunks(t, 1)
+
+	// The first child stops after its first chunk, holding its loader
+	stalled := rpc.NewMockServerSendSnapshotStream()
+	stalled.AddChunk(chunks[0])
+	stalledErr := make(chan error, 1)
+	go func() { stalledErr <- followers[1].InstallSnapshot(stalled) }()
+	require.Eventually(t, func() bool {
+		_, err := os.Stat(kvFactory.DatabaseDir(constant.DefaultNamespace, 1) + ".staging")
+		return err == nil
+	}, 10*time.Second, time.Millisecond)
+
+	require.NoError(t, followers[2].InstallSnapshot(newSnapshotStream(chunks)), "the second child installs meanwhile")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := followers[3].InstallSnapshot(&contextSnapshotStream{MockServerSendSnapshotStream: newSnapshotStream(chunks),
+		ctx: ctx})
+	assert.ErrorIs(t, err, context.Canceled, "another shard waits")
+
+	for _, chunk := range chunks[1:] {
+		stalled.AddChunk(chunk)
+	}
+	close(stalled.Chunks)
+	require.NoError(t, <-stalledErr)
+	for _, fc := range followers {
+		assert.NoError(t, fc.Close())
 	}
 }
 
@@ -4210,7 +4257,7 @@ func TestNewFollowerControllerCompletesAnInterruptedSnapshotInstall(t *testing.T
 	appendUncommittedEntries(t, fc, 3)
 	require.NoError(t, fc.Close())
 
-	loader, err := kvFactory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 0, 0)
+	loader, err := kvFactory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 0, kvstore.SnapshotLoaderOptions{})
 	require.NoError(t, err)
 	for _, chunk := range snapshotChunks(t, 1) {
 		require.NoError(t, loader.AddChunk(chunk.Name, chunk.ChunkIndex, chunk.ChunkCount, chunk.Content))
@@ -4475,6 +4522,16 @@ func newFollowerLeftWithAMarkedInstall(t *testing.T) (*followerController, *hook
 	return fc, walFactory, kvFactory
 }
 
+// contextSnapshotStream is a snapshot stream of the given context.
+type contextSnapshotStream struct {
+	*rpc.MockServerSendSnapshotStream
+	ctx context.Context
+}
+
+func (s *contextSnapshotStream) Context() context.Context {
+	return s.ctx
+}
+
 // withManifest returns copies of the chunks, the first one with the manifest.
 func withManifest(chunks []*proto.SnapshotChunk, manifest *proto.SnapshotManifest) []*proto.SnapshotChunk {
 	copied := make([]*proto.SnapshotChunk, len(chunks))
@@ -4691,11 +4748,11 @@ func (f *hookKVFactory) NewKV(namespace string, shardId int64, keySorting proto.
 }
 
 func (f *hookKVFactory) NewSnapshotLoader(ctx context.Context, namespace string, shardId int64,
-	size int64) (kvstore.SnapshotLoader, error) {
+	options kvstore.SnapshotLoaderOptions) (kvstore.SnapshotLoader, error) {
 	if err := runHook(f.getHooks().newSnapshotLoader); err != nil {
 		return nil, err
 	}
-	loader, err := f.Factory.NewSnapshotLoader(ctx, namespace, shardId, size)
+	loader, err := f.Factory.NewSnapshotLoader(ctx, namespace, shardId, options)
 	if err != nil {
 		return nil, err
 	}

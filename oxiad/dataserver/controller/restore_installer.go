@@ -61,7 +61,7 @@ type installer struct {
 // the disk.
 func newInstaller(ctx context.Context, storageOptions *option.StorageOptions, namespace string, shardId int64,
 	walFactory wal.Factory, kvFactory kvstore.Factory) (Installer, error) {
-	loader, err := kvFactory.NewSnapshotLoader(ctx, namespace, shardId, 0)
+	loader, err := kvFactory.NewSnapshotLoader(ctx, namespace, shardId, kvstore.SnapshotLoaderOptions{})
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to create the snapshot loader")
 	}

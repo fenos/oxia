@@ -3954,7 +3954,7 @@ func TestNewLeaderControllerCompletesAnInterruptedSnapshotInstall(t *testing.T) 
 	}
 	require.NoError(t, w.Close())
 
-	loader, err := kvFactory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, shard, 0)
+	loader, err := kvFactory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, shard, kvstore.SnapshotLoaderOptions{})
 	require.NoError(t, err)
 	addSnapshotChunks(t, loader, 10)
 	errCrash := errors.New("crash")

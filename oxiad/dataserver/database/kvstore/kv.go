@@ -139,6 +139,19 @@ type Snapshot interface {
 	Next() bool
 }
 
+// SnapshotLoaderOptions configures the install of a snapshot.
+type SnapshotLoaderOptions struct {
+	// Size is the room the install needs on the disk, in bytes, besides the
+	// headroom.
+	Size int64
+	// Group names the installs that run side by side, while the others wait
+	// their turn: e.g. the children of one split, which receive the snapshot
+	// of their parent together. The first install of a group checks the room
+	// for the whole group, so its Size is the group's: the others join it
+	// without a check.
+	Group string
+}
+
 // SnapshotLoader stages a snapshot beside the database of its shard, which it
 // leaves untouched until Install: a failure or a crash at any step leaves the
 // shard with either its database or the snapshot.
@@ -258,12 +271,13 @@ type Factory interface {
 
 	NewKV(namespace string, shardId int64, keySorting proto.KeySortingType) (KV, error)
 
-	// NewSnapshotLoader prepares the install of a snapshot of size bytes. It
-	// waits, as long as ctx allows, for the install of another snapshot to
-	// finish: one at a time keeps the room it checks for free. It refuses when
-	// the disk can't hold the snapshot and a headroom, which the logs of the
-	// shards need.
-	NewSnapshotLoader(ctx context.Context, namespace string, shardId int64, size int64) (SnapshotLoader, error)
+	// NewSnapshotLoader prepares the install of a snapshot. It waits, as long
+	// as ctx allows, for the installs of other snapshots to finish: one at a
+	// time, or one group at a time, keeps the room it checks for free. It
+	// refuses when the disk can't hold the snapshot and a headroom, which the
+	// logs of the shards need.
+	NewSnapshotLoader(ctx context.Context, namespace string, shardId int64, options SnapshotLoaderOptions) (
+		SnapshotLoader, error)
 
 	// RecoverSnapshotInstall completes the install of a snapshot of the shard
 	// that a failure or a crash interrupted once the replacement started, and

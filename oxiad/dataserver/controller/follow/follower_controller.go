@@ -750,8 +750,8 @@ func (fc *followerController) InstallSnapshot(stream proto.OxiaLogReplication_Se
 
 	// A follower that replicates refuses the install at once, rather than
 	// once the leader sent the first chunk
-	var databaseSize int64
-	if databaseSize, err = fc.prepareInstall(); err != nil {
+	var install installPlan
+	if install, err = fc.prepareInstall(); err != nil {
 		return err
 	}
 
@@ -773,7 +773,7 @@ func (fc *followerController) InstallSnapshot(stream proto.OxiaLogReplication_Se
 	// which a new term and the close of the follower take, and not after
 	// the close
 	var loader kvstore.SnapshotLoader
-	if loader, err = fc.newSnapshotLoader(stream.Context(), snapshotSize(firstChunk, databaseSize)); err != nil {
+	if loader, err = fc.newSnapshotLoader(stream.Context(), install.loaderOptions(fc.namespace, firstChunk)); err != nil {
 		return errors.Wrapf(multierr.Combine(constant.ErrResourceUnavailable, err), "failed to create snapshot loader")
 	}
 	defer func() {
@@ -879,31 +879,59 @@ func (fc *followerController) installConflict() error {
 // newSnapshotLoader returns the loader of a snapshot, once the installs of the
 // other shards let it start. It stops waiting when ctx is done or the
 // follower closes.
-func (fc *followerController) newSnapshotLoader(ctx context.Context, size int64) (kvstore.SnapshotLoader, error) {
+func (fc *followerController) newSnapshotLoader(ctx context.Context, options kvstore.SnapshotLoaderOptions) (
+	kvstore.SnapshotLoader, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	stop := context.AfterFunc(fc.ctx, cancel)
 	defer stop()
-	return fc.kvFactory.NewSnapshotLoader(ctx, fc.namespace, fc.shardId, size)
+	return fc.kvFactory.NewSnapshotLoader(ctx, fc.namespace, fc.shardId, options)
+}
+
+// installPlan is what the follower knows of an install before its first chunk.
+type installPlan struct {
+	// databaseSize is the size of the database the snapshot replaces
+	databaseSize int64
+	// splitParent is the range of the parent of the split, for a child of
+	// a split whose parent sent it
+	splitParent *proto.HashRange
+}
+
+// loaderOptions returns the options of the loader of the snapshot. The
+// children of one split receive the snapshot of their parent together, each
+// all of it: they install side by side, the first of them with the room for
+// both.
+func (p installPlan) loaderOptions(namespace string, firstChunk *proto.SnapshotChunk) kvstore.SnapshotLoaderOptions {
+	options := kvstore.SnapshotLoaderOptions{Size: snapshotSize(firstChunk, p.databaseSize)}
+	if p.splitParent != nil {
+		options.Group = fmt.Sprintf("%s/split/%d-%d/term-%d", namespace, p.splitParent.GetMin(), p.splitParent.GetMax(),
+			firstChunk.Term)
+		options.Size *= 2
+	}
+	return options
 }
 
 // prepareInstall checks that the follower can install a snapshot, and returns
-// the size of its database. A follower that an earlier install left without a
+// what it knows of it. A follower that an earlier install left without a
 // database completes that install first, if it got as far as its marker, or
 // reopens its database: the next install must not replace a marked snapshot.
-func (fc *followerController) prepareInstall() (int64, error) {
+func (fc *followerController) prepareInstall() (installPlan, error) {
 	fc.rwMutex.Lock()
 	defer fc.rwMutex.Unlock()
 	if err := fc.installConflict(); err != nil {
-		return 0, err
+		return installPlan{}, err
 	}
 	if fc.db == nil {
 		fc.reopenAfterFailedInstall(errNoDatabase)
 		if fc.db == nil {
-			return 0, errors.Wrap(constant.ErrResourceUnavailable, errNoDatabase.Error())
+			return installPlan{}, errors.Wrap(constant.ErrResourceUnavailable, errNoDatabase.Error())
 		}
 	}
-	return int64(fc.db.RawKV().DiskSpaceUsage()), nil
+	plan := installPlan{databaseSize: int64(fc.db.RawKV().DiskSpaceUsage())}
+	if fc.splitHashRange != nil {
+		plan.splitParent = fc.splitParentHashRange
+	}
+	return plan, nil
 }
 
 // errNoDatabase is the state of a follower whose install failed, and then the

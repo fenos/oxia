@@ -312,7 +312,8 @@ type failingLoaderFactory struct {
 	err error
 }
 
-func (f *failingLoaderFactory) NewSnapshotLoader(context.Context, string, int64, int64) (kvstore.SnapshotLoader, error) {
+func (f *failingLoaderFactory) NewSnapshotLoader(context.Context, string, int64,
+	kvstore.SnapshotLoaderOptions) (kvstore.SnapshotLoader, error) {
 	return nil, f.err
 }
 

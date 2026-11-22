@@ -113,8 +113,8 @@ type PebbleFactory struct {
 	generationsLock sync.Mutex
 	generations     map[string]uint64
 
-	// installSlot admits one snapshot loader at a time, across the shards
-	installSlot chan struct{}
+	// installs admits the snapshot loaders, across the shards
+	installs *installAdmission
 
 	gaugeCacheSize metric.Gauge
 }
@@ -141,7 +141,7 @@ func NewPebbleKVFactory(options *FactoryOptions) (Factory, error) {
 		dataDir:       options.DataDir,
 		options:       options,
 		memTableSlots: memTableSlots,
-		installSlot:   make(chan struct{}, 1),
+		installs:      newInstallAdmission(),
 
 		// Share a single cache instance across the databases for all the shards
 		cache: blockCache,
@@ -200,8 +200,65 @@ func (p *PebbleFactory) NewKV(namespace string, shardId int64, keySorting proto.
 }
 
 func (p *PebbleFactory) NewSnapshotLoader(ctx context.Context, namespace string, shardId int64,
-	size int64) (SnapshotLoader, error) {
-	return newPebbleSnapshotLoader(ctx, p, namespace, shardId, size)
+	options SnapshotLoaderOptions) (SnapshotLoader, error) {
+	return newPebbleSnapshotLoader(ctx, p, namespace, shardId, options)
+}
+
+// installAdmission admits the installs of snapshots on a data server: one at a
+// time, or the installs of one group side by side, each of its own shard. Two
+// installs of one shard never run side by side: they share its stage. Owner:
+// the factory. The loaders acquire it when they are created and release it
+// when they close; mu guards it.
+type installAdmission struct {
+	mu sync.Mutex
+	// group is the group of the installs admitted, "" for a lone install
+	group string
+	// shards are the shards of the installs admitted
+	shards map[string]struct{}
+	// changed is closed, and replaced, when an install admitted ends
+	changed chan struct{}
+}
+
+func newInstallAdmission() *installAdmission {
+	return &installAdmission{shards: map[string]struct{}{}, changed: make(chan struct{})}
+}
+
+// acquire waits, as long as ctx allows, until the install of shard can run in
+// group, and reports whether it is the first of its group.
+func (a *installAdmission) acquire(ctx context.Context, group string, shard string) (bool, error) {
+	for {
+		a.mu.Lock()
+		_, installing := a.shards[shard]
+		switch {
+		case len(a.shards) == 0:
+			a.group = group
+			a.shards[shard] = struct{}{}
+			a.mu.Unlock()
+			return true, nil
+		case group != "" && group == a.group && !installing:
+			a.shards[shard] = struct{}{}
+			a.mu.Unlock()
+			return false, nil
+		}
+		changed := a.changed
+		a.mu.Unlock()
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
+	}
+}
+
+func (a *installAdmission) release(shard string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.shards, shard)
+	if len(a.shards) == 0 {
+		a.group = ""
+	}
+	close(a.changed)
+	a.changed = make(chan struct{})
 }
 
 func (p *PebbleFactory) DatabaseDir(namespace string, shardId int64) string {
@@ -1359,7 +1416,7 @@ type pebbleSnapshotLoader struct {
 	shard     int64
 	fs        vfs.FS
 	paths     installPaths
-	// release frees the install slot of the factory
+	// release ends the admission of the install by the factory
 	release func()
 	// installing is set once the marker exists: the snapshot is then the
 	// database of the shard, even if the replacement fails
@@ -1368,15 +1425,15 @@ type pebbleSnapshotLoader struct {
 }
 
 func newPebbleSnapshotLoader(ctx context.Context, pf *PebbleFactory, namespace string, shard int64,
-	size int64) (SnapshotLoader, error) {
+	options SnapshotLoaderOptions) (SnapshotLoader, error) {
 	if err := validation.ValidateNamespace(namespace); err != nil {
 		return nil, err
 	}
 
-	select {
-	case pf.installSlot <- struct{}{}:
-	case <-ctx.Done():
-		return nil, errors.Wrap(ctx.Err(), "failed to wait for the install of another snapshot")
+	member := generationKey(namespace, shard)
+	first, err := pf.installs.acquire(ctx, options.Group, member)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to wait for the install of another snapshot")
 	}
 	sl := &pebbleSnapshotLoader{
 		pf:        pf,
@@ -1384,7 +1441,7 @@ func newPebbleSnapshotLoader(ctx context.Context, pf *PebbleFactory, namespace s
 		shard:     shard,
 		fs:        pf.options.FS,
 		paths:     newInstallPaths(pf.getKVPath(namespace, shard)),
-		release:   sync.OnceFunc(func() { <-pf.installSlot }),
+		release:   sync.OnceFunc(func() { pf.installs.release(member) }),
 	}
 	// A marked install completes first, through RecoverSnapshotInstall: its
 	// stage is the snapshot of the shard, which the marker would otherwise
@@ -1395,11 +1452,17 @@ func newPebbleSnapshotLoader(ctx context.Context, pf *PebbleFactory, namespace s
 		sl.release()
 		return nil, err
 	}
-	// A stage left by a loader that didn't install it holds another snapshot
-	err := pf.runInstallSteps(
+	// A stage left by a loader that didn't install it holds another snapshot.
+	// The first install of a group checked the room for the others
+	err = pf.runInstallSteps(
 		installStep{"remove-stage", func() error { return sl.fs.RemoveAll(sl.paths.stage) }},
 		installStep{"create-stage", func() error { return sl.fs.MkdirAll(sl.paths.stage, 0755) }},
-		installStep{"check-room", func() error { return checkInstallRoom(sl.fs, sl.paths.stage, size) }},
+		installStep{"check-room", func() error {
+			if !first {
+				return nil
+			}
+			return checkInstallRoom(sl.fs, sl.paths.stage, options.Size)
+		}},
 	)
 	if err != nil {
 		return nil, multierr.Append(err, sl.Close())

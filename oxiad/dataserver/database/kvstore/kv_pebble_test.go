@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -1020,7 +1021,7 @@ func TestPebbleDatabaseGenerationCountsReplacementsAndDeletions(t *testing.T) {
 	assert.EqualValues(t, 0, factory.DatabaseGeneration(constant.DefaultNamespace, 1))
 	require.NoError(t, kv.Close())
 
-	loader, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, 0)
+	loader, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, SnapshotLoaderOptions{})
 	require.NoError(t, err)
 	require.NoError(t, loader.Close())
 	assert.EqualValues(t, 0, factory.DatabaseGeneration(constant.DefaultNamespace, 1),
@@ -1047,7 +1048,7 @@ func TestPebbleSnapshotLoaderInstallReplacesTheDatabase(t *testing.T) {
 	putKeys(t, kv, "old")
 	require.NoError(t, kv.Close())
 
-	loader, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, 0)
+	loader, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, SnapshotLoaderOptions{})
 	require.NoError(t, err)
 	addChunks(t, loader, snapshotChunksOf(t, "new"))
 	var checked []string
@@ -1081,7 +1082,7 @@ func TestPebbleSnapshotLoaderInstallKeepsTheDatabaseWhenTheCheckFails(t *testing
 	putKeys(t, kv, "old")
 	require.NoError(t, kv.Close())
 
-	loader, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, 0)
+	loader, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, SnapshotLoaderOptions{})
 	require.NoError(t, err)
 	addChunks(t, loader, snapshotChunksOf(t, "new"))
 	errCheck := errors.New("the snapshot is not the announced one")
@@ -1111,7 +1112,7 @@ func TestPebbleSnapshotLoaderCloseKeepsTheDatabase(t *testing.T) {
 	putKeys(t, kv, "old")
 	require.NoError(t, kv.Close())
 
-	loader, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, 0)
+	loader, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, SnapshotLoaderOptions{})
 	require.NoError(t, err)
 	chunks := snapshotChunksOf(t, "new")
 	// The stream ends in the middle of the last file
@@ -1129,7 +1130,7 @@ func TestPebbleSnapshotLoaderCloseKeepsTheDatabase(t *testing.T) {
 
 func TestPebbleSnapshotLoaderInstallRefusesAnUnfinishedFile(t *testing.T) {
 	factory := newMemFactory(t, memFSWithRoom(), nil)
-	loader, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, 0)
+	loader, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, SnapshotLoaderOptions{})
 	require.NoError(t, err)
 	require.NoError(t, loader.AddChunk("a", 0, 2, []byte("first")))
 
@@ -1144,7 +1145,7 @@ func TestPebbleSnapshotLoaderInstallLeavesTheReplacementToRecoveryWhenTheLogClea
 	dbPath := factory.getKVPath(constant.DefaultNamespace, 1)
 	writeMemDB(t, fs, dbPath, "old")
 
-	loader, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, 0)
+	loader, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, SnapshotLoaderOptions{})
 	require.NoError(t, err)
 	addChunks(t, loader, snapshotChunksOf(t, "new"))
 	errClear := errors.New("the log can't be cleared")
@@ -1199,7 +1200,7 @@ func TestPebbleSnapshotLoaderInstallSurvivesACrashAtEveryStep(t *testing.T) {
 			dbPath := factory.getKVPath(constant.DefaultNamespace, 1)
 			writeMemDB(t, fs, dbPath, "old")
 
-			loader, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, 0)
+			loader, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, SnapshotLoaderOptions{})
 			if err == nil {
 				addChunks(t, loader, chunks)
 				err = loader.Install(noCheck, noLogClear)
@@ -1303,7 +1304,7 @@ func TestPebbleNewSnapshotLoaderChecksTheRoomOnTheDisk(t *testing.T) {
 			fs.TestingSetDiskUsage(vfs.DiskUsage{TotalBytes: test.total, AvailBytes: test.avail})
 			factory := newMemFactory(t, fs, nil)
 
-			loader, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, size)
+			loader, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, SnapshotLoaderOptions{Size: size})
 			if test.admitted {
 				require.NoError(t, err)
 				assert.NoError(t, loader.Close())
@@ -1314,11 +1315,48 @@ func TestPebbleNewSnapshotLoaderChecksTheRoomOnTheDisk(t *testing.T) {
 			assertNoInstallFiles(t, fs, newInstallPaths(factory.getKVPath(constant.DefaultNamespace, 1)))
 
 			// The refusal frees the install slot
-			loader, err = factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, 0)
+			loader, err = factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, SnapshotLoaderOptions{})
 			require.NoError(t, err)
 			assert.NoError(t, loader.Close())
 		})
 	}
+}
+
+// The installs of one group run side by side, the first with the room check
+// for the group, while any other waits for the last of them to end, as does
+// another install of a shard of the group.
+func TestPebbleNewSnapshotLoaderAdmitsTheInstallsOfAGroupSideBySide(t *testing.T) {
+	factory := newMemFactory(t, memFSWithRoom(), nil)
+	first, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1,
+		SnapshotLoaderOptions{Group: "split"})
+	require.NoError(t, err)
+	// No disk holds this size: the second of the group joins without a check
+	second, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 2,
+		SnapshotLoaderOptions{Group: "split", Size: math.MaxInt64 / 2})
+	require.NoError(t, err)
+
+	waits := func() {
+		t.Helper()
+		for _, group := range []string{"", "other"} {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			_, err := factory.NewSnapshotLoader(ctx, constant.DefaultNamespace, 3, SnapshotLoaderOptions{Group: group})
+			assert.ErrorIs(t, err, context.Canceled, "group %q", group)
+		}
+	}
+	waits()
+	// Two installs of one shard share its stage
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = factory.NewSnapshotLoader(ctx, constant.DefaultNamespace, 2, SnapshotLoaderOptions{Group: "split"})
+	assert.ErrorIs(t, err, context.Canceled, "a second install of a shard of the group")
+	require.NoError(t, first.Close())
+	waits()
+	require.NoError(t, second.Close())
+
+	third, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 3, SnapshotLoaderOptions{})
+	require.NoError(t, err)
+	assert.NoError(t, third.Close())
 }
 
 // The install of a snapshot that got as far as its marker completes before
@@ -1331,29 +1369,29 @@ func TestPebbleNewSnapshotLoaderRefusesWhileAnInstallIsMarked(t *testing.T) {
 	writeMemDB(t, fs, paths.stage, "new")
 	require.NoError(t, writeInstallMarker(fs, paths.marker, 1))
 
-	_, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, 0)
+	_, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, SnapshotLoaderOptions{})
 	assert.ErrorIs(t, err, errs.ErrFailedPrecondition)
 	assert.Equal(t, map[string]int{"new": 100}, keysOnFS(t, fs, paths.stage), "the marked snapshot stands")
 
 	require.NoError(t, factory.RecoverSnapshotInstall(constant.DefaultNamespace, 1, noLogClear))
-	loader, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, 0)
+	loader, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, SnapshotLoaderOptions{})
 	require.NoError(t, err, "the slot is free again")
 	assert.NoError(t, loader.Close())
 }
 
 func TestPebbleNewSnapshotLoaderWaitsForTheInstallInProgress(t *testing.T) {
 	factory := newMemFactory(t, memFSWithRoom(), nil)
-	first, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, 0)
+	first, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, SnapshotLoaderOptions{})
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err = factory.NewSnapshotLoader(ctx, constant.DefaultNamespace, 2, 0)
+	_, err = factory.NewSnapshotLoader(ctx, constant.DefaultNamespace, 2, SnapshotLoaderOptions{})
 	assert.ErrorIs(t, err, context.Canceled)
 
 	admitted := make(chan error, 1)
 	go func() {
-		second, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 2, 0)
+		second, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 2, SnapshotLoaderOptions{})
 		if err == nil {
 			err = second.Close()
 		}
@@ -1389,7 +1427,7 @@ func TestPebbleSnapshotLoader_RejectsPathTraversal(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	loader, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, 0)
+	loader, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, SnapshotLoaderOptions{})
 	require.NoError(t, err)
 
 	stagePath := filepath.Join(dataDir, constant.DefaultNamespace, "shard-1.staging")
@@ -1434,7 +1472,7 @@ func TestPebbleFactoryNewSnapshotLoaderRejectsEmptyNamespace(t *testing.T) {
 	require.NoError(t, err)
 	defer factory.Close()
 
-	loader, err := factory.NewSnapshotLoader(context.Background(), "", 1, 0)
+	loader, err := factory.NewSnapshotLoader(context.Background(), "", 1, SnapshotLoaderOptions{})
 
 	assert.ErrorContains(t, err, "namespace must not be empty")
 	assert.Nil(t, loader)
@@ -2212,7 +2250,7 @@ func TestPebbleRejectsInvalidNamespace(t *testing.T) {
 	_, err = factory.NewKV("../escaped-ns", 7, proto.KeySortingType_HIERARCHICAL)
 	assert.ErrorContains(t, err, "invalid path traversal sequence")
 
-	_, err = factory.NewSnapshotLoader(context.Background(), "../escaped-ns", 7, 0)
+	_, err = factory.NewSnapshotLoader(context.Background(), "../escaped-ns", 7, SnapshotLoaderOptions{})
 	assert.ErrorContains(t, err, "invalid path traversal sequence")
 
 	// The data dir is a t.TempDir(), so its parent is the per-test temp root
@@ -2436,7 +2474,7 @@ func TestPebbleBatchPutMarshalableFailsWhenMarshalingFillsLessThanItsSize(t *tes
 
 func TestPebbleSnapshotLoaderAddChunkRejectsUnfinishedFile(t *testing.T) {
 	factory := newMemFactory(t, memFSWithRoom(), nil)
-	loader, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, 0)
+	loader, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, SnapshotLoaderOptions{})
 	require.NoError(t, err)
 
 	require.NoError(t, loader.AddChunk("a", 0, 2, []byte("first")))
@@ -2489,7 +2527,7 @@ func TestPebbleSnapshotLoaderFailsOnFilesystemErrors(t *testing.T) {
 			}))
 			factory := newMemFactory(t, fs, nil)
 
-			loader, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, 0)
+			loader, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, SnapshotLoaderOptions{})
 			if test.step == nil {
 				assert.ErrorIs(t, err, errorfs.ErrInjected)
 				return
@@ -2910,7 +2948,7 @@ func addChunks(t *testing.T, loader SnapshotLoader, chunks []snapshotChunk) {
 // installSnapshot installs the chunks as the database of shard 1.
 func installSnapshot(t *testing.T, factory Factory, chunks []snapshotChunk) {
 	t.Helper()
-	loader, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, 0)
+	loader, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, SnapshotLoaderOptions{})
 	require.NoError(t, err)
 	addChunks(t, loader, chunks)
 	require.NoError(t, loader.Install(noCheck, noLogClear))
