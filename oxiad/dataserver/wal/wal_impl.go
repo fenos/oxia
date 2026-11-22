@@ -73,6 +73,31 @@ func (*walFactory) Close() error {
 	return nil
 }
 
+// ClearShard clears the WAL of a shard that no controller has open, e.g. once
+// a snapshot replaced the database its entries belong to.
+func ClearShard(f Factory, namespace string, shard int64) error {
+	w, err := f.NewWal(namespace, shard, noCommitOffset{})
+	if err != nil {
+		return errors.Wrap(err, "failed to open the WAL")
+	}
+	if err = multierr.Append(w.Clear(), w.Close()); err != nil {
+		return errors.Wrap(err, "failed to clear the WAL")
+	}
+	return nil
+}
+
+// noCommitOffset is the commit offset provider of a WAL opened only to be
+// cleared: nothing is applied from it.
+type noCommitOffset struct{}
+
+func (noCommitOffset) CommitOffset() int64 {
+	return InvalidOffset
+}
+
+func (noCommitOffset) FlushDatabase() error {
+	return nil
+}
+
 type wal struct {
 	sync.RWMutex
 
@@ -756,7 +781,24 @@ func (t *wal) clearWithoutLock() error {
 	t.lastAppendedOffset.Store(InvalidOffset)
 	t.lastSyncedOffset.Store(InvalidOffset)
 	t.firstOffset.Store(InvalidOffset)
+
+	// A crash must not bring back the removed segments: the caller may rely
+	// on their removal, e.g. once a snapshot replaced the database they
+	// belong to
+	if err = multierr.Append(syncDir(t.fs, t.walPath), syncDir(t.fs, filepath.Dir(t.walPath))); err != nil {
+		t.writeErrors.Inc()
+		return errors.Wrap(err, "failed to sync the cleared wal")
+	}
 	return nil
+}
+
+// syncDir makes the entries of the directory at path durable.
+func syncDir(fs vfs.FS, path string) error {
+	dir, err := fs.Open(path)
+	if err != nil {
+		return err
+	}
+	return multierr.Append(dir.Sync(), dir.Close())
 }
 
 func (t *wal) Delete() error {

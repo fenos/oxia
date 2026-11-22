@@ -2185,6 +2185,89 @@ func TestWalSyncDoesNotUndoConcurrentTruncateLog(t *testing.T) {
 	assert.NoError(t, w.Close())
 }
 
+func TestClearShardRemovesTheEntries(t *testing.T) {
+	f := NewTestWalFactory(t)
+	w, err := f.NewWal(constant.DefaultNamespace, shard, nil)
+	require.NoError(t, err)
+	appendEntries(t, w, 1, 0, 2, "v")
+	require.NoError(t, w.Close())
+
+	require.NoError(t, ClearShard(f, constant.DefaultNamespace, shard))
+
+	w, err = f.NewWal(constant.DefaultNamespace, shard, nil)
+	require.NoError(t, err)
+	assert.EqualValues(t, InvalidOffset, w.LastOffset())
+	assert.NoError(t, w.Close())
+}
+
+func TestClearShardFailsWhenTheWalCannotBeOpened(t *testing.T) {
+	err := ClearShard(NewTestWalFactory(t), "", shard)
+	assert.ErrorContains(t, err, "failed to open the WAL")
+}
+
+func TestClearShardFailsWhenTheWalCannotBeCleared(t *testing.T) {
+	fs := newFaultFS()
+	options := &FactoryOptions{BaseWalDir: t.TempDir(), SegmentSize: 128, fs: fs}
+	fs.failNth(opSync, walPath(options.BaseWalDir, constant.DefaultNamespace, shard), 1)
+
+	err := ClearShard(NewWalFactory(options), constant.DefaultNamespace, shard)
+	assert.ErrorIs(t, err, errInjected)
+	assert.ErrorContains(t, err, "failed to clear the WAL")
+}
+
+func TestNoCommitOffsetAppliesNothing(t *testing.T) {
+	assert.EqualValues(t, InvalidOffset, noCommitOffset{}.CommitOffset())
+	assert.NoError(t, noCommitOffset{}.FlushDatabase())
+}
+
+func TestWalClearSyncsTheWalDirectory(t *testing.T) {
+	fs := newFaultFS()
+	w := newFaultWal(t, fs, false)
+	appendEntries(t, w, 1, 0, 2, "v")
+	var synced []string
+	var mu sync.Mutex
+	fs.setHook(func(op fsOp, name string) error {
+		if op == opSync {
+			mu.Lock()
+			synced = append(synced, name)
+			mu.Unlock()
+		}
+		return nil
+	})
+
+	require.NoError(t, w.Clear())
+
+	mu.Lock()
+	defer mu.Unlock()
+	// A crash must not bring back the segments of a cleared wal: the caller
+	// may rely on it, e.g. once a snapshot replaced the database
+	assert.Contains(t, synced, w.walPath)
+	assert.Contains(t, synced, filepath.Dir(w.walPath))
+	assert.NoError(t, w.Close())
+}
+
+func TestWalClearFailsWhenTheWalDirectoryCannotBeSynced(t *testing.T) {
+	for _, test := range []struct {
+		op  fsOp
+		dir func(walPath string) string
+	}{
+		{opSync, func(walPath string) string { return walPath }},
+		{opSync, filepath.Dir},
+		// The wal directory is opened to list its segments too: open the
+		// parent's, which only the sync opens
+		{opOpenFile, filepath.Dir},
+	} {
+		fs := newFaultFS()
+		w := newFaultWal(t, fs, false)
+		appendEntries(t, w, 1, 0, 2, "v")
+		fs.failNth(test.op, test.dir(w.walPath), 1)
+
+		assert.ErrorIs(t, w.Clear(), errInjected)
+
+		assert.NoError(t, w.Close())
+	}
+}
+
 func TestWalClearFailsWhenSegmentCannotBeReopened(t *testing.T) {
 	fs := newFaultFS()
 	w := newFaultWal(t, fs, false)
