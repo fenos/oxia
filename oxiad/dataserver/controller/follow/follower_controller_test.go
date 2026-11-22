@@ -850,6 +850,9 @@ func prepareTestDb(t *testing.T, term int64) kvstore.Snapshot {
 	snapshot, err := db.Snapshot()
 	assert.NoError(t, err)
 
+	// The database stops its notification trimmer: left running, it reads the
+	// files the test's cleanup deletes
+	assert.NoError(t, db.Close())
 	assert.NoError(t, kvFactory.Close())
 
 	return snapshot
