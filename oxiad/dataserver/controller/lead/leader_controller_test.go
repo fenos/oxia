@@ -5690,3 +5690,30 @@ func TestLeaderController_SeededFollowerBehindTheWalOfTheLeaderGetsASnapshot(t *
 		})
 	}
 }
+
+// A follower that missed the election of a leader seeded from a snapshot, and
+// comes back with an entry of the snapshot's term past the snapshot's last
+// entry, isn't kept: its entry there is one the old leader never got
+// committed, while the leader's entry at that offset is of its own term, so
+// streaming the next entries would let the logs diverge. The leader refuses it,
+// as before.
+func TestLeaderController_SeededLeaderRefusesALateFollowerPastTheSnapshot(t *testing.T) {
+	rpcClient := rpc.NewMockRpcClient()
+	lc, closeAll := newSeededLeader(t, rpcClient, 1)
+	defer closeAll()
+
+	_, err := lc.BecomeLeader(context.Background(), &proto.BecomeLeaderRequest{
+		Shard: 1, Term: 2, ReplicationFactor: 1, FollowerMaps: map[string]*proto.EntryId{},
+	})
+	require.NoError(t, err)
+	// The leader commits its entry 10, of its term 2: the leader can stream
+	// after 10
+	shard := int64(1)
+	_, err = lc.WriteBlock(context.Background(), &proto.WriteRequest{Shard: &shard,
+		Puts: []*proto.PutRequest{{Key: "k", Value: []byte("v")}}})
+	require.NoError(t, err)
+
+	commitOffset := int64(9)
+	_, err = lc.(*leaderController).truncateFollowerIfNeeded("late", 1, &proto.EntryId{Term: 1, Offset: 10}, &commitOffset)
+	assert.ErrorIs(t, err, constant.ErrInvalidTerm)
+}
