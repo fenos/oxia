@@ -16,8 +16,11 @@ package election
 
 import (
 	"context"
+	"fmt"
 	"io"
+	"iter"
 	"log/slog"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"slices"
@@ -31,6 +34,7 @@ import (
 	coordoption "github.com/oxia-db/oxia/oxiad/coordinator/option"
 
 	"github.com/oxia-db/oxia/oxiad/common/async"
+	"github.com/oxia-db/oxia/oxiad/common/entry"
 
 	"github.com/oxia-db/oxia/oxiad/common/errs"
 	"github.com/oxia-db/oxia/oxiad/common/feature"
@@ -1686,4 +1690,116 @@ func TestElectionSnapshotHeadsRankByOffset(t *testing.T) {
 
 	leader, _ = e.chooseLeader(sharding.Candidates{s1: head(2, 5), s2: head(1, 5), s3: head(-1, 4)}, nil)
 	assert.Equal(t, s1, leader, "known terms rank by term first")
+}
+
+// A snapshot's head that ties the highest WAL head doesn't make way for a
+// longer WAL of an older term. W holds every committed entry through 10, of
+// term 5; S is a snapshot at 10; W2 is a stale leader of term 4 whose entries
+// 10 to 20 were never committed: electing it would overwrite the committed
+// entry 10. Whatever the order of the fence's answers, W or S leads. A
+// snapshot ahead of the highest WAL head leads, over a longer WAL of an older
+// term too.
+func TestElectionSnapshotHeadsRankWhateverTheOrderOfTheAnswers(t *testing.T) {
+	w, s, w2 := testDataServer("w"), testDataServer("s"), testDataServer("w2")
+	head := func(term, offset int64) sharding.Candidate {
+		return sharding.Candidate{HeadEntryId: &proto.EntryId{Term: term, Offset: offset}}
+	}
+	committed := func(term, offset, commitOffset int64) sharding.Candidate {
+		return sharding.Candidate{HeadEntryId: &proto.EntryId{Term: term, Offset: offset}, CommitOffset: &commitOffset}
+	}
+	for _, test := range []struct {
+		name   string
+		heads  sharding.Candidates
+		leader *proto.DataServerIdentity
+	}{
+		{"the snapshot ties a committed head", sharding.Candidates{w: committed(5, 10, 10), s: head(-1, 10), w2: head(4, 20)}, w},
+		{"the snapshot ties a head not known to be committed", sharding.Candidates{w: head(5, 10), s: head(-1, 10), w2: head(4, 20)}, s},
+		{"the snapshot is ahead of the highest WAL head", sharding.Candidates{w: head(5, 10), s: head(-1, 15), w2: head(4, 20)}, s},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			// The map's order of iteration, and so of the answers, varies
+			for range 500 {
+				e := &election{logger: slog.New(slog.DiscardHandler), meta: &proto.ShardMetadata{}}
+				leader, _ := e.chooseLeader(test.heads, nil)
+				require.Equal(t, test.leader.GetNameOrDefault(), leader.GetNameOrDefault())
+			}
+		})
+	}
+}
+
+// The highest heads don't depend on the order of the fence's answers: every
+// permutation of a random set of heads, snapshots' among them, folds into the
+// same data servers. With heads of WAL entries only, they are upstream's: the
+// highest term, then offset.
+func TestElectionHighestHeadsDontDependOnTheOrderOfTheAnswers(t *testing.T) {
+	random := rand.New(rand.NewPCG(1, 2))
+	for range 500 {
+		count := 2 + random.IntN(4)
+		servers := make([]*proto.DataServerIdentity, count)
+		heads := make([]*proto.EntryId, count)
+		walOnly := true
+		for i := range count {
+			servers[i] = testDataServer(fmt.Sprintf("s%d", i))
+			heads[i] = &proto.EntryId{Term: int64(random.IntN(4)) - 1, Offset: int64(random.IntN(6)) - 1}
+			walOnly = walOnly && !isSnapshotHead(heads[i])
+		}
+
+		var first []string
+		for order := range permutations(count) {
+			var folded headMax
+			for _, i := range order {
+				folded.offer(servers[i], heads[i])
+			}
+			highest := names(folded.highest())
+			if first == nil {
+				first = highest
+			}
+			require.Equal(t, first, highest, "heads %v in the order %v", heads, order)
+		}
+
+		if walOnly {
+			var upstream []*proto.DataServerIdentity
+			for i, head := range heads {
+				if slices.ContainsFunc(heads, func(other *proto.EntryId) bool { return entry.Compare(other, head) > 0 }) {
+					continue
+				}
+				upstream = append(upstream, servers[i])
+			}
+			require.Equal(t, names(upstream), first, "heads %v", heads)
+		}
+	}
+}
+
+// permutations yields every order of the indexes 0 to count-1.
+func permutations(count int) iter.Seq[[]int] {
+	return func(yield func([]int) bool) {
+		var permute func(order []int, rest []int) bool
+		permute = func(order []int, rest []int) bool {
+			if len(rest) == 0 {
+				return yield(order)
+			}
+			for i, next := range rest {
+				others := append(slices.Clone(rest[:i]), rest[i+1:]...)
+				if !permute(append(slices.Clone(order), next), others) {
+					return false
+				}
+			}
+			return true
+		}
+		rest := make([]int, count)
+		for i := range rest {
+			rest[i] = i
+		}
+		permute(nil, rest)
+	}
+}
+
+// names are the sorted names of the data servers.
+func names(servers []*proto.DataServerIdentity) []string {
+	result := make([]string, 0, len(servers))
+	for _, server := range servers {
+		result = append(result, server.GetNameOrDefault())
+	}
+	slices.Sort(result)
+	return result
 }

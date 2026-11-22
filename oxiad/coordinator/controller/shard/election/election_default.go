@@ -305,17 +305,14 @@ gracePeriod:
 //	           +----------------------+
 func (e *election) chooseLeader(ensembleHeads sharding.Candidates, retainedHeads sharding.Candidates) (
 	leader *proto.DataServerIdentity, followers sharding.Candidates) {
-	var mostUpToDate []*proto.DataServerIdentity
-	var highest *proto.EntryId
-	for i, candidates := range []sharding.Candidates{ensembleHeads, retainedHeads} {
-		for server, candidate := range candidates {
-			if highest == nil || compareHeads(candidate.HeadEntryId, highest) > 0 {
-				highest, mostUpToDate = candidate.HeadEntryId, []*proto.DataServerIdentity{server}
-			} else if i == 0 && compareHeads(candidate.HeadEntryId, highest) == 0 {
-				// Visited first, the ensemble wins a tie
-				mostUpToDate = append(mostUpToDate, server)
-			}
-		}
+	mostUpToDate := highestHeads(ensembleHeads, retainedHeads)
+	// The ensemble wins a tie: the data server removed by the change leads only
+	// when it is ahead of every fenced member
+	if members := slices.DeleteFunc(slices.Clone(mostUpToDate), func(server *proto.DataServerIdentity) bool {
+		_, retained := retainedHeads[server]
+		return retained
+	}); len(members) > 0 {
+		mostUpToDate = members
 	}
 	slices.SortStableFunc(mostUpToDate, func(a, b *proto.DataServerIdentity) int {
 		return cmp.Compare(rankTie(ensembleHeads[a]), rankTie(ensembleHeads[b]))
@@ -820,35 +817,101 @@ func isSnapshotHead(head *proto.EntryId) bool {
 	return head.GetTerm() == unknownTerm && head.GetOffset() >= 0
 }
 
-// compareHeads ranks the heads of two fenced data servers by how up to date
-// they are.
+// highestHeads returns the fenced data servers with the most up-to-date
+// heads: the ones that hold every committed entry. It takes the maximum of
+// each kind of head on its own, then compares the two, so that the result
+// doesn't depend on the order in which the data servers answered the fence:
 //
-// Two heads of WAL entries rank by term, then by offset, as entry.Compare
-// does: an entry of a higher term overrides one of a lower term at the same
-// offset, so the higher term holds every entry the other could have committed.
+//  1. Heads of WAL entries rank by term, then by offset, as entry.Compare
+//     does and as upstream ranks every head: an entry of a higher term
+//     overrides one of a lower term at the same offset, so the highest holds
+//     every entry the others could have committed.
+//  2. A data server whose WAL is empty, e.g. one seeded by a snapshot with
+//     nothing appended since, reports the commit offset of its database with
+//     an unknown term. Its database applies only committed entries, and a
+//     committed entry is never overwritten, so its head holds exactly the
+//     committed entries up to its offset. These heads rank by offset.
+//  3. The highest of each kind rank by offset. A snapshot at a higher offset
+//     than the highest WAL head holds committed entries that WAL lacks; at a
+//     lower offset, the WAL may hold committed entries beyond it; at the same
+//     offset both hold every committed entry, and both are the highest.
 //
-// A data server whose WAL is empty, e.g. one seeded by a snapshot with
-// nothing appended since, reports the commit offset of its database with an
-// unknown term. Its database applies only committed entries, and a committed
-// entry is never overwritten, so its head holds exactly the committed entries
-// up to its offset, whatever their terms. Against the head of a WAL entry it
-// therefore ranks by offset alone: a head at a higher offset may hold
-// committed entries beyond it, so it is ahead; one at a lower offset lacks a
-// committed entry the snapshot holds, so it is behind; and at the same offset
-// both hold every committed entry, so they tie. Ranked term first instead,
-// the snapshot's head would always lose: an idle shard couldn't elect a
-// member seeded by a snapshot over its old leader, and so never remove that
-// leader.
-func compareHeads(a *proto.EntryId, b *proto.EntryId) int {
-	if isSnapshotHead(a) != isSnapshotHead(b) {
-		return cmp.Compare(a.GetOffset(), b.GetOffset())
+// The choice is so upstream's unless the highest WAL head lacks committed
+// entries that a snapshot holds. Ranking every head term first instead, a
+// snapshot's head always loses, and an idle shard can't elect a member seeded
+// by a snapshot over its old leader. Ranking a snapshot's head against each
+// WAL head by offset, in one running maximum, isn't transitive: a snapshot
+// that ties the highest WAL head would make way for a longer WAL of an older
+// term, whose entries could differ from the committed ones.
+//
+// A WAL of an older term longer than every snapshot still wins over them, as
+// upstream: only the term of a snapshot's last entry would tell whether that
+// WAL's entries up to the snapshot's offset are the committed ones.
+func highestHeads(candidateSets ...sharding.Candidates) []*proto.DataServerIdentity {
+	var heads headMax
+	for _, candidates := range candidateSets {
+		for server, candidate := range candidates {
+			heads.offer(server, candidate.HeadEntryId)
+		}
 	}
-	return entry.Compare(a, b)
+	return heads.highest()
+}
+
+// headMax folds the fenced heads, in any order, into the highest ones (see
+// highestHeads).
+type headMax struct {
+	wal      highest
+	snapshot highest
+}
+
+func (m *headMax) offer(server *proto.DataServerIdentity, head *proto.EntryId) {
+	if isSnapshotHead(head) {
+		m.snapshot.offer(server, head, compareOffsets)
+	} else {
+		m.wal.offer(server, head, entry.Compare)
+	}
+}
+
+func (m *headMax) highest() []*proto.DataServerIdentity {
+	if m.snapshot.head == nil {
+		return m.wal.servers
+	}
+	if m.wal.head == nil {
+		return m.snapshot.servers
+	}
+	switch compareOffsets(m.snapshot.head, m.wal.head) {
+	case 1:
+		return m.snapshot.servers
+	case -1:
+		return m.wal.servers
+	default:
+		return append(slices.Clone(m.wal.servers), m.snapshot.servers...)
+	}
+}
+
+// highest is the highest head offered, by an order of heads of one kind, and
+// the data servers at it.
+type highest struct {
+	head    *proto.EntryId
+	servers []*proto.DataServerIdentity
+}
+
+func (h *highest) offer(server *proto.DataServerIdentity, head *proto.EntryId,
+	compare func(a *proto.EntryId, b *proto.EntryId) int) {
+	if h.head == nil || compare(head, h.head) > 0 {
+		h.head, h.servers = head, []*proto.DataServerIdentity{server}
+	} else if compare(head, h.head) == 0 {
+		h.servers = append(h.servers, server)
+	}
+}
+
+func compareOffsets(a *proto.EntryId, b *proto.EntryId) int {
+	return cmp.Compare(a.GetOffset(), b.GetOffset())
 }
 
 // rankTie orders the candidates tied at the highest head, the first to lead.
 // A head of a snapshot ties with the head of a WAL entry at the same offset
-// (see compareHeads), but they aren't as good a leader:
+// (see highestHeads), but they aren't as good a leader:
 //   - a WAL whose entries are all committed, its commit offset at its head,
 //     goes first: it holds every committed entry, and as the leader it can
 //     match the entries of its followers against its own;
@@ -907,23 +970,7 @@ func (e *election) settleGrowth(ensembleHeads sharding.Candidates) error {
 		return nil
 	}
 	isTo := dataserver.MatchDataServer(change.To)
-	var highest *proto.EntryId
-	toIsHighest := false
-	for server, candidate := range ensembleHeads {
-		if highest == nil {
-			highest, toIsHighest = candidate.HeadEntryId, isTo(server)
-			continue
-		}
-		switch c := compareHeads(candidate.HeadEntryId, highest); {
-		case c > 0:
-			highest, toIsHighest = candidate.HeadEntryId, isTo(server)
-		case c == 0:
-			toIsHighest = toIsHighest || isTo(server)
-		default:
-			// Behind the highest head
-		}
-	}
-	if toIsHighest {
+	if slices.ContainsFunc(highestHeads(ensembleHeads), isTo) {
 		e.logger.Info("The data server added by the growth of the ensemble caught up, the growth is finished",
 			slog.Any("to", change.To))
 		e.meta.EnsembleChange = nil
