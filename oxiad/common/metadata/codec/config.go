@@ -41,8 +41,11 @@ func (configCodec) Clone(value *commonproto.ClusterConfiguration) *commonproto.C
 	return gproto.Clone(value).(*commonproto.ClusterConfiguration) //nolint:revive
 }
 
+// MarshalYAML renders a copy of value: the YAML encoder reads the messages by
+// reflection, state included, which another goroutine may set meanwhile by
+// rendering one of them, e.g. a data server it logs.
 func (configCodec) MarshalYAML(value *commonproto.ClusterConfiguration) ([]byte, error) {
-	return yamlv3.Marshal(value)
+	return yamlv3.Marshal(gproto.Clone(value))
 }
 
 func (configCodec) UnmarshalJSON(data []byte) (*commonproto.ClusterConfiguration, error) {

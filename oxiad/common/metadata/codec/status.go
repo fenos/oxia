@@ -40,8 +40,11 @@ func (statusCodec) NewZero() *commonproto.ClusterStatus {
 	return &commonproto.ClusterStatus{}
 }
 
+// MarshalYAML renders a copy of value: the YAML encoder reads the messages by
+// reflection, state included, which another goroutine may set meanwhile by
+// rendering one of them, e.g. a data server it logs.
 func (statusCodec) MarshalYAML(value *commonproto.ClusterStatus) ([]byte, error) {
-	return yamlv3.Marshal(value)
+	return yamlv3.Marshal(gproto.Clone(value))
 }
 
 func (statusCodec) UnmarshalJSON(data []byte) (*commonproto.ClusterStatus, error) {

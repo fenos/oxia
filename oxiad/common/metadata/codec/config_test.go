@@ -15,9 +15,12 @@
 package codec
 
 import (
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	commonproto "github.com/oxia-db/oxia/common/proto"
 )
 
 func TestConfigCodecUnmarshalYAMLRejectsInvalidYAML(t *testing.T) {
@@ -30,4 +33,21 @@ func TestConfigCodecUnmarshalJSONRejectsInvalidJSON(t *testing.T) {
 	config, err := ClusterConfigCodec.UnmarshalJSON([]byte(`{"servers": "not a list"}`))
 	require.Error(t, err)
 	require.Nil(t, config)
+}
+
+// The configuration renders to YAML while other goroutines use the data
+// servers it holds, e.g. to log them.
+func TestConfigCodecMarshalYAMLWhileTheDataServersAreLogged(t *testing.T) {
+	identity := &commonproto.DataServerIdentity{Public: "s1:6648", Internal: "s1:6649"}
+	config := &commonproto.ClusterConfiguration{Servers: []*commonproto.DataServerIdentity{identity}}
+
+	var wg sync.WaitGroup
+	wg.Go(func() { _ = identity.String() })
+	data, err := ClusterConfigCodec.MarshalYAML(config)
+	wg.Wait()
+
+	require.NoError(t, err)
+	decoded, err := ClusterConfigCodec.UnmarshalYAML(data)
+	require.NoError(t, err)
+	require.Equal(t, "s1:6648", decoded.GetServers()[0].GetPublic())
 }
