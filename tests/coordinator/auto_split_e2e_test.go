@@ -18,6 +18,7 @@ import (
 	"cmp"
 	"context"
 	"fmt"
+	"io"
 	"math"
 	"math/rand"
 	"slices"
@@ -43,11 +44,16 @@ import (
 // enough data is written to exceed it, and the test asserts that the
 // coordinator splits the shard on its own (no manual InitiateSplit call).
 func TestCoordinator_AutoSplit(t *testing.T) {
-	// Servers run under t.Context() and are torn down at test end; we only need
-	// their addresses here.
-	_, sa1 := newServer(t)
-	_, sa2 := newServer(t)
-	_, sa3 := newServer(t)
+	// The servers close before the test removes their directories: the
+	// databases of a server left open read their files on their own
+	s1, sa1 := newServer(t)
+	s2, sa2 := newServer(t)
+	s3, sa3 := newServer(t)
+	defer func() {
+		for _, s := range []io.Closer{s1, s2, s3} {
+			assert.NoError(t, s.Close())
+		}
+	}()
 
 	metadataProvider := memory.NewProvider(metadatacodec.ClusterStatusCodec, metadatacommon.WatchDisabled, "")
 	clusterConfig := newClusterConfig([]*proto.Namespace{{
