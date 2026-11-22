@@ -747,22 +747,16 @@ func (fc *followerController) InstallSnapshot(stream proto.OxiaLogReplication_Se
 		}
 	}()
 
-	fc.rwMutex.Lock()
-	defer fc.rwMutex.Unlock()
-
-	if fc.closed.Load() { // double check
-		return constant.ErrResourceConflict
-	}
-
-	if fc.logSynchronizer.IsValid() {
-		err = constant.ErrResourceConflict
+	// A follower that replicates refuses the install at once, rather than
+	// once the leader sent the first chunk
+	fc.rwMutex.RLock()
+	err = fc.installConflict()
+	fc.rwMutex.RUnlock()
+	if err != nil {
 		return err
 	}
 
-	// Read the first chunk to validate the term before performing any
-	// destructive operations (WAL clear, DB close). This ensures the
-	// follower remains usable if the snapshot has a wrong term.
-	term := fc.term.Load()
+	// The first chunk tells the size of the snapshot, and its term
 	firstChunk, err := stream.Recv()
 	switch {
 	case err != nil:
@@ -772,18 +766,15 @@ func (fc *followerController) InstallSnapshot(stream proto.OxiaLogReplication_Se
 		return errors.Wrapf(multierr.Combine(constant.ErrResourceUnavailable, err), "failed to read first snapshot chunk")
 	case firstChunk == nil:
 		return nil
-	case term != constant.I64NegativeOne && firstChunk.Term != constant.I64NegativeOne && term != firstChunk.Term:
-		// The follower could be left with term=-1 by a previous failed
-		// attempt at sending the snapshot. It's ok to proceed in that case.
-		err = constant.ErrInvalidTerm
-		return err
 	}
 
 	// The snapshot is received beside the database: the follower keeps its
-	// WAL and its database until the snapshot is complete and checked
+	// WAL and its database until the snapshot is complete and checked. The
+	// loader waits for the install of another shard: not under the lock,
+	// which a new term and the close of the follower take, and not after
+	// the close
 	var loader kvstore.SnapshotLoader
-	loader, err = fc.kvFactory.NewSnapshotLoader(stream.Context(), fc.namespace, fc.shardId, fc.snapshotSize(firstChunk))
-	if err != nil {
+	if loader, err = fc.newSnapshotLoader(stream.Context(), firstChunk); err != nil {
 		return errors.Wrapf(multierr.Combine(constant.ErrResourceUnavailable, err), "failed to create snapshot loader")
 	}
 	defer func() {
@@ -791,6 +782,24 @@ func (fc *followerController) InstallSnapshot(stream proto.OxiaLogReplication_Se
 		// install, or when the shard opens again
 		_ = loader.Close()
 	}()
+
+	fc.rwMutex.Lock()
+	defer fc.rwMutex.Unlock()
+
+	// The follower may have closed, or a stream started, while the loader
+	// waited
+	if err = fc.installConflict(); err != nil {
+		return err
+	}
+
+	// Validate the term before performing any destructive operations (DB
+	// close, swap). The follower could be left with term=-1 by a previous
+	// failed attempt at sending the snapshot. It's ok to proceed in that case.
+	if term := fc.term.Load(); term != constant.I64NegativeOne && firstChunk.Term != constant.I64NegativeOne &&
+		term != firstChunk.Term {
+		err = constant.ErrInvalidTerm
+		return err
+	}
 
 	totalSize, err := fc.loadSnapshotChunks(loader, firstChunk, stream)
 	if err != nil {
@@ -812,11 +821,13 @@ func (fc *followerController) InstallSnapshot(stream proto.OxiaLogReplication_Se
 		}
 	}()
 	// Pebble closes the database even when Close reports an error (e.g. leaked
-	// iterators), so a failed close is recovered by re-opening it as well
-	oldDb := fc.db
-	fc.db = nil
-	if err = oldDb.Close(); err != nil {
-		return errors.Wrapf(multierr.Combine(constant.ErrResourceUnavailable, err), "failed to close Database")
+	// iterators), so a failed close is recovered by re-opening it as well. A
+	// follower that failed to recover from an earlier install has none
+	if oldDb := fc.db; oldDb != nil {
+		fc.db = nil
+		if err = oldDb.Close(); err != nil {
+			return errors.Wrapf(multierr.Combine(constant.ErrResourceUnavailable, err), "failed to close Database")
+		}
 	}
 	if err = loader.Install(func(dir string) error { return checkSnapshot(dir, firstChunk) }, fc.wal.Clear); err != nil {
 		return errors.Wrapf(multierr.Combine(constant.ErrResourceUnavailable, err), "failed to install snapshot")
@@ -856,12 +867,39 @@ func (fc *followerController) InstallSnapshot(stream proto.OxiaLogReplication_Se
 	return nil
 }
 
+// installConflict returns constant.ErrResourceConflict when the follower can't
+// install a snapshot: once closed, and while a stream replicates to it. Must
+// be called while holding the lock.
+func (fc *followerController) installConflict() error {
+	if fc.closed.Load() || fc.logSynchronizer.IsValid() {
+		return constant.ErrResourceConflict
+	}
+	return nil
+}
+
+// newSnapshotLoader returns the loader of a snapshot, once the installs of the
+// other shards let it start. It stops waiting when ctx is done or the
+// follower closes.
+func (fc *followerController) newSnapshotLoader(ctx context.Context, firstChunk *proto.SnapshotChunk) (
+	kvstore.SnapshotLoader, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stop := context.AfterFunc(fc.ctx, cancel)
+	defer stop()
+	return fc.kvFactory.NewSnapshotLoader(ctx, fc.namespace, fc.shardId, fc.snapshotSize(firstChunk))
+}
+
 // snapshotSize returns the size of the snapshot that the leader announced on
 // its first chunk. A leader that doesn't announce it sends a snapshot of the
-// shard: the database it replaces gives an estimate.
+// shard: the database it replaces gives an estimate, if the follower has one.
 func (fc *followerController) snapshotSize(firstChunk *proto.SnapshotChunk) int64 {
 	if manifest := firstChunk.GetManifest(); manifest != nil {
 		return manifest.TotalSize
+	}
+	fc.rwMutex.RLock()
+	defer fc.rwMutex.RUnlock()
+	if fc.db == nil {
+		return 0
 	}
 	return int64(fc.db.RawKV().DiskSpaceUsage())
 }

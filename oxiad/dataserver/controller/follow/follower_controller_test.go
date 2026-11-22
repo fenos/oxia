@@ -3559,6 +3559,8 @@ func TestFollowerControllerRejectsRequestsOnceClosed(t *testing.T) {
 // A request waiting for the lock of the follower while it closes is rejected
 // once it gets the lock.
 func TestFollowerControllerRejectsRequestsClosedWhileWaitingForTheLock(t *testing.T) {
+	// An install takes the lock once it read the first chunk
+	chunks := snapshotChunks(t, 1)
 	for _, test := range []struct {
 		name string
 		call func(fc FollowerController) error
@@ -3575,7 +3577,7 @@ func TestFollowerControllerRejectsRequestsClosedWhileWaitingForTheLock(t *testin
 			return err
 		}},
 		{"install-snapshot", func(fc FollowerController) error {
-			return fc.InstallSnapshot(newSnapshotStream(nil))
+			return fc.InstallSnapshot(newSnapshotStream(chunks))
 		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -3987,7 +3989,8 @@ func TestFollowerControllerInstallSnapshotRecoversFromFailures(t *testing.T) {
 }
 
 // A follower that fails to install a snapshot, and then to complete the
-// install or to re-open its database, is left without a database.
+// install or to re-open its database, is left without a database, until a
+// snapshot installs again.
 func TestFollowerControllerInstallSnapshotFailsToRecoverDatabase(t *testing.T) {
 	failing := func() error { return errors.New("injected") }
 	for _, test := range []struct {
@@ -4007,14 +4010,62 @@ func TestFollowerControllerInstallSnapshotFailsToRecoverDatabase(t *testing.T) {
 			kvFactory.setHooks(func(h *kvHooks) { *h = test.kvHooks })
 			err := fc.InstallSnapshot(newSnapshotStream(snapshotChunks(t, 1)))
 			assert.ErrorContains(t, err, test.err)
-			fci := fc.(*followerController)
-			assert.Nil(t, fci.db)
+			assert.Nil(t, fc.(*followerController).db)
 
-			// Close needs the database: release the rest
-			fci.cancel()
-			fci.waitGroup.Wait()
 			walFactory.setHooks(func(h *walHooks) { *h = walHooks{} })
-			assert.NoError(t, fci.wal.Close())
+			kvFactory.setHooks(func(h *kvHooks) { *h = kvHooks{} })
+			require.NoError(t, fc.InstallSnapshot(newSnapshotStream(snapshotChunks(t, 1))))
+			assert.EqualValues(t, 99, fc.CommitOffset())
+			assert.NoError(t, fc.Close())
+		})
+	}
+}
+
+// A follower whose install waits for the install of another shard can be
+// fenced, and closed, meanwhile.
+func TestFollowerControllerInstallSnapshotWaitsForAnotherShardOutsideTheLock(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		// interrupt fences or closes the follower while it waits
+		interrupt func(fc FollowerController) error
+		err       error
+	}{
+		{"new-term", func(fc FollowerController) error {
+			_, err := fc.NewTerm(&proto.NewTermRequest{Term: 2})
+			return err
+		}, constant.ErrInvalidTerm},
+		{"close", FollowerController.Close, context.Canceled},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			walFactory, kvFactory := newHookFactories(t)
+			fc := newFencedFollower(t, walFactory, kvFactory)
+			occupant, err := kvFactory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 99, 0)
+			require.NoError(t, err)
+
+			stream := rpc.NewMockServerSendSnapshotStream()
+			chunks := snapshotChunks(t, 1)
+			for _, chunk := range chunks {
+				stream.AddChunk(chunk)
+			}
+			close(stream.Chunks)
+			installErr := make(chan error, 1)
+			go func() { installErr <- fc.InstallSnapshot(stream) }()
+			// The install read the first chunk, and waits for the other shard
+			require.Eventually(t, func() bool { return len(stream.Chunks) == len(chunks)-1 }, 10*time.Second,
+				time.Millisecond)
+
+			interrupted := make(chan error, 1)
+			go func() { interrupted <- test.interrupt(fc) }()
+			select {
+			case err := <-interrupted:
+				require.NoError(t, err)
+			case <-time.After(10 * time.Second):
+				require.FailNow(t, "the follower waited for the install of another shard")
+			}
+
+			require.NoError(t, occupant.Close())
+			assert.ErrorIs(t, <-installErr, test.err)
+			assert.NoError(t, fc.Close())
 		})
 	}
 }
