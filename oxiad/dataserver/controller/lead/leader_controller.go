@@ -144,8 +144,14 @@ type leaderController struct {
 	// became leader. It's used in the logic for deciding where to
 	// truncate the followers. A node seeded from a snapshot, with an empty
 	// WAL, became leader at the snapshot's commit offset, with an invalid
-	// term, as GetLogState reported its head to the election.
+	// term.
 	leaderElectionHeadEntryId *proto.EntryId
+	// seededTerm is the term of the last entry the database of a node seeded
+	// from a snapshot applied, when it became leader with an empty WAL:
+	// GetLogState reported its head to the election with it. It is
+	// wal.InvalidTerm for a leader with entries in its WAL, and for a
+	// database that a binary which didn't record the term left.
+	seededTerm int64
 
 	// The database commit offset: the last entry applied to the database. It's
 	// the commit offset reported to the WAL, starting from the WAL recovery.
@@ -458,10 +464,11 @@ func (lc *leaderController) becomeLeader(ctx context.Context, req *proto.BecomeL
 		return err
 	}
 
-	leaderCommitOffset, err := lc.db.ReadCommitOffset()
+	leaderCommit, err := lc.db.ReadCommitEntryId()
 	if err != nil {
 		return err
 	}
+	leaderCommitOffset := leaderCommit.Offset
 
 	// A leader seeded from a snapshot, like the first leader of a split child,
 	// has an empty wal while its database is already at the snapshot's commit
@@ -469,8 +476,10 @@ func (lc *leaderController) becomeLeader(ctx context.Context, req *proto.BecomeL
 	// take the ones at or below it as committed without any ack, and the
 	// followers seeded from the same snapshot drop them as duplicates.
 	headOffset := max(lc.leaderElectionHeadEntryId.Offset, leaderCommitOffset)
+	lc.seededTerm = wal.InvalidTerm
 	if lc.leaderElectionHeadEntryId.Term == wal.InvalidTerm {
 		lc.leaderElectionHeadEntryId = &proto.EntryId{Term: wal.InvalidTerm, Offset: headOffset}
+		lc.seededTerm = leaderCommit.Term
 	}
 	lc.quorumAckTracker = NewQuorumAckTracker(req.GetReplicationFactor(), headOffset, leaderCommitOffset)
 	lc.registerOffsetGauges(lc.quorumAckTracker)
@@ -487,13 +496,9 @@ func (lc *leaderController) becomeLeader(ctx context.Context, req *proto.BecomeL
 		}
 	}
 
-	// The entries of the wal are committed before the leader serves, or it
-	// could miss them: the ones not committed yet are with an entry of the term
-	commitOffset := lc.leaderElectionHeadEntryId.Offset
-	if headOffset > leaderCommitOffset {
-		if commitOffset, err = lc.appendTermEntry(term); err != nil {
-			return err
-		}
+	commitOffset, err := lc.appendTermEntryIfNeeded(term, headOffset, leaderCommit)
+	if err != nil {
+		return err
 	}
 	if err = lc.quorumAckTracker.WaitForCommitOffset(ctx, commitOffset); err != nil {
 		return err
@@ -567,6 +572,28 @@ func (lc *leaderController) becomeLeader(ctx context.Context, req *proto.BecomeL
 // quorum includes a replica whose head has this term or a later one: the
 // leader it elects has the entries before it. As Raft's leader does with a
 // no-op entry, the leader only commits its entries through one of its term.
+// appendTermEntryIfNeeded returns the offset the new leader waits to commit
+// before it serves, after it appends an entry of its term when it needs one.
+//
+// The entries of the wal are committed before the leader serves, or it could
+// miss them: the ones not committed yet are with an entry of the term. A
+// database that doesn't hold the term of its last applied entry, left by a
+// binary that didn't record it, gets an entry of the term too: the first
+// leader after the upgrade appends it once, and once it is applied, the
+// database holds a term that the snapshots it seeds replicas with carry. The
+// entry is a no-op of the leader's term, the entry a Raft leader appends at
+// the start of each of its terms: it is replicated and committed as any
+// other, so it changes no state but the head, and the replicas that apply it
+// all record its term.
+func (lc *leaderController) appendTermEntryIfNeeded(term int64, headOffset int64,
+	leaderCommit *proto.EntryId) (int64, error) {
+	unknownTerm := leaderCommit.Offset != wal.InvalidOffset && leaderCommit.Term == wal.InvalidTerm
+	if headOffset > leaderCommit.Offset || unknownTerm {
+		return lc.appendTermEntry(term)
+	}
+	return lc.leaderElectionHeadEntryId.Offset, nil
+}
+
 func (lc *leaderController) appendTermEntry(term int64) (int64, error) {
 	offset := lc.quorumAckTracker.NextOffset()
 	if err := lc.wal.Append(&proto.LogEntry{Term: term, Offset: offset, Value: commonentry.NoOpValue,
@@ -957,19 +984,7 @@ func (lc *leaderController) truncateFollowerIfNeeded(follower string, shardId in
 		}
 		return constant2.InvalidEntryId, nil
 	}
-	if lc.leaderElectionHeadEntryId.Term == wal.InvalidTerm &&
-		followerHeadEntryId.Offset <= lc.leaderElectionHeadEntryId.Offset {
-		// The leader was seeded from a snapshot and had no entry in its wal
-		// when it became leader: its entries up to the snapshot's commit
-		// offset are in its database only, and it can't match the entries of
-		// the follower against them. A follower that isn't ahead of the
-		// snapshot starts over from a snapshot of the leader, whose
-		// installation wipes the data it has. That loses nothing: all the
-		// entries up to the snapshot's offset are committed, so each entry of
-		// the follower is either the committed one at its offset, which the
-		// snapshot holds, or one that never got committed. A follower ahead
-		// of the snapshot could hold entries of this term, committed ones
-		// included: it isn't reset, and fails the check below
+	if lc.leaderElectionHeadEntryId.Term == wal.InvalidTerm && lc.resetsSeededFollower(followerHeadEntryId) {
 		return constant2.InvalidEntryId, nil
 	}
 
@@ -1064,6 +1079,39 @@ func (lc *leaderController) truncateFollowerIfNeeded(follower string, shardId in
 // to offset, and that has no other entry. The leader committed that offset, so
 // its own entries up to it are the same, and its wal must have every entry
 // after it, or the leader must have none.
+// resetsSeededFollower reports whether a leader seeded from a snapshot, which
+// had no entry in its wal when it became leader, starts the follower over
+// from a snapshot of it. Its entries up to the snapshot's last entry N are in
+// its database only, and it can't match the entries of the follower against
+// them; the follower's installation of the snapshot wipes the data it has.
+//
+// It does for a follower that loses no committed entry so:
+//   - Every entry up to N is committed, as the database applies only
+//     committed entries. A follower that isn't ahead of N holds at each
+//     offset the committed entry, which the snapshot holds, or an entry that
+//     never got committed.
+//   - With the term t of the entry at N known, a follower whose last entry is
+//     of an earlier term holds, past N, entries that never got committed, at
+//     any offset. The terms of the entries of a log never decrease, so an
+//     entry of a term before t can't follow the entry of term t at N in the
+//     log of a leader of term t or later; and the leader of an earlier term
+//     couldn't commit it, as the election of this leader, ranking its head
+//     term first, would have found it on a fenced replica.
+//
+// A follower of term t ahead of N, or of a later term, could hold entries of
+// this leader's term, committed ones included: it isn't reset, and fails the
+// checks of truncateFollowerIfNeeded. So does a follower ahead of N when the
+// term of the entry at N is unknown, in a database that a binary which didn't
+// record it left.
+func (lc *leaderController) resetsSeededFollower(followerHeadEntryId *proto.EntryId) bool {
+	n := lc.leaderElectionHeadEntryId.Offset
+	if lc.seededTerm == wal.InvalidTerm {
+		return followerHeadEntryId.Offset <= n
+	}
+	return followerHeadEntryId.Term < lc.seededTerm ||
+		(followerHeadEntryId.Term == lc.seededTerm && followerHeadEntryId.Offset <= n)
+}
+
 func (lc *leaderController) canStreamAfter(offset int64) bool {
 	commitOffset := lc.quorumAckTracker.CommitOffset()
 	if offset == wal.InvalidOffset || offset > commitOffset {
@@ -1845,7 +1893,7 @@ func getLastEntryIdInWal(walObject wal.Wal) (*proto.EntryId, error) {
 }
 
 func GetLogState(walObject wal.Wal, db database.DB) (*proto.EntryId, int64, error) {
-	commitOffset, err := db.ReadCommitOffset()
+	commit, err := db.ReadCommitEntryId()
 	if err != nil {
 		return nil, wal.InvalidOffset, err
 	}
@@ -1853,10 +1901,14 @@ func GetLogState(walObject wal.Wal, db database.DB) (*proto.EntryId, int64, erro
 	if err != nil {
 		return nil, wal.InvalidOffset, err
 	}
-	if headEntryId.Offset == wal.InvalidOffset && commitOffset != wal.InvalidOffset {
-		headEntryId = &proto.EntryId{Term: wal.InvalidTerm, Offset: commitOffset}
+	if headEntryId.Offset == wal.InvalidOffset && commit.Offset != wal.InvalidOffset {
+		// A replica seeded from a snapshot: its head is the last entry its
+		// database applied, with that entry's term, Raft's last included term
+		// of the snapshot. It is wal.InvalidTerm for a database that a binary
+		// which didn't record it left.
+		headEntryId = commit
 	}
-	return headEntryId, commitOffset, nil
+	return headEntryId, commit.Offset, nil
 }
 
 // CommitOffset is the offset of the last entry applied to the database, rather

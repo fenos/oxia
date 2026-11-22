@@ -842,7 +842,7 @@ func prepareTestDb(t *testing.T, term int64) kvstore.Snapshot {
 				Key:   fmt.Sprintf("key-%d", i),
 				Value: []byte(fmt.Sprintf("value-%d", i)),
 			}},
-		}, 0, int64(i), 0, database.NoOpCallback)
+		}, term, int64(i), 0, database.NoOpCallback)
 		assert.NoError(t, err)
 	}
 	assert.NoError(t, db.UpdateTerm(term, database.TermOptions{}))
@@ -1058,7 +1058,7 @@ func sendSnapshot(t *testing.T, stream *rpc.MockServerSendSnapshotStream, snapsh
 // A follower seeded from a snapshot has an empty wal, while its database holds
 // the entries up to the snapshot's commit offset. Fenced with a new term, it
 // must report them, so that an election doesn't take it for a follower without
-// any data.
+// any data, with the term of the last one, which the snapshot carries.
 func TestFollower_NewTermAfterSnapshot(t *testing.T) {
 	var shardId int64
 	kvFactory, err := kvstore.NewPebbleKVFactory(kvstore.NewFactoryOptionsForTest(t))
@@ -1077,7 +1077,7 @@ func TestFollower_NewTermAfterSnapshot(t *testing.T) {
 
 	res, err := fc.NewTerm(&proto.NewTermRequest{Term: 2})
 	require.NoError(t, err)
-	assertProtoEqual(t, &proto.EntryId{Term: wal.InvalidTerm, Offset: 99}, res.HeadEntryId)
+	assertProtoEqual(t, &proto.EntryId{Term: 1, Offset: 99}, res.HeadEntryId)
 
 	assert.NoError(t, fc.Close())
 	assert.NoError(t, kvFactory.Close())
