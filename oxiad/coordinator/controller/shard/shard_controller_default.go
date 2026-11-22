@@ -39,7 +39,6 @@ import (
 	coordmetadata "github.com/oxia-db/oxia/oxiad/coordinator/metadata"
 	"github.com/oxia-db/oxia/oxiad/coordinator/rpc"
 
-	"github.com/oxia-db/oxia/common"
 	"github.com/oxia-db/oxia/common/channel"
 	"github.com/oxia-db/oxia/common/constant"
 	"github.com/oxia-db/oxia/common/process"
@@ -226,7 +225,8 @@ func NewController(
 func (s *controller) Dispatch(ac action.Action) {
 	s.terminationMu.RLock()
 	defer s.terminationMu.RUnlock()
-	if s.terminating.Load() {
+	// A controller that stopped on its own, see stopRemoved, has no event loop
+	if s.terminating.Load() || s.ctx.Err() != nil {
 		ac.Error(constant.ErrResourceUnavailable)
 		return
 	}
@@ -247,19 +247,24 @@ func (s *controller) Dispatch(ac action.Action) {
 	}
 }
 
+// stopRemoved stops the controller of a shard that was removed, which it found
+// out handling an event: e.g. the children of a split aborted meanwhile, or a
+// shard whose deletion finished elsewhere. There is nothing left to control,
+// and an election would bring the shard back. The event loop ends, what is
+// sent to the controller fails, and whoever removed the shard closes it.
+func (s *controller) stopRemoved(handling string) {
+	s.logger.Info("The shard was removed, stopping its controller", slog.String("handling", handling))
+	s.ctxCancel()
+}
+
 func (s *controller) run(bo backoff.BackOff) error {
 	borrowedMeta, exists, err := s.metadataStore.GetShardStatus(s.namespace, s.shard)
 	if err != nil {
 		return err
 	}
 	if !exists {
-		// The status of a shard is stored before its controller is created,
-		// so the shard was removed since, e.g. a child of a split that was
-		// aborted right after it was initiated. Its remover closes the
-		// controller; until then, there is nothing to control, and an
-		// election would bring the shard back.
-		s.logger.Info("The shard was removed before its controller started, stopping the controller")
-		s.ctxCancel()
+		// The status of a shard is stored before its controller is created
+		s.stopRemoved("starting")
 		return nil
 	}
 	initShardMeta := borrowedMeta.UnsafeBorrow()
@@ -396,9 +401,11 @@ func (s *controller) handleDataServerFailureWithRetries(failedDataServer *proto.
 		time.AfterFunc(time.Second, func() { s.BecameUnavailable(failedDataServer) })
 		return
 	}
-	shardMeta := common.Must(borrowedMeta, exists,
-		"bug: shard metadata missing while handling data server failure: namespace=", s.namespace, " shard=",
-		s.shard).UnsafeBorrow()
+	if !exists {
+		s.stopRemoved("a data server failure")
+		return
+	}
+	shardMeta := borrowedMeta.UnsafeBorrow()
 	s.logger.Debug(
 		"Received notification of failed data server",
 		slog.Any("failed-data-server", failedDataServer.GetNameOrDefault()),
@@ -437,9 +444,11 @@ func (s *controller) handleFeaturesDiscoveredWithRetries() {
 		})
 		return
 	}
-	shardMeta := common.Must(borrowedMeta, exists,
-		"bug: shard metadata missing while handling discovered features: namespace=", s.namespace, " shard=",
-		s.shard).UnsafeBorrow()
+	if !exists {
+		s.stopRemoved("the discovered features")
+		return
+	}
+	shardMeta := borrowedMeta.UnsafeBorrow()
 	if slices.ContainsFunc(shardMeta.Ensemble, func(member *proto.DataServerIdentity) bool {
 		_, found := discovered[member.GetNameOrDefault()]
 		return found
@@ -651,9 +660,12 @@ func (s *controller) handleElectionWithRetries(electionAction *action.ElectionAc
 		time.AfterFunc(time.Second, func() { s.Dispatch(electionAction) })
 		return
 	}
-	shardMeta := common.Must(borrowedMeta, exists,
-		"bug: shard metadata missing while starting election: namespace=", s.namespace, " shard=",
-		s.shard).UnsafeBorrow()
+	if !exists {
+		s.stopRemoved("an election")
+		electionAction.Error(constant.ErrResourceUnavailable)
+		return
+	}
+	shardMeta := borrowedMeta.UnsafeBorrow()
 	leader, err := s.electLeader(shardMeta, nil, electionAction.PreferredLeader)
 	if err != nil {
 		electionAction.Error(errors.Wrap(errs.ErrUnavailable, "the election failed to elect a leader"))
@@ -722,9 +734,12 @@ func (s *controller) deleteShard() error {
 	if err != nil {
 		return err
 	}
-	shardMeta := gproto.CloneOf(common.Must(borrowedMeta, exists,
-		"bug: shard metadata missing while deleting shard: namespace=", s.namespace, " shard=",
-		s.shard).UnsafeBorrow())
+	if !exists {
+		// Its deletion finished already
+		s.stopRemoved("the deletion")
+		return nil
+	}
+	shardMeta := gproto.CloneOf(borrowedMeta.UnsafeBorrow())
 	if s.currentElection != nil {
 		s.currentElection.Cancel()
 		s.currentElection = nil
@@ -832,9 +847,12 @@ func (s *controller) onChangeEnsemble(changeEnsembleAction *action.ChangeEnsembl
 		changeEnsembleAction.Error(err)
 		return
 	}
-	shardMeta := common.Must(borrowedMeta, exists,
-		"bug: shard metadata missing while changing the ensemble: namespace=", s.namespace, " shard=",
-		s.shard).UnsafeBorrow()
+	if !exists {
+		s.stopRemoved("a change of the ensemble")
+		changeEnsembleAction.Error(constant.ErrResourceUnavailable)
+		return
+	}
+	shardMeta := borrowedMeta.UnsafeBorrow()
 	// The data server removed by the pending change may still hold committed
 	// entries that the ensemble doesn't: a second change would let a fence
 	// quorum miss them
@@ -893,9 +911,11 @@ func (s *controller) Refresh() {
 		s.logger.Warn("Failed to refresh the ensemble addresses", slog.Any("error", err))
 		return
 	}
-	shardMeta := common.Must(borrowedMeta, exists,
-		"bug: shard metadata missing while syncing server addresses: namespace=", s.namespace, " shard=",
-		s.shard).UnsafeBorrow()
+	if !exists {
+		s.stopRemoved("a refresh of the ensemble addresses")
+		return
+	}
+	shardMeta := borrowedMeta.UnsafeBorrow()
 	needSync := false
 	for _, candidate := range shardMeta.Ensemble {
 		// A data server that left keeps the addresses it drains from, also
@@ -937,9 +957,11 @@ func (s *controller) handlePeriodicTasks() {
 		s.logger.Warn("Failed to handle the periodic tasks, retrying next round", slog.Any("error", err))
 		return
 	}
-	shardMeta := common.Must(borrowedMeta, exists,
-		"bug: shard metadata missing while handling periodic tasks: namespace=", s.namespace, " shard=",
-		s.shard).UnsafeBorrow()
+	if !exists {
+		s.stopRemoved("the periodic tasks")
+		return
+	}
+	shardMeta := borrowedMeta.UnsafeBorrow()
 
 	if len(shardMeta.PendingDeleteShardNodes) > 0 {
 		if err := s.handlePendingDeleteShard(shardMeta); err != nil {

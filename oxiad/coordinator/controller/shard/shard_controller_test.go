@@ -2758,6 +2758,7 @@ func TestControllerHandlePeriodicTasksKeepsSplitUpdates(t *testing.T) {
 func TestControllerDispatchElectionDiscardsWhenQueueIsFull(t *testing.T) {
 	var shard int64 = 5
 	s := &controller{
+		ctx:        t.Context(),
 		shard:      shard,
 		electionOp: make(chan *action.ElectionAction, chanBufferSize),
 		logger:     slog.Default(),
@@ -3916,7 +3917,7 @@ func TestControllerBecameDrainedQueuesNothing(t *testing.T) {
 }
 
 func TestControllerDispatchPanicsOnUnknownAction(t *testing.T) {
-	s := &controller{shard: 5, logger: slog.Default()}
+	s := &controller{ctx: t.Context(), shard: 5, logger: slog.Default()}
 	assert.PanicsWithValue(t, "unknown action type: *shard.unknownAction", func() {
 		s.Dispatch(&unknownAction{})
 	})
@@ -4701,6 +4702,147 @@ func TestControllerOfAShardRemovedBeforeItStartedStops(t *testing.T) {
 	ac := action.NewChangeEnsembleAction(shard, s1, testDataServer("s2"))
 	sc.Dispatch(ac)
 	assert.NoError(t, sc.Close())
+	_, err := ac.Wait(t.Context())
+	assert.ErrorIs(t, err, constant.ErrResourceUnavailable)
+}
+
+// A controller that finds its shard removed while it handles an event, as the
+// children of a split aborted while their controllers run, stops on its own:
+// it elects nothing, so it doesn't bring the shard back, what it was handling
+// fails, and it closes.
+func TestControllerOfAShardRemovedWhileItRunsStops(t *testing.T) {
+	var shard int64 = 3
+	s1, s2 := testDataServer("s1"), testDataServer("s2")
+	for _, test := range []struct {
+		name     string
+		interval time.Duration
+		// land sends the event to the controller, and returns how to wait
+		// for the action it fails, if any
+		land func(sc *controller) func() error
+	}{
+		{name: "data server failure", land: func(sc *controller) func() error {
+			sc.BecameUnavailable(s1)
+			return nil
+		}},
+		{name: "discovered features", land: func(sc *controller) func() error {
+			sc.FeaturesDiscovered(s1)
+			return nil
+		}},
+		{name: "election", land: func(sc *controller) func() error {
+			ac := action.NewElectionAction(shard)
+			sc.Dispatch(ac)
+			return func() error {
+				_, err := ac.Wait(t.Context())
+				return err
+			}
+		}},
+		{name: "change of the ensemble", land: func(sc *controller) func() error {
+			ac := action.NewChangeEnsembleAction(shard, s1, s2)
+			sc.Dispatch(ac)
+			return func() error {
+				_, err := ac.Wait(t.Context())
+				return err
+			}
+		}},
+		{name: "deletion", land: func(sc *controller) func() error {
+			sc.Delete()
+			return nil
+		}},
+		{name: "refresh of the addresses", land: func(sc *controller) func() error {
+			sc.Refresh()
+			return nil
+		}},
+		{name: "periodic tasks", interval: 10 * time.Millisecond, land: func(*controller) func() error {
+			return nil
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			rpc := rpctest.NewRpcProvider()
+			metadata := newTestMetadata(t, memory.NewProvider(metadatacodec.ClusterStatusCodec, metadatacommon.WatchDisabled, ""),
+				&proto.ClusterConfiguration{})
+			shardMeta := &proto.ShardMetadata{
+				Status:           proto.ShardStatusSteadyState,
+				Term:             1,
+				Leader:           s1,
+				Ensemble:         []*proto.DataServerIdentity{s1},
+				EnsembleCaughtUp: true,
+			}
+			storeTestShardMetadata(t, metadata, constant.DefaultNamespace, shard, namespaceConfig, shardMeta)
+			rpc.GetNode(s1).GetStatusResponse(1, proto.ServingStatus_LEADER, 0, 0)
+			interval := test.interval
+			if interval == 0 {
+				interval = DefaultPeriodicTasksInterval
+			}
+			sc := NewController(constant.DefaultNamespace, shard, namespaceConfig, shardMeta, metadata,
+				feature.NoOpSupplier, nil, rpc, interval).(*controller)
+			t.Cleanup(func() { assert.NoError(t, sc.Close()) })
+			rpc.GetNode(s1).ExpectGetStatusRequest(t, shard)
+
+			// A change without a target fails once the event loop read the
+			// status: the loop is then waiting for the next event
+			invalid := action.NewChangeEnsembleAction(shard, s1, nil)
+			sc.Dispatch(invalid)
+			_, err := invalid.Wait(t.Context())
+			require.ErrorIs(t, err, errs.ErrInvalidArgument)
+
+			require.NoError(t, metadata.DeleteShardStatus(constant.DefaultNamespace, shard))
+			wait := test.land(sc)
+
+			select {
+			case <-sc.ctx.Done():
+			case <-time.After(10 * time.Second):
+				require.FailNow(t, "the controller of a removed shard kept running")
+			}
+			if wait != nil {
+				assert.ErrorIs(t, wait(), constant.ErrResourceUnavailable)
+			}
+			rpc.GetNode(s1).ExpectNoMoreNewTermRequest(t)
+			_, exists := testShardMetadata(metadata, constant.DefaultNamespace, shard)
+			assert.False(t, exists)
+
+			after := action.NewElectionAction(shard)
+			sc.Dispatch(after)
+			_, err = after.Wait(t.Context())
+			assert.ErrorIs(t, err, constant.ErrResourceUnavailable, "a stopped controller fails what it is sent at once")
+		})
+	}
+}
+
+// checkedContext reports the first check of its error, once it is read.
+type checkedContext struct {
+	context.Context
+	once    sync.Once
+	checked chan struct{}
+}
+
+func (c *checkedContext) Err() error {
+	err := c.Context.Err()
+	c.once.Do(func() { close(c.checked) })
+	return err
+}
+
+// A change of the ensemble that waits for room in the queue fails when the
+// controller stops meanwhile.
+func TestControllerDispatchChangeEnsembleFailsWhenTheControllerStopsMeanwhile(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	checked := &checkedContext{Context: ctx, checked: make(chan struct{})}
+	s := &controller{
+		ctx:              checked,
+		shard:            5,
+		changeEnsembleOp: make(chan *action.ChangeEnsembleAction),
+		logger:           slog.Default(),
+	}
+	ac := action.NewChangeEnsembleAction(5, testDataServer("s1"), testDataServer("s2"))
+	dispatched := make(chan struct{})
+	go func() {
+		defer close(dispatched)
+		s.Dispatch(ac)
+	}()
+
+	// The queue has no room: once the context was checked, the dispatch waits
+	<-checked.checked
+	cancel()
+	<-dispatched
 	_, err := ac.Wait(t.Context())
 	assert.ErrorIs(t, err, constant.ErrResourceUnavailable)
 }
