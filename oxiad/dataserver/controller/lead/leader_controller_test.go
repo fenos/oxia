@@ -3958,7 +3958,7 @@ func TestNewLeaderControllerCompletesAnInterruptedSnapshotInstall(t *testing.T) 
 	require.NoError(t, err)
 	addSnapshotChunks(t, loader, 10)
 	errCrash := errors.New("crash")
-	require.ErrorIs(t, loader.Install(func(string) error { return nil }, func() error { return errCrash }), errCrash)
+	require.ErrorIs(t, loader.Install(func(string) error { return nil }, nil, func() error { return errCrash }), errCrash)
 	require.NoError(t, loader.Close())
 
 	_, err = NewLeaderController(&option.StorageOptions{}, constant.DefaultNamespace, shard, rpc.NewMockRpcClient(),

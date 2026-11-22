@@ -196,7 +196,7 @@ func (p *PebbleFactory) returnMemTableSlot() {
 }
 
 func (p *PebbleFactory) NewKV(namespace string, shardId int64, keySorting proto.KeySortingType) (KV, error) {
-	return newKVPebble(p, namespace, shardId, keySorting, p.options.Failpoints)
+	return newKVPebble(p, namespace, shardId, p.getKVPath(namespace, shardId), keySorting, p.options.Failpoints)
 }
 
 func (p *PebbleFactory) NewSnapshotLoader(ctx context.Context, namespace string, shardId int64,
@@ -358,7 +358,10 @@ type Pebble struct {
 	failpoints *failpoint.Failpoints
 }
 
-func newKVPebble(factory *PebbleFactory, namespace string, shardId int64, keySorting proto.KeySortingType, failpoints *failpoint.Failpoints) (KV, error) {
+// newKVPebble opens the database of a shard at dbPath: where the shard keeps
+// it, or the stage of a snapshot to install in its place.
+func newKVPebble(factory *PebbleFactory, namespace string, shardId int64, dbPath string,
+	keySorting proto.KeySortingType, failpoints *failpoint.Failpoints) (KV, error) {
 	if err := validation.ValidateNamespace(namespace); err != nil {
 		return nil, err
 	}
@@ -376,7 +379,7 @@ func newKVPebble(factory *PebbleFactory, namespace string, shardId int64, keySor
 		factory:    factory,
 		namespace:  namespace,
 		shardId:    shardId,
-		dbPath:     factory.getKVPath(namespace, shardId),
+		dbPath:     dbPath,
 		failpoints: failpoints,
 
 		batchCommitLatency: metric.NewLatencyHistogram("oxia_server_kv_batch_commit_latency",
@@ -1575,7 +1578,8 @@ func (sl *pebbleSnapshotLoader) AddChunk(fileName string, chunkIndex int32, chun
 	return nil
 }
 
-func (sl *pebbleSnapshotLoader) Install(check func(dir string) error, clearLog func() error) error {
+func (sl *pebbleSnapshotLoader) Install(check func(dir string) error, prepare func(stage KV) error,
+	clearLog func() error) error {
 	generation := sl.pf.DatabaseGeneration(sl.namespace, sl.shard) + 1
 	err := sl.pf.runInstallSteps(
 		installStep{"check-files", func() error {
@@ -1584,12 +1588,14 @@ func (sl *pebbleSnapshotLoader) Install(check func(dir string) error, clearLog f
 			}
 			return nil
 		}},
-		// The files are synced already. Sync the directory entries too: of the
-		// files, and of the stage
+		installStep{"check-stage", func() error { return check(sl.paths.stage) }},
+		installStep{"prepare-stage", func() error { return sl.prepareStage(prepare) }},
+		// The files are synced already: those of the snapshot, and those that
+		// the database flushed for prepare. Sync the directory entries too: of
+		// the files, and of the stage
 		installStep{"sync-stage", func() error {
 			return multierr.Combine(syncDir(sl.fs, sl.paths.stage), syncDir(sl.fs, filepath.Dir(sl.paths.stage)))
 		}},
-		installStep{"check-stage", func() error { return check(sl.paths.stage) }},
 		installStep{"mark", func() error { return writeInstallMarker(sl.fs, sl.paths.marker, generation) }},
 	)
 	if err != nil {
@@ -1597,6 +1603,21 @@ func (sl *pebbleSnapshotLoader) Install(check func(dir string) error, clearLog f
 	}
 	sl.installing = true
 	return sl.pf.completeInstall(sl.namespace, sl.shard, generation, clearLog)
+}
+
+// prepareStage opens the stage as the database of the shard for prepare, if
+// set, and closes it: closing it flushes what prepare wrote. prepare may close
+// it first.
+func (sl *pebbleSnapshotLoader) prepareStage(prepare func(stage KV) error) error {
+	if prepare == nil {
+		return nil
+	}
+	stage, err := newKVPebble(sl.pf, sl.namespace, sl.shard, sl.paths.stage, proto.KeySortingType_UNKNOWN,
+		sl.pf.options.Failpoints)
+	if err != nil {
+		return errors.Wrap(err, "failed to open the snapshot")
+	}
+	return multierr.Append(prepare(stage), stage.Close())
 }
 
 // completeInstall puts the snapshot of a shard in place once its marker

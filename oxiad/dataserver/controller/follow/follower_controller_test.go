@@ -2158,6 +2158,13 @@ func installSplitTestSnapshot(t *testing.T, fc FollowerController, term int64) {
 // the term of the shard that sends the snapshot.
 func installSplitTestSnapshotWith(t *testing.T, fc FollowerController, term int64, termOptions database.TermOptions) {
 	t.Helper()
+	require.NoError(t, fc.InstallSnapshot(newSnapshotStream(splitTestSnapshotChunks(t, term, termOptions))))
+}
+
+// splitTestSnapshotChunks are the chunks of the snapshot of a parent that holds
+// the keys a..f, of the term with the options termOptions.
+func splitTestSnapshotChunks(t *testing.T, term int64, termOptions database.TermOptions) []*proto.SnapshotChunk {
+	t.Helper()
 
 	parentKvFactory, err := kvstore.NewPebbleKVFactory(kvstore.NewFactoryOptionsForTest(t))
 	require.NoError(t, err)
@@ -2174,15 +2181,11 @@ func installSplitTestSnapshotWith(t *testing.T, fc FollowerController, term int6
 	snapshot, err := parentDb.Snapshot()
 	require.NoError(t, err)
 
-	stream := rpc.NewMockServerSendSnapshotStream()
-	wg := sync.WaitGroup{}
-	wg.Go(func() {
-		assert.NoError(t, fc.InstallSnapshot(stream))
-	})
+	var chunks []*proto.SnapshotChunk
 	for ; snapshot.Valid(); snapshot.Next() {
 		chunk, err := snapshot.Chunk()
 		require.NoError(t, err)
-		stream.AddChunk(&proto.SnapshotChunk{
+		chunks = append(chunks, &proto.SnapshotChunk{
 			Term:       term,
 			Name:       chunk.Name(),
 			Content:    chunk.Content(),
@@ -2190,12 +2193,11 @@ func installSplitTestSnapshotWith(t *testing.T, fc FollowerController, term int6
 			ChunkCount: chunk.TotalCount(),
 		})
 	}
-	close(stream.Chunks)
-	wg.Wait()
 
 	assert.NoError(t, snapshot.Close())
 	assert.NoError(t, parentDb.Close())
 	assert.NoError(t, parentKvFactory.Close())
+	return chunks
 }
 
 // The follower applies the entries to its database, which runs without the
@@ -4263,7 +4265,7 @@ func TestNewFollowerControllerCompletesAnInterruptedSnapshotInstall(t *testing.T
 		require.NoError(t, loader.AddChunk(chunk.Name, chunk.ChunkIndex, chunk.ChunkCount, chunk.Content))
 	}
 	errCrash := errors.New("crash")
-	require.ErrorIs(t, loader.Install(func(string) error { return nil }, func() error { return errCrash }), errCrash)
+	require.ErrorIs(t, loader.Install(func(string) error { return nil }, nil, func() error { return errCrash }), errCrash)
 	require.NoError(t, loader.Close())
 
 	_, err = NewFollowerController(&option.StorageOptions{}, constant.DefaultNamespace, 0, failingWalFactory{},
@@ -4279,14 +4281,78 @@ func TestNewFollowerControllerCompletesAnInterruptedSnapshotInstall(t *testing.T
 	assert.NoError(t, fc.Close())
 }
 
-func TestFollowerControllerInstallSnapshotFailsWhenSplitFilterFails(t *testing.T) {
-	// The term is read when the database opens, then again by the filter
-	var termReads atomic.Int64
-	secondTermReadFails := func(key string) error {
-		if key == constant.InternalKeyPrefix+"term" && termReads.Add(1) == 2 {
-			return errors.New("read failed")
+// A split child records its filter in the snapshot before the snapshot
+// replaces its database: a crash at any step of the install once it replaced
+// it leaves the child with its filter, not with the records of its parent out
+// of its range, whichever filter the term of the parent asks for.
+func TestFollowerControllerInstallSnapshotRecordsTheSplitFilterBeforeTheSwap(t *testing.T) {
+	if !failpoint.Enabled {
+		t.Skip("needs failpoints: disabled by the disable_trap tag")
+	}
+	deferred := database.TermOptions{Features: []proto.Feature{proto.Feature_FEATURE_SPLIT_DEFERRED_FILTER}}
+	for _, step := range []string{"swap", "clear-log", "remove-replaced", "unmark"} {
+		for _, test := range []struct {
+			name        string
+			termOptions database.TermOptions
+		}{{"filtered", database.TermOptions{}}, {"deferred", deferred}} {
+			t.Run(step+"/"+test.name, func(t *testing.T) {
+				crashing := &atomic.Bool{}
+				options := kvstore.NewFactoryOptionsForTest(t)
+				options.Failpoints = failpoint.New(map[string]func() error{"snapshot.install." + step: func() error {
+					if crashing.Load() {
+						return errors.New("crash")
+					}
+					return nil
+				}})
+				kvFactory, err := kvstore.NewPebbleKVFactory(options)
+				require.NoError(t, err)
+				walFactory := newTestWalFactory(t)
+				t.Cleanup(func() {
+					assert.NoError(t, kvFactory.Close())
+					assert.NoError(t, walFactory.Close())
+				})
+				fc := newFencedFollower(t, walFactory, kvFactory)
+				fc.SetSplitHashRange(splitTestHashRange, nil, 1)
+
+				crashing.Store(true)
+				require.Error(t, fc.InstallSnapshot(newSnapshotStream(splitTestSnapshotChunks(t, 1, test.termOptions))))
+				require.Nil(t, fc.(*followerController).db, "the install stops where the crash stops it")
+				require.NoError(t, fc.Close())
+				crashing.Store(false)
+
+				restarted, err := NewFollowerController(&option.StorageOptions{}, constant.DefaultNamespace, 0, walFactory,
+					kvFactory, nil)
+				require.NoError(t, err)
+				db := restarted.(*followerController).db
+				if test.termOptions.Features == nil {
+					assert.Equal(t, &database.SplitFilter{
+						MinHash: splitTestHashRange.Min, MaxHash: splitTestHashRange.Max, ParentTerm: 1,
+					}, db.SplitFilter())
+				} else {
+					assert.Equal(t, &database.DeferredSplitFilter{
+						MinHash: splitTestHashRange.Min, MaxHash: splitTestHashRange.Max, ParentTerm: 1,
+					}, db.DeferredSplitFilter())
+				}
+				assertSplitTestKeys(t, db, map[string]string{
+					"a": "snapshot-a", "b": "snapshot-b", "c": "snapshot-c", "e": "snapshot-e",
+				})
+				assert.NoError(t, restarted.Close())
+			})
 		}
-		return nil
+	}
+}
+
+func TestFollowerControllerInstallSnapshotFailsWhenSplitFilterFails(t *testing.T) {
+	// The first read of a key fails: the filter opens the snapshot, and reads
+	// its term, before the snapshot replaces the database, which reopens
+	firstReadFails := func(failing string) func(key string) error {
+		var reads atomic.Int64
+		return func(key string) error {
+			if key == failing && reads.Add(1) == 1 {
+				return errors.New("read failed")
+			}
+			return nil
+		}
 	}
 	for _, test := range []struct {
 		name  string
@@ -4294,7 +4360,8 @@ func TestFollowerControllerInstallSnapshotFailsWhenSplitFilterFails(t *testing.T
 	}{
 		{"filter", kvHooks{rangeScan: func() error { return errors.New("scan failed") }}},
 		{"record", kvHooks{flush: func() error { return errors.New("flush failed") }}},
-		{"read-term", kvHooks{get: secondTermReadFails}},
+		{"open", kvHooks{get: firstReadFails(constant.InternalKeyPrefix + "last-version-id")}},
+		{"read-term", kvHooks{get: firstReadFails(constant.InternalKeyPrefix + "term")}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			walFactory, kvFactory := newHookFactories(t)
@@ -4306,6 +4373,8 @@ func TestFollowerControllerInstallSnapshotFailsWhenSplitFilterFails(t *testing.T
 			assert.ErrorIs(t, err, constant.ErrResourceUnavailable)
 			assert.ErrorContains(t, err, "failed to filter snapshot for split")
 			assert.NotEqual(t, proto.ServingStatus_FOLLOWER, fc.Status())
+			assert.NotNil(t, fc.(*followerController).db, "the snapshot didn't replace the database, which reopens")
+			assert.EqualValues(t, 0, kvFactory.DatabaseGeneration(constant.DefaultNamespace, 0))
 
 			kvFactory.setHooks(func(h *kvHooks) { *h = kvHooks{} })
 			assert.NoError(t, fc.Close())
@@ -4808,11 +4877,18 @@ func (l *hookSnapshotLoader) AddChunk(fileName string, chunkIndex int32, chunkCo
 	return l.SnapshotLoader.AddChunk(fileName, chunkIndex, chunkCount, content)
 }
 
-func (l *hookSnapshotLoader) Install(check func(dir string) error, clearLog func() error) error {
+// Install runs the hooks of the KV of the database on the snapshot that
+// prepare writes to as well.
+func (l *hookSnapshotLoader) Install(check func(dir string) error, prepare func(stage kvstore.KV) error,
+	clearLog func() error) error {
 	if err := runHook(l.factory.getHooks().install); err != nil {
 		return err
 	}
-	return l.SnapshotLoader.Install(check, clearLog)
+	hooked := prepare
+	if prepare != nil {
+		hooked = func(stage kvstore.KV) error { return prepare(&hookKV{KV: stage, factory: l.factory}) }
+	}
+	return l.SnapshotLoader.Install(check, hooked, clearLog)
 }
 
 // The entries of the terms before a new leader's own, which it sends after its

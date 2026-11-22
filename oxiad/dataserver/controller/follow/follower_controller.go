@@ -828,7 +828,8 @@ func (fc *followerController) InstallSnapshot(stream proto.OxiaLogReplication_Se
 			return errors.Wrapf(multierr.Combine(constant.ErrResourceUnavailable, err), "failed to close Database")
 		}
 	}
-	if err = loader.Install(func(dir string) error { return checkSnapshot(dir, firstChunk) }, fc.wal.Clear); err != nil {
+	if err = loader.Install(func(dir string) error { return checkSnapshot(dir, firstChunk) }, fc.prepareSnapshot(),
+		fc.wal.Clear); err != nil {
 		return errors.Wrapf(multierr.Combine(constant.ErrResourceUnavailable, err), "failed to install snapshot")
 	}
 
@@ -842,14 +843,6 @@ func (fc *followerController) InstallSnapshot(stream proto.OxiaLogReplication_Se
 	fc.commitOffset.Store(rawCommitOffset)
 	fc.lastAppendedOffset.Store(rawCommitOffset)
 	fc.advertisedCommitOffset.Store(rawCommitOffset)
-
-	// If this follower is a split child, filter the snapshot to only retain
-	// keys within the child's hash range.
-	if fc.splitHashRange != nil {
-		if err = filterSplitSnapshot(db, fc.splitHashRange, fc.splitParentHashRange); err != nil {
-			return errors.Wrapf(multierr.Combine(constant.ErrResourceUnavailable, err), "failed to filter snapshot for split")
-		}
-	}
 
 	if err = stream.SendAndClose(&proto.SnapshotResponse{
 		AckOffset: rawCommitOffset,
@@ -999,14 +992,38 @@ func (fc *followerController) reopenAfterFailedInstall(err error) {
 	fc.advertisedCommitOffset.Store(commitOffset)
 }
 
+// prepareSnapshot returns what a split child writes to the snapshot of its
+// parent before the snapshot replaces its database, and nil for another shard:
+// the filter of the split, which keeps the child to its hash range. The
+// snapshot brings it along, so that a crash once it replaced the database
+// can't leave the child with the records of its parent and no filter: the
+// parent doesn't send the snapshot again. Must be called while holding the
+// lock.
+func (fc *followerController) prepareSnapshot() func(stage kvstore.KV) error {
+	if fc.splitHashRange == nil {
+		return nil
+	}
+	hashRange, parentHashRange := fc.splitHashRange, fc.splitParentHashRange
+	retention := fc.storageOptions.Notification.Retention.ToDuration()
+	return func(stage kvstore.KV) error {
+		db, err := database.NewDBWithKV(fc.namespace, fc.shardId, stage, retention, commontime.SystemClock)
+		if err != nil {
+			return errors.Wrap(err, "failed to filter snapshot for split")
+		}
+		err = filterSplitSnapshot(db, hashRange, parentHashRange)
+		return errors.Wrap(multierr.Append(err, db.Close()), "failed to filter snapshot for split")
+	}
+}
+
 // filterSplitSnapshot filters the snapshot of its parent that a split child
-// installed to the child's hash range. When the term of the parent pins
-// FEATURE_SPLIT_DEFERRED_FILTER, the child keeps all the records of its parent
-// until the split completes, and only records the filter, which it applies
-// afterwards (see database.DeferredSplitFilter): the parent accepts as
-// observers only the members of a child that support the features of its
-// term, and every member gets a snapshot of the same term. The range of the
-// parent, if known, places the notifications that such a child inherits.
+// installs to the child's hash range, before the snapshot replaces its
+// database. When the term of the parent pins FEATURE_SPLIT_DEFERRED_FILTER,
+// the child keeps all the records of its parent until the split completes, and
+// only records the filter, which it applies afterwards (see
+// database.DeferredSplitFilter): the parent accepts as observers only the
+// members of a child that support the features of its term, and every member
+// gets a snapshot of the same term. The range of the parent, if known, places
+// the notifications that such a child inherits.
 func filterSplitSnapshot(db database.DB, hashRange *proto.HashRange, parentHashRange *proto.HashRange) error {
 	parentTerm, termOptions, err := db.ReadTerm()
 	if err != nil {
@@ -1029,8 +1046,8 @@ func filterSplitSnapshot(db database.DB, hashRange *proto.HashRange, parentHashR
 	// Record the filter too, for the parent's entries that the child
 	// applies other than as the follower of the parent, e.g. when it
 	// replays them after a restart. Recording it flushes the database,
-	// which runs without the Pebble WAL: once acked, the filtered snapshot
-	// must survive a crash, as the parent doesn't send it again.
+	// which runs without the Pebble WAL: the snapshot replaces the
+	// database of the child filtered, or not at all.
 	return db.SetSplitFilter(&database.SplitFilter{
 		MinHash:    hashRange.GetMin(),
 		MaxHash:    hashRange.GetMax(),

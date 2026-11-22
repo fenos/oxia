@@ -1057,7 +1057,7 @@ func TestPebbleSnapshotLoaderInstallReplacesTheDatabase(t *testing.T) {
 	require.NoError(t, loader.Install(func(dir string) error {
 		checked = append(checked, dir)
 		return nil
-	}, func() error {
+	}, nil, func() error {
 		logClears++
 		return nil
 	}))
@@ -1088,7 +1088,7 @@ func TestPebbleSnapshotLoaderInstallKeepsTheDatabaseWhenTheCheckFails(t *testing
 	addChunks(t, loader, snapshotChunksOf(t, "new"))
 	errCheck := errors.New("the snapshot is not the announced one")
 	logClears := 0
-	err = loader.Install(func(string) error { return errCheck }, func() error {
+	err = loader.Install(func(string) error { return errCheck }, nil, func() error {
 		logClears++
 		return nil
 	})
@@ -1102,6 +1102,106 @@ func TestPebbleSnapshotLoaderInstallKeepsTheDatabaseWhenTheCheckFails(t *testing
 	require.NoError(t, err)
 	assertKeys(t, kv, "old")
 	assert.NoError(t, kv.Close())
+}
+
+// What prepare writes to the snapshot, once checked, is in the database the
+// snapshot replaces, whether prepare closes the snapshot or leaves it to the
+// install.
+func TestPebbleSnapshotLoaderInstallPreparesTheSnapshotBeforeItReplacesTheDatabase(t *testing.T) {
+	for _, closes := range []bool{false, true} {
+		t.Run(fmt.Sprintf("closes=%v", closes), func(t *testing.T) {
+			factory, err := NewPebbleKVFactory(NewFactoryOptionsForTest(t))
+			require.NoError(t, err)
+			defer func() { assert.NoError(t, factory.Close()) }()
+			kv, err := factory.NewKV(constant.DefaultNamespace, 1, proto.KeySortingType_NATURAL)
+			require.NoError(t, err)
+			putKeys(t, kv, "old")
+			require.NoError(t, kv.Close())
+
+			loader, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1,
+				SnapshotLoaderOptions{})
+			require.NoError(t, err)
+			addChunks(t, loader, snapshotChunksOf(t, "new"))
+			var steps []string
+			require.NoError(t, loader.Install(func(string) error {
+				steps = append(steps, "check")
+				return nil
+			}, func(stage KV) error {
+				steps = append(steps, "prepare")
+				assertKeys(t, stage, "new")
+				putKeys(t, stage, "prepared")
+				if closes {
+					return stage.Close()
+				}
+				return nil
+			}, noLogClear))
+			require.NoError(t, loader.Close())
+
+			assert.Equal(t, []string{"check", "prepare"}, steps)
+			assertNoInstallFiles(t, vfs.Default, newInstallPaths(factory.(*PebbleFactory).getKVPath(constant.DefaultNamespace, 1)))
+			kv, err = factory.NewKV(constant.DefaultNamespace, 1, proto.KeySortingType_NATURAL)
+			require.NoError(t, err)
+			assertKeys(t, kv, "new")
+			assertKeys(t, kv, "prepared")
+			assertNoKeys(t, kv, "old")
+			assert.NoError(t, kv.Close())
+		})
+	}
+}
+
+// A snapshot that prepare fails to write to, or that doesn't open as a
+// database, doesn't replace the database.
+func TestPebbleSnapshotLoaderInstallKeepsTheDatabaseWhenThePreparationFails(t *testing.T) {
+	errPrepare := errors.New("the snapshot can't be prepared")
+	unknownEncoding := func(chunks []snapshotChunk) []snapshotChunk {
+		for i, chunk := range chunks {
+			if chunk.name == markerFileName {
+				chunks[i].content = []byte("unknown-format")
+			}
+		}
+		return chunks
+	}
+	for _, test := range []struct {
+		name    string
+		chunks  func([]snapshotChunk) []snapshotChunk
+		prepare func(stage KV) error
+		err     string
+	}{
+		{"prepare", func(chunks []snapshotChunk) []snapshotChunk { return chunks },
+			func(KV) error { return errPrepare }, errPrepare.Error()},
+		{"open", unknownEncoding, func(KV) error { return nil }, "failed to open the snapshot"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			factory, err := NewPebbleKVFactory(NewFactoryOptionsForTest(t))
+			require.NoError(t, err)
+			defer func() { assert.NoError(t, factory.Close()) }()
+			kv, err := factory.NewKV(constant.DefaultNamespace, 1, proto.KeySortingType_NATURAL)
+			require.NoError(t, err)
+			putKeys(t, kv, "old")
+			require.NoError(t, kv.Close())
+
+			loader, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1,
+				SnapshotLoaderOptions{})
+			require.NoError(t, err)
+			addChunks(t, loader, test.chunks(snapshotChunksOf(t, "new")))
+			logClears := 0
+			err = loader.Install(noCheck, test.prepare, func() error {
+				logClears++
+				return nil
+			})
+			assert.ErrorContains(t, err, "failed to prepare stage")
+			assert.ErrorContains(t, err, test.err)
+			require.NoError(t, loader.Close())
+
+			assert.Zero(t, logClears)
+			assert.EqualValues(t, 0, factory.DatabaseGeneration(constant.DefaultNamespace, 1))
+			assertNoInstallFiles(t, vfs.Default, newInstallPaths(factory.(*PebbleFactory).getKVPath(constant.DefaultNamespace, 1)))
+			kv, err = factory.NewKV(constant.DefaultNamespace, 1, proto.KeySortingType_NATURAL)
+			require.NoError(t, err)
+			assertKeys(t, kv, "old")
+			assert.NoError(t, kv.Close())
+		})
+	}
 }
 
 func TestPebbleSnapshotLoaderCloseKeepsTheDatabase(t *testing.T) {
@@ -1135,7 +1235,7 @@ func TestPebbleSnapshotLoaderInstallRefusesAnUnfinishedFile(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, loader.AddChunk("a", 0, 2, []byte("first")))
 
-	err = loader.Install(noCheck, noLogClear)
+	err = loader.Install(noCheck, nil, noLogClear)
 	assert.ErrorContains(t, err, "last file not finished")
 	assert.NoError(t, loader.Close())
 }
@@ -1150,7 +1250,7 @@ func TestPebbleSnapshotLoaderInstallLeavesTheReplacementToRecoveryWhenTheLogClea
 	require.NoError(t, err)
 	addChunks(t, loader, snapshotChunksOf(t, "new"))
 	errClear := errors.New("the log can't be cleared")
-	assert.ErrorIs(t, loader.Install(noCheck, func() error { return errClear }), errClear)
+	assert.ErrorIs(t, loader.Install(noCheck, nil, func() error { return errClear }), errClear)
 	require.NoError(t, loader.Close())
 
 	logClears := 0
@@ -1181,8 +1281,9 @@ func TestPebbleSnapshotLoaderInstallSurvivesACrashAtEveryStep(t *testing.T) {
 		{"create-stage", false},
 		{"check-room", false},
 		{"check-files", false},
-		{"sync-stage", false},
 		{"check-stage", false},
+		{"prepare-stage", false},
+		{"sync-stage", false},
 		{"mark", false},
 		{"swap", true},
 		{"clear-log", true},
@@ -1204,7 +1305,7 @@ func TestPebbleSnapshotLoaderInstallSurvivesACrashAtEveryStep(t *testing.T) {
 			loader, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, SnapshotLoaderOptions{})
 			if err == nil {
 				addChunks(t, loader, chunks)
-				err = loader.Install(noCheck, noLogClear)
+				err = loader.Install(noCheck, nil, noLogClear)
 				require.NoError(t, loader.Close())
 			}
 			require.ErrorIs(t, err, errFailpoint)
@@ -2562,7 +2663,7 @@ func TestPebbleSnapshotLoaderFailsOnFilesystemErrors(t *testing.T) {
 	parent := filepath.Dir(paths.db)
 	addChunk := func(loader SnapshotLoader) error { return loader.AddChunk("a", 0, 1, []byte("content")) }
 	install := func(loader SnapshotLoader) error {
-		return multierr.Append(addChunk(loader), loader.Install(noCheck, noLogClear))
+		return multierr.Append(addChunk(loader), loader.Install(noCheck, nil, noLogClear))
 	}
 	swapped := opIs(errorfs.OpRename, paths.stage)
 	for _, test := range []struct {
@@ -3025,7 +3126,7 @@ func installSnapshot(t *testing.T, factory Factory, chunks []snapshotChunk) {
 	loader, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, SnapshotLoaderOptions{})
 	require.NoError(t, err)
 	addChunks(t, loader, chunks)
-	require.NoError(t, loader.Install(noCheck, noLogClear))
+	require.NoError(t, loader.Install(noCheck, nil, noLogClear))
 	require.NoError(t, loader.Close())
 }
 

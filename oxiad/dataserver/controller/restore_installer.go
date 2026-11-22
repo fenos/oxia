@@ -106,7 +106,7 @@ func (i *installer) Complete(hashRange *proto.HashRange) (commitOffset int64, te
 	err = i.loader.Install(func(dir string) error {
 		_, err := database.ReadCheckpoint(dir)
 		return err
-	}, func() error {
+	}, nil, func() error {
 		return wal.ClearShard(i.walFactory, i.namespace, i.shardId)
 	})
 	if err != nil {

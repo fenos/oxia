@@ -163,11 +163,15 @@ type SnapshotLoader interface {
 	AddChunk(fileName string, chunkIndex int32, chunkCount int32, content []byte) error
 
 	// Install makes the snapshot durable, has check read its directory, and
-	// replaces the database of the shard with it, unless check fails. The
-	// caller has closed the database. clearLog clears the log of the shard,
-	// whose entries belong to the replaced database. Once the replacement
-	// started, a failure leaves it to Factory.RecoverSnapshotInstall.
-	Install(check func(dir string) error, clearLog func() error) error
+	// replaces the database of the shard with it, unless check fails. Before
+	// the replacement, prepare, when set, writes to the snapshot opened as
+	// the database of the shard, which Install closes once prepare returns:
+	// the replacement brings what prepare wrote, at once, a crash included.
+	// The caller has closed the database. clearLog clears the log of the
+	// shard, whose entries belong to the replaced database. Once the
+	// replacement started, a failure leaves it to
+	// Factory.RecoverSnapshotInstall.
+	Install(check func(dir string) error, prepare func(stage KV) error, clearLog func() error) error
 }
 
 type ComparisonType proto.KeyComparisonType

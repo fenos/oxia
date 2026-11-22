@@ -211,7 +211,13 @@ func NewDB(namespace string, shardId int64, factory kvstore.Factory,
 	if err != nil {
 		return nil, err
 	}
+	return NewDBWithKV(namespace, shardId, kv, notificationRetentionTime, clock)
+}
 
+// NewDBWithKV opens the database of a shard on kv, which it owns: it closes kv
+// when it fails to open, and when the database closes.
+func NewDBWithKV(namespace string, shardId int64, kv kvstore.KV, notificationRetentionTime time.Duration,
+	clock time2.Clock) (DB, error) {
 	labels := metric.LabelsForShard(namespace, shardId)
 	db := &db{
 		kv:                    kv,
