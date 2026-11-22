@@ -50,6 +50,8 @@ type scheduler struct {
 	planner    planner.Planner
 	dispatcher dispatcher.Dispatcher
 	collector  *collector.Collector
+	// holds is owned by run
+	holds growthHolds
 
 	splitsCounter metric.Counter
 }
@@ -68,6 +70,7 @@ func New(ctx context.Context, metadata coordmetadata.Metadata, running func(name
 		planner:    p,
 		dispatcher: dispatcher.New(ctx, running, actions),
 		collector:  collector.New(ctx, metadata, running, provider),
+		holds:      make(growthHolds),
 		splitsCounter: metric.NewCounter("oxia_coordinator_autosplit_splits_initiated_total",
 			"Auto-splits started", "count", map[string]any{}),
 	}
@@ -125,6 +128,7 @@ func (s *scheduler) run() {
 			s.logger.Warn("Failed to read the cluster, retrying next round", slog.Any("error", err))
 			continue
 		}
+		s.holds.mark(snap, now)
 		actions, blocked := s.planner.Plan(snap)
 		if len(actions) == 0 {
 			// The splits come last: sample the stats only once nothing else
@@ -136,7 +140,9 @@ func (s *scheduler) run() {
 			s.logger.Warn("A replica on a removed data server is blocked", slog.Any("replica", replica))
 		}
 		succeeded := true
-		for _, result := range s.dispatcher.Dispatch(snap, actions) {
+		results := s.dispatcher.Dispatch(snap, actions)
+		s.holds.account(results, time.Now(), s.logger)
+		for _, result := range results {
 			_, splitting := result.Action.(*action.SplitAction)
 			switch {
 			case result.Err != nil:

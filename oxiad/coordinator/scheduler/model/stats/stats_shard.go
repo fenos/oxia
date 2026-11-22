@@ -26,4 +26,6 @@ type ShardStats struct {
 	// PendingDelete are the data servers whose copy of the shard is still to
 	// be deleted: none of them can be added to the ensemble until it is
 	PendingDelete []string
+	// GrowthHeld is whether the growth of the shard waits after failures
+	GrowthHeld bool
 }

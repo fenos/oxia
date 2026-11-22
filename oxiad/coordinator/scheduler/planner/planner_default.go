@@ -97,8 +97,9 @@ func (p *planner) Plan(s *stats.ClusterStats) ([]action.Action, []model.Blocked)
 }
 
 // grow plans a growth of each steady shard whose ensemble is short of the
-// replication factor of its namespace, before any other op: a raised factor
-// makes the shards durable before they are balanced. Each growth adds one
+// replication factor of its namespace, and whose growth isn't held, before
+// any other op: a raised factor makes the shards durable before they are
+// balanced. Each growth adds one
 // member, the data server that Place would choose among the ones the filters
 // pass, and the next rounds add the others. It returns how many it planned.
 func (p *planner) grow(s *stats.ClusterStats, pl *plan) int {
@@ -107,7 +108,8 @@ func (p *planner) grow(s *stats.ClusterStats, pl *plan) int {
 		ns := s.Namespaces[name]
 		for _, id := range slices.Sorted(maps.Keys(ns.Shards)) {
 			shard := ns.Shards[id]
-			if !shard.Steady || shard.Changing || shard.Splitting || len(shard.Ensemble) >= ns.ReplicationFactor {
+			if !shard.Steady || shard.Changing || shard.Splitting || shard.GrowthHeld ||
+				len(shard.Ensemble) >= ns.ReplicationFactor {
 				continue
 			}
 			if to, ok := p.growthTarget(s, pl, name, id); ok {

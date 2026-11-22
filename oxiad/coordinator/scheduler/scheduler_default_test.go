@@ -339,3 +339,31 @@ func (p *fakeProvider) GetStatus(context.Context, *proto.DataServerIdentity,
 	*proto.GetStatusRequest) (*proto.GetStatusResponse, error) {
 	return &proto.GetStatusResponse{ShardStats: p.stats}, nil
 }
+
+// A shard whose growth fails, e.g. too hot for a new member to catch up with,
+// is held: the next rounds plan its split instead of growing it again.
+func TestSchedulerSplitsAShardWhoseGrowthFails(t *testing.T) {
+	metadata := newFakeMetadata(t)
+	metadata.config.LoadBalancer = &proto.LoadBalancer{ScheduleInterval: "10ms"}
+	metadata.config.AutoSplit = &proto.AutoSplitConfig{Enabled: true, MaxShardSizeMb: 1, StabilizationPeriod: "0s",
+		CooldownPeriod: "1h", CollectionInterval: "10ms"}
+	metadata.namespaces["a"] = &proto.Namespace{Name: "a", ReplicationFactor: 3}
+	metadata.setShards("a", map[int64]*proto.ShardMetadata{1: {Status: proto.ShardStatusSteadyState,
+		Ensemble: identities("n0"), Leader: identities("n0")[0], EnsembleCaughtUp: true,
+		Int32HashRange: &proto.HashRange{Max: math.MaxUint32}}})
+	s := New(t.Context(), metadata, running, &fakeProvider{stats: &proto.ShardStats{DbSizeBytes: 2 << 20}})
+	t.Cleanup(func() { assert.NoError(t, s.Close()) })
+
+	growth := (<-s.GetActions()).(*action.ChangeEnsembleAction)
+	assert.Nil(t, growth.From)
+	growth.Error(errors.New("the new member didn't catch up in time"))
+
+	select {
+	case ac := <-s.GetActions():
+		split, ok := ac.(*action.SplitAction)
+		require.True(t, ok, "the shard is grown again: %T", ac)
+		assert.Equal(t, int64(1), split.GetShard())
+	case <-time.After(10 * time.Second):
+		require.Fail(t, "the split of the held shard is never planned")
+	}
+}

@@ -492,13 +492,14 @@ func TestPlannerPlanGrowsAShardShortOfItsReplicationFactor(t *testing.T) {
 	assert.Len(t, s.GetShard(1).Ensemble, 3)
 }
 
-// A shard grows only when it is steady, with no change or split in progress;
-// one at the replication factor doesn't.
+// A shard grows only when it is steady, with no change or split in progress,
+// and its growth isn't held; one at the replication factor doesn't.
 func TestPlannerPlanGrowsOnlyASteadyShard(t *testing.T) {
 	for name, unsettle := range map[string]func(*stats.ShardStats){
 		"in election": func(shard *stats.ShardStats) { shard.Steady = false },
 		"changing":    func(shard *stats.ShardStats) { shard.Changing = true },
 		"splitting":   func(shard *stats.ShardStats) { shard.Splitting = true },
+		"held":        func(shard *stats.ShardStats) { shard.GrowthHeld = true },
 		"at the replication factor": func(shard *stats.ShardStats) {
 			shard.Ensemble = []string{"n0", "n1", "n2"}
 		},
