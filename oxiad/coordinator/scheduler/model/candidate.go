@@ -29,6 +29,10 @@ const (
 	// Split splits a shard in two children at the middle of its hash range,
 	// placed as new shards. It has no From and no To.
 	Split
+	// Grow adds the member To to the ensemble of a shard that is short of the
+	// replication factor of its namespace, which copies a whole replica onto
+	// To and runs an election. It has no From.
+	Grow
 )
 
 func (k Kind) String() string {
@@ -37,6 +41,8 @@ func (k Kind) String() string {
 		return "transfer-leader"
 	case Split:
 		return "split"
+	case Grow:
+		return "grow"
 	default:
 		return "replace"
 	}

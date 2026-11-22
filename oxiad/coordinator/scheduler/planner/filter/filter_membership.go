@@ -24,7 +24,8 @@ import (
 )
 
 // Membership rejects an op that doesn't fit the ensemble: a replace must move a
-// member to a data server that isn't one, and a transfer must move the
+// member to a data server that isn't one, a growth must add a data server that
+// isn't one, and has no copy left to delete, and a transfer must move the
 // leadership from the leader to another member. A split keeps the members.
 // The candidates are enumerated from the ensemble, so it rejects the pairs
 // that the enumeration yields but that make no sense, e.g. a target that is
@@ -40,6 +41,14 @@ func (Membership) Filter(s *stats.ClusterStats, op model.Candidate) error {
 	switch op.Kind {
 	case model.Split:
 		return nil
+	case model.Grow:
+		if slices.Contains(shard.Ensemble, op.To) {
+			return fmt.Errorf("%w: %q is already a member of shard %d", errs.ErrInvalidArgument, op.To, op.Shard)
+		}
+		if slices.Contains(shard.PendingDelete, op.To) {
+			return fmt.Errorf("%w: the copy of shard %d on %q is still to be deleted", errs.ErrFailedPrecondition,
+				op.Shard, op.To)
+		}
 	case model.TransferLeader:
 		if op.From != shard.Leader {
 			return fmt.Errorf("%w: %q is not the leader of shard %d", errs.ErrInvalidArgument, op.From, op.Shard)

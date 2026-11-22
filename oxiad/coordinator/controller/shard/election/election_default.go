@@ -44,6 +44,7 @@ import (
 	"github.com/oxia-db/oxia/oxiad/coordinator/rpc"
 
 	"github.com/oxia-db/oxia/common/constant"
+	"github.com/oxia-db/oxia/common/failpoint"
 	"github.com/oxia-db/oxia/common/metric"
 	"github.com/oxia-db/oxia/common/process"
 	"github.com/oxia-db/oxia/common/proto"
@@ -65,12 +66,15 @@ type election struct {
 	metadataStore coordmetadata.Metadata
 	// preferredLeader is the data server that a leader transfer asks for, or
 	// empty.
-	preferredLeader  string
-	eventListener    controllerapi.ShardEventListener
-	provider         rpc.ControllerRPCProvider
-	namespace        string
-	shard            int64
-	changeEnsemble   *action.ChangeEnsembleAction
+	preferredLeader string
+	eventListener   controllerapi.ShardEventListener
+	provider        rpc.ControllerRPCProvider
+	namespace       string
+	shard           int64
+	changeEnsemble  *action.ChangeEnsembleAction
+	// undoGrowth undoes a pending growth of the ensemble whose new member isn't
+	// among the highest heads: the growth missed its deadline
+	undoGrowth       bool
 	requiredFeatures []proto.Feature
 	featureSupplier  feature.Supplier
 	shardMailbox     async.Mailbox
@@ -92,8 +96,8 @@ type election struct {
 func (e *election) refreshEnsembleInfo(meta *proto.ShardMetadata) (ensemble []*proto.DataServerIdentity,
 	change *proto.EnsembleChangeMetadata, err error) {
 	servers := meta.Ensemble
-	if meta.EnsembleChange != nil {
-		servers = slices.Concat(servers, []*proto.DataServerIdentity{meta.EnsembleChange.From})
+	if from := meta.GetEnsembleChange().GetFrom(); from != nil {
+		servers = slices.Concat(servers, []*proto.DataServerIdentity{from})
 	}
 	refreshed := make([]*proto.DataServerIdentity, len(servers))
 	for idx, server := range servers {
@@ -131,7 +135,10 @@ func (e *election) refreshEnsembleInfo(meta *proto.ShardMetadata) (ensemble []*p
 			return nil, nil, fmt.Errorf("%w: the pending change of the ensemble adds %q, which isn't a member of it",
 				errs.ErrShardNotElectable, meta.EnsembleChange.To.GetNameOrDefault())
 		}
-		change = &proto.EnsembleChangeMetadata{From: refreshed[len(meta.Ensemble)], To: ensemble[idx]}
+		change = &proto.EnsembleChangeMetadata{To: ensemble[idx]}
+		if meta.EnsembleChange.From != nil {
+			change.From = refreshed[len(meta.Ensemble)]
+		}
 	}
 	return ensemble, change, nil
 }
@@ -143,8 +150,12 @@ func (e *election) fenceQuorum(term int64, options *proto.NewTermOptions, ensemb
 	fenceQuorumTimer := e.newTermQuorumLatencyHistogram.Timer()
 
 	fencingDataServers := ensemble
-	if change != nil {
-		fencingDataServers = slices.Concat(ensemble, []*proto.DataServerIdentity{change.From})
+	oldEnsembleSize := len(ensemble)
+	if from := change.GetFrom(); from != nil {
+		fencingDataServers = slices.Concat(ensemble, []*proto.DataServerIdentity{from})
+	} else if change != nil {
+		// A growth: the ensemble before it is the ensemble without to
+		oldEnsembleSize--
 	}
 	fencingQuorumSize := len(fencingDataServers)
 	// As Raft's joint consensus, the fence overlaps every majority of the
@@ -152,9 +163,11 @@ func (e *election) fenceQuorum(term int64, options *proto.NewTermOptions, ensemb
 	// committed before it, and of the ensemble, which holds the ones committed
 	// since. The first takes one member less than a majority with an even
 	// replication factor; the second is a majority, which the leader also needs
-	// as followers
+	// as followers. A growth that can't fence a majority of the ensemble, e.g.
+	// to is down, can still be undone with a majority of the ensemble before it
+	// (see settleGrowth)
 	majority := quorum.Majority(len(ensemble))
-	oldEnsembleQuorum := quorum.MajorityOverlap(len(ensemble))
+	oldEnsembleQuorum := quorum.MajorityOverlap(oldEnsembleSize)
 	inOldEnsemble := func(server *proto.DataServerIdentity) bool {
 		return change == nil || !dataserver.MatchDataServer(change.To)(server)
 	}
@@ -236,7 +249,7 @@ func (e *election) fenceQuorum(term int64, options *proto.NewTermOptions, ensemb
 	if oldEnsembleFenced < oldEnsembleQuorum {
 		return nil, nil, nil, errors.Wrap(err, "election failed: quorum not reached")
 	}
-	if len(ensembleHeads) < majority {
+	if len(ensembleHeads) < majority && (!isGrowth(change) || oldEnsembleFenced < quorum.Majority(oldEnsembleSize)) {
 		return nil, nil, nil, errors.Errorf(
 			"election failed: quorum of the ensemble not reached: %d of %d members fenced",
 			len(ensembleHeads), len(ensemble))
@@ -312,7 +325,9 @@ func (e *election) chooseLeader(ensembleHeads sharding.Candidates, retainedHeads
 		e.logger.Info("The data server added by the change of the ensemble caught up, the change is finished",
 			slog.Any("from", change.From), slog.Any("to", change.To))
 		e.meta.EnsembleChange = nil
-		e.meta.PendingDeleteShardNodes = dataserver.AddDataServer(e.meta.PendingDeleteShardNodes, change.From)
+		if change.From != nil {
+			e.meta.PendingDeleteShardNodes = dataserver.AddDataServer(e.meta.PendingDeleteShardNodes, change.From)
+		}
 	}
 	// The scheduler balances the leaders, so the election doesn't count them:
 	// a count read by every election of a failover at once would send each to
@@ -576,7 +591,9 @@ func (e *election) prepareIfChangeEnsemble(mutShardMeta *proto.ShardMetadata) {
 	// pending delete state. We don't want a background task to attempt deletion anymore
 	mutShardMeta.PendingDeleteShardNodes = slices.DeleteFunc(mutShardMeta.PendingDeleteShardNodes,
 		dataserver.MatchDataServer(to))
-	mutShardMeta.Ensemble = slices.DeleteFunc(mutShardMeta.Ensemble, dataserver.MatchDataServer(from))
+	if from != nil {
+		mutShardMeta.Ensemble = slices.DeleteFunc(mutShardMeta.Ensemble, dataserver.MatchDataServer(from))
+	}
 	mutShardMeta.Ensemble = append(mutShardMeta.Ensemble, to)
 	mutShardMeta.EnsembleChange = &proto.EnsembleChangeMetadata{From: from, To: to}
 	e.logger.Info(
@@ -597,6 +614,7 @@ func (e *election) newTerm() (*proto.NewTermOptions, error) {
 		return nil, err
 	}
 
+	previousTerm := e.meta.Term
 	e.meta.Status = proto.ShardStatusElection
 	e.meta.Leader = nil
 	e.meta.Term++
@@ -613,6 +631,8 @@ func (e *election) newTerm() (*proto.NewTermOptions, error) {
 				errs.ErrShardNotElectable)
 		case e.changeEnsemble != nil && current.Split != nil:
 			return false, fmt.Errorf("%w: the shard is part of a split", errs.ErrShardNotElectable)
+		case current.GetTerm() != previousTerm:
+			return false, termMovedError(previousTerm, current.GetTerm())
 		}
 		current.Status = e.meta.Status
 		current.Term = e.meta.Term
@@ -635,12 +655,25 @@ func (e *election) Start() (candidateLeader *proto.DataServerIdentity, err error
 	e.logger.Info("Starting a new election")
 	timer := e.leaderElectionLatencyHistogram.Timer()
 
+	// A growth is recorded with the new term, so that the data server it adds
+	// is a member, and out of the pending deletions, before any fence: a
+	// coordinator that reads the status from now on never deletes its copy. A
+	// swap is recorded once fenced, as it removes a member
+	growth := e.changeEnsemble != nil && e.changeEnsemble.From == nil
+	if growth {
+		e.prepareIfChangeEnsemble(e.meta)
+	}
 	termOptions, err := e.newTerm()
 	if err != nil {
 		return nil, err
 	}
+	if err := failpoint.Step(e.ctx, "election.afterNewTerm"); err != nil {
+		return nil, err
+	}
 
-	e.prepareIfChangeEnsemble(e.meta)
+	if !growth {
+		e.prepareIfChangeEnsemble(e.meta)
+	}
 
 	// Negotiate the feature set across the new ensemble before fencing, so it
 	// can be pinned in the term options: every member persists it with the
@@ -651,30 +684,9 @@ func (e *election) Start() (candidateLeader *proto.DataServerIdentity, err error
 	negotiatedFeatures := feature.Union(feature.Negotiate(features, len(e.meta.Ensemble)), e.requiredFeatures)
 	termOptions.Features = negotiatedFeatures
 
-	// Send NewTerm to all the ensemble members
-	ensembleHeads, retainedHeads, enabledFeatures, err := e.fenceQuorum(
-		e.meta.Term,
-		termOptions,
-		e.meta.Ensemble,
-		e.meta.EnsembleChange)
+	ensembleHeads, retainedHeads, err := e.fence(termOptions, negotiatedFeatures)
 	if err != nil {
-		return nil, e.moveToReportedTerm(err)
-	}
-	if err = e.checkNegotiatedFeatures(negotiatedFeatures, enabledFeatures, ensembleHeads); err != nil {
 		return nil, err
-	}
-	if written := highestWrittenTerm(ensembleHeads, retainedHeads); written >= e.meta.Term {
-		// A log holds entries of this term already: a leadership at it
-		// happened that the shard status doesn't know of, e.g. the status was
-		// restored from a backup, or a standalone data directory is adopted.
-		// Leading again under a term that was written to would lead the shard
-		// twice under one term, so the next election fences above it
-		e.logger.Info("The term of the election was already written to, moving above it",
-			slog.Int64("term", e.meta.Term), slog.Int64("written-term", written))
-		if err := e.moveTerm(written); err != nil {
-			return nil, multierr.Append(errTermAlreadyWritten, err)
-		}
-		return nil, errTermAlreadyWritten
 	}
 	candidateLeader, followers := e.chooseLeader(ensembleHeads, retainedHeads)
 	e.logger.Info(
@@ -689,6 +701,9 @@ func (e *election) Start() (candidateLeader *proto.DataServerIdentity, err error
 	e.meta.Leader = candidateLeader
 
 	if err = e.metadataStore.PatchShardStatus(e.namespace, e.shard, func(current *proto.ShardMetadata) (bool, error) {
+		if current.GetTerm() != e.meta.Term {
+			return false, termMovedError(e.meta.Term, current.GetTerm())
+		}
 		if current.GetStatusOrDefault() != proto.ShardStatusDeleting {
 			current.Status = e.meta.Status
 		}
@@ -701,8 +716,14 @@ func (e *election) Start() (candidateLeader *proto.DataServerIdentity, err error
 	}); err != nil {
 		return nil, errors.Wrap(err, "failed to persist the new leader")
 	}
+	if err := failpoint.Step(e.ctx, "election.afterLeaderStored"); err != nil {
+		return nil, err
+	}
 	if err = e.becomeLeader(e.meta.Term, candidateLeader, followers, uint32(len(e.meta.Ensemble)),
 		negotiatedFeatures); err != nil {
+		return nil, err
+	}
+	if err := failpoint.Step(e.ctx, "election.afterBecomeLeader"); err != nil {
 		return nil, err
 	}
 	if e.eventListener != nil {
@@ -742,6 +763,129 @@ func (e *election) Start() (candidateLeader *proto.DataServerIdentity, err error
 		)
 	})
 	return candidateLeader, nil
+}
+
+// fence sends NewTerm to the members of the ensemble, at the term of the
+// election with termOptions, until a quorum is fenced, and settles a pending
+// growth of the ensemble from their heads (see settleGrowth). It fails when a
+// log of the ensemble holds entries of the term already, and moves the next
+// election above it.
+func (e *election) fence(termOptions *proto.NewTermOptions, negotiatedFeatures []proto.Feature) (
+	ensembleHeads sharding.Candidates, retainedHeads sharding.Candidates, err error) {
+	ensembleHeads, retainedHeads, enabledFeatures, err := e.fenceQuorum(
+		e.meta.Term,
+		termOptions,
+		e.meta.Ensemble,
+		e.meta.EnsembleChange)
+	if err != nil {
+		return nil, nil, e.moveToReportedTerm(err)
+	}
+	if err := failpoint.Step(e.ctx, "election.afterFence"); err != nil {
+		return nil, nil, err
+	}
+	if err = e.checkNegotiatedFeatures(negotiatedFeatures, enabledFeatures, ensembleHeads); err != nil {
+		return nil, nil, err
+	}
+	if written := highestWrittenTerm(ensembleHeads, retainedHeads); written >= e.meta.Term {
+		// A log holds entries of this term already: a leadership at it
+		// happened that the shard status doesn't know of, e.g. the status was
+		// restored from a backup, or a standalone data directory is adopted.
+		// Leading again under a term that was written to would lead the shard
+		// twice under one term, so the next election fences above it
+		e.logger.Info("The term of the election was already written to, moving above it",
+			slog.Int64("term", e.meta.Term), slog.Int64("written-term", written))
+		if err := e.moveTerm(written); err != nil {
+			return nil, nil, multierr.Append(errTermAlreadyWritten, err)
+		}
+		return nil, nil, errTermAlreadyWritten
+	}
+	if err = e.settleGrowth(ensembleHeads); err != nil {
+		return nil, nil, err
+	}
+	return ensembleHeads, retainedHeads, nil
+}
+
+// isGrowth reports whether change adds a member to the ensemble without
+// removing one.
+func isGrowth(change *proto.EnsembleChangeMetadata) bool {
+	return change != nil && change.From == nil
+}
+
+// errTermMoved fails a write of the election whose shard moved to another term
+// since the election read it, e.g. elected by another coordinator: the next
+// election starts from the stored status.
+var errTermMoved = fmt.Errorf("%w: the term of the shard moved", errs.ErrUnavailable)
+
+func termMovedError(expected int64, current int64) error {
+	return fmt.Errorf("%w: from %d to %d", errTermMoved, expected, current)
+}
+
+// errGrowthNotUndone fails an election that has to undo a pending growth, but
+// fenced less than a majority of the ensemble before it: the next election
+// tries again.
+var errGrowthNotUndone = fmt.Errorf("%w: the growth of the ensemble can't be undone yet", errs.ErrUnavailable)
+
+// settleGrowth decides what the election does with a pending growth of the
+// ensemble, from the fenced heads:
+//   - to is among the highest heads: it has every committed entry, so the
+//     growth is finished;
+//   - the fence didn't reach a majority of the ensemble, e.g. to is down, or the
+//     growth missed its deadline (see undoGrowth): it is undone, as Raft rolls
+//     back a change that isn't committed. Every entry committed while the
+//     growth was pending is on a majority of the ensemble, so on a majority
+//     less one of the members before the growth, which overlaps any majority
+//     of them: with a majority of them fenced, the highest head has every
+//     committed entry. To goes to the pending deletions;
+//   - otherwise, the growth stays pending, and to follows.
+func (e *election) settleGrowth(ensembleHeads sharding.Candidates) error {
+	change := e.meta.EnsembleChange
+	if !isGrowth(change) {
+		return nil
+	}
+	isTo := dataserver.MatchDataServer(change.To)
+	var highest *proto.EntryId
+	toIsHighest := false
+	for server, candidate := range ensembleHeads {
+		if highest == nil {
+			highest, toIsHighest = candidate.HeadEntryId, isTo(server)
+			continue
+		}
+		switch c := entry.Compare(candidate.HeadEntryId, highest); {
+		case c > 0:
+			highest, toIsHighest = candidate.HeadEntryId, isTo(server)
+		case c == 0:
+			toIsHighest = toIsHighest || isTo(server)
+		default:
+			// Behind the highest head
+		}
+	}
+	if toIsHighest {
+		e.logger.Info("The data server added by the growth of the ensemble caught up, the growth is finished",
+			slog.Any("to", change.To))
+		e.meta.EnsembleChange = nil
+		return nil
+	}
+	if len(ensembleHeads) >= quorum.Majority(len(e.meta.Ensemble)) && !e.undoGrowth {
+		return nil
+	}
+	fencedBefore := 0
+	for server := range ensembleHeads {
+		if !isTo(server) {
+			fencedBefore++
+		}
+	}
+	if fencedBefore < quorum.Majority(len(e.meta.Ensemble)-1) {
+		return errGrowthNotUndone
+	}
+	e.logger.Info("The growth of the ensemble is undone", slog.Any("to", change.To),
+		slog.Bool("deadline-missed", e.undoGrowth))
+	maps.DeleteFunc(ensembleHeads, func(server *proto.DataServerIdentity, _ sharding.Candidate) bool {
+		return isTo(server)
+	})
+	e.meta.Ensemble = slices.DeleteFunc(e.meta.Ensemble, isTo)
+	e.meta.EnsembleChange = nil
+	e.meta.PendingDeleteShardNodes = dataserver.AddDataServer(e.meta.PendingDeleteShardNodes, change.To)
+	return nil
 }
 
 // errTermAlreadyWritten ends an election whose term a log of the ensemble
@@ -889,7 +1033,9 @@ func (e *election) Tick() error {
 		}
 		if finishChange && current.EnsembleChange != nil {
 			finished = current.EnsembleChange
-			current.PendingDeleteShardNodes = dataserver.AddDataServer(current.PendingDeleteShardNodes, finished.From)
+			if finished.From != nil {
+				current.PendingDeleteShardNodes = dataserver.AddDataServer(current.PendingDeleteShardNodes, finished.From)
+			}
 			current.EnsembleChange = nil
 		}
 		current.EnsembleCaughtUp = current.EnsembleCaughtUp || markCaughtUp
@@ -930,7 +1076,8 @@ func New(ctx context.Context, logger *slog.Logger, eventListener controllerapi.S
 	featureSupplier feature.Supplier,
 	provider rpc.ControllerRPCProvider, namespace string, shard int64,
 	shardMetadata *proto.ShardMetadata,
-	changeEnsembleAction *action.ChangeEnsembleAction, preferredLeader string, requiredFeatures []proto.Feature,
+	changeEnsembleAction *action.ChangeEnsembleAction, preferredLeader string, undoGrowth bool,
+	requiredFeatures []proto.Feature,
 	leaderElectionLatencyHistogram metric.LatencyHistogram, newTermQuorumLatencyHistogram metric.LatencyHistogram,
 	becomeLeaderLatencyHistogram metric.LatencyHistogram) Election {
 	current, cancelFunc := context.WithCancel(ctx)
@@ -949,6 +1096,7 @@ func New(ctx context.Context, logger *slog.Logger, eventListener controllerapi.S
 		shard:                          shard,
 		meta:                           gproto.CloneOf(shardMetadata),
 		changeEnsemble:                 changeEnsembleAction,
+		undoGrowth:                     undoGrowth,
 		requiredFeatures:               requiredFeatures,
 		leaderElectionLatencyHistogram: leaderElectionLatencyHistogram,
 		newTermQuorumLatencyHistogram:  newTermQuorumLatencyHistogram,

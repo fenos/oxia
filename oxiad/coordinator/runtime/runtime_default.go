@@ -593,8 +593,9 @@ func mergedAuthorities(status map[string]commonobject.Borrowed[*proto.NamespaceS
 			for _, server := range shard.Ensemble {
 				addServerAuthorities(server.GetPublic(), server.GetInternal())
 			}
-			if change := shard.GetEnsembleChange(); change != nil {
-				addServerAuthorities(change.GetFrom().GetPublic(), change.GetFrom().GetInternal())
+			// A growth has no source; to is a member already
+			if from := shard.GetEnsembleChange().GetFrom(); from != nil {
+				addServerAuthorities(from.GetPublic(), from.GetInternal())
 			}
 		}
 	}

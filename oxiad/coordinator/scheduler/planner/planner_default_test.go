@@ -353,6 +353,10 @@ func apply(s *stats.ClusterStats, op action.Action) {
 		shard.Leader = op.PreferredLeader
 	case *action.ChangeEnsembleAction:
 		from, to := op.From.GetInternal(), op.To.GetInternal()
+		if op.From == nil {
+			shard.Ensemble = append(shard.Ensemble, to)
+			return
+		}
 		shard.Ensemble[slices.Index(shard.Ensemble, from)] = to
 		if shard.Leader == from {
 			shard.Leader = to
@@ -372,6 +376,10 @@ func describe(actions []action.Action) []string {
 		case *action.SplitAction:
 			names = append(names, fmt.Sprintf("split %s %d", op.Namespace, op.Shard))
 		case *action.ChangeEnsembleAction:
+			if op.From == nil {
+				names = append(names, fmt.Sprintf("grow %d %s", op.Shard, op.To.GetInternal()))
+				continue
+			}
 			names = append(names, fmt.Sprintf("replace %d %s %s", op.Shard, op.From.GetInternal(), op.To.GetInternal()))
 		default:
 			names = append(names, fmt.Sprintf("%T", op))
@@ -448,4 +456,79 @@ func zonedCluster(zones, perZone, used, namespaces, shards int) *stats.ClusterSt
 		ns.Shards[int64(id)] = &stats.ShardStats{Ensemble: ensemble, Leader: ensemble[0]}
 	}
 	return s
+}
+
+// grown has namespace a at replication factor 3, with its steady shard 1 on n0
+// alone, which leads it.
+func grown(dataServers int) *stats.ClusterStats {
+	s := cluster(dataServers)
+	shard := addShard(s, "a", 1, "n0")
+	shard.Leader, shard.Steady = "n0", true
+	s.Namespaces["a"].ReplicationFactor = 3
+	return s
+}
+
+// A shard short of the replication factor of its namespace grows one member a
+// round, onto the data server with the fewest replicas of the namespace, before
+// anything is balanced.
+func TestPlannerPlanGrowsAShardShortOfItsReplicationFactor(t *testing.T) {
+	s := grown(4)
+	// n1 holds more replicas of a than n2 and n3: the growths skip it
+	addShard(s, "a", 2, "n1").Leader = "n1"
+	addShard(s, "b", 3, "n3").Leader = "n3"
+
+	ops, _ := defaultPlanner().Plan(s)
+	assert.Equal(t, []string{"grow 1 n2"}, describe(ops), "n2 holds nothing, n3 a replica of b")
+
+	apply(s, ops[0])
+	ops, _ = defaultPlanner().Plan(s)
+	assert.Equal(t, []string{"grow 1 n3"}, describe(ops), "n3 is the one left without a replica of a")
+
+	apply(s, ops[0])
+	ops, _ = defaultPlanner().Plan(s)
+	for _, op := range describe(ops) {
+		assert.NotContains(t, op, "grow")
+	}
+	assert.Len(t, s.GetShard(1).Ensemble, 3)
+}
+
+// A shard grows only when it is steady, with no change or split in progress;
+// one at the replication factor doesn't.
+func TestPlannerPlanGrowsOnlyASteadyShard(t *testing.T) {
+	for name, unsettle := range map[string]func(*stats.ShardStats){
+		"in election": func(shard *stats.ShardStats) { shard.Steady = false },
+		"changing":    func(shard *stats.ShardStats) { shard.Changing = true },
+		"splitting":   func(shard *stats.ShardStats) { shard.Splitting = true },
+		"at the replication factor": func(shard *stats.ShardStats) {
+			shard.Ensemble = []string{"n0", "n1", "n2"}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := grown(3)
+			unsettle(s.GetShard(1))
+
+			ops, _ := defaultPlanner().Plan(s)
+
+			for _, op := range describe(ops) {
+				assert.NotContains(t, op, "grow")
+			}
+		})
+	}
+}
+
+// A shard that no data server can take grows nowhere, and the other ops are
+// planned as usual.
+func TestPlannerPlanSkipsAGrowthWithNoTarget(t *testing.T) {
+	s := grown(2)
+	// No data server has a zone: every growth breaks the anti-affinity
+	s.Namespaces["a"].AntiAffinities = []*proto.AntiAffinity{{Labels: []string{"zone"}, Mode: "strict"}}
+	removed(s, "r")
+	addShard(s, "b", 2, "r", "n0")
+
+	ops, _ := defaultPlanner().Plan(s)
+
+	assert.Contains(t, describe(ops), "replace 2 r n1")
+	for _, op := range describe(ops) {
+		assert.NotContains(t, op, "grow")
+	}
 }

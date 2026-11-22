@@ -17,7 +17,10 @@ package stats
 import "github.com/oxia-db/oxia/common/proto"
 
 type NamespaceStats struct {
-	AntiAffinities []*proto.AntiAffinity
-	Shards         map[int64]*ShardStats
-	DeletingShards int
+	// ReplicationFactor is the size of the ensembles of the namespace: a
+	// shard short of it grows
+	ReplicationFactor int
+	AntiAffinities    []*proto.AntiAffinity
+	Shards            map[int64]*ShardStats
+	DeletingShards    int
 }

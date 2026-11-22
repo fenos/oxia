@@ -76,6 +76,9 @@ func (pl *plan) add(op model.Candidate) {
 		pl.actions = append(pl.actions, action.NewLeaderTransferAction(op.Shard, op.To))
 	case model.Split:
 		pl.actions = append(pl.actions, action.NewSplitAction(op.Namespace, op.Shard))
+	case model.Grow:
+		pl.actions = append(pl.actions, action.NewChangeEnsembleAction(op.Shard, nil,
+			pl.clusterStats.DataServers[op.To].GetIdentity()))
 	default:
 		pl.actions = append(pl.actions, action.NewChangeEnsembleAction(op.Shard,
 			pl.clusterStats.DataServers[op.From].GetIdentity(), pl.clusterStats.DataServers[op.To].GetIdentity()))

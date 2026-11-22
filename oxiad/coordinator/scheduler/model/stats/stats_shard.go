@@ -15,10 +15,15 @@
 package stats
 
 type ShardStats struct {
-	Ensemble   []string
-	Leader     string
-	Changing   bool
+	Ensemble []string
+	Leader   string
+	Changing bool
+	// Steady is whether the shard has a leader and no election in progress
+	Steady     bool
 	Splitting  bool
 	Splittable bool
 	Overshoot  float64
+	// PendingDelete are the data servers whose copy of the shard is still to
+	// be deleted: none of them can be added to the ensemble until it is
+	PendingDelete []string
 }

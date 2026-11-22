@@ -101,6 +101,19 @@ type controller struct {
 	// currentElection is owned by the event loop
 	currentElection election.Election
 
+	// The growth of the ensemble, see shard_controller_growth.go. The event
+	// loop owns the fields: growing is set while the new member of a growth
+	// catches up, which reports on growthCatchUpOp; growthDeadline is armed
+	// while a growth is pending, and reports on growthDeadlineOp; once it
+	// passed, growthOverdue has the elections undo the growth.
+	growing              bool
+	growthOverdue        bool
+	growthDeadline       *time.Timer
+	growthCatchUpOp      chan growthCatchUp
+	growthDeadlineOp     chan *proto.DataServerIdentity
+	growthCatchUpTimeout time.Duration
+	growthFinishTimeout  time.Duration
+
 	leaderElectionLatencyHistogram metric.LatencyHistogram
 	newTermQuorumLatencyHistogram  metric.LatencyHistogram
 	becomeLeaderLatencyHistogram   metric.LatencyHistogram
@@ -148,7 +161,8 @@ func NewController(
 	featureSupplier featurepkg.Supplier,
 	eventListener controllerapi.ShardEventListener,
 	rpcProvider rpc.ControllerRPCProvider,
-	periodTasksInterval time.Duration) Controller {
+	periodTasksInterval time.Duration,
+	opts ...Option) Controller {
 	labels := metric.LabelsForShard(namespace, shard)
 	s := &controller{
 		namespace:             namespace,
@@ -165,6 +179,10 @@ func NewController(
 		discoveredDataServers: make(map[string]*proto.DataServerIdentity),
 		featuresDiscoveredOp:  make(chan any, 1),
 		electionMailbox:       make(chan async.Mail, 1),
+		growthCatchUpOp:       make(chan growthCatchUp, 1),
+		growthDeadlineOp:      make(chan *proto.DataServerIdentity, 1),
+		growthCatchUpTimeout:  DefaultGrowthCatchUpTimeout,
+		growthFinishTimeout:   DefaultGrowthFinishTimeout,
 
 		periodicTasksInterval: oxiatime.Jitter(periodTasksInterval, periodTasksInterval/4),
 		logger: slog.With(
@@ -182,6 +200,10 @@ func NewController(
 			"The time it takes to take the ensemble of data servers to a new term", labels),
 		becomeLeaderLatencyHistogram: metric.NewLatencyHistogram("oxia_coordinator_become_leader_latency",
 			"The time it takes for the new elected leader to start", labels),
+	}
+
+	for _, opt := range opts {
+		opt(s)
 	}
 
 	s.termGauge = metric.NewGauge("oxia_coordinator_term",
@@ -297,6 +319,10 @@ func (s *controller) run(bo backoff.BackOff) error {
 			s.handleFeaturesDiscoveredWithRetries()
 		case op := <-s.changeEnsembleOp:
 			s.onChangeEnsemble(op)
+		case result := <-s.growthCatchUpOp:
+			s.onGrowthCaughtUp(result)
+		case to := <-s.growthDeadlineOp:
+			s.onGrowthDeadline(to)
 		case <-s.electionMailbox:
 			// A failed tick posts to the mailbox again a second later
 			if s.currentElection != nil {
@@ -419,7 +445,9 @@ func (s *controller) handleDataServerFailureWithRetries(failedDataServer *proto.
 			slog.Any("leader", failedDataServer.GetNameOrDefault()),
 		)
 		_, _ = s.electLeader(shardMeta, nil, "")
+		return
 	}
+	s.onGrowthMemberFailure(shardMeta, failedDataServer)
 }
 
 // handleFeaturesDiscoveredWithRetries checks the features pinned by the current term
@@ -597,19 +625,19 @@ func (s *controller) validateChangeEnsembleFeatures(shardMeta *proto.ShardMetada
 	if shardMeta.Split != nil {
 		return fmt.Errorf("%w: shard is not ready for change ensemble: the shard is part of a split", errs.ErrUnavailable)
 	}
-	if changeEnsembleAction.From == nil {
-		return fmt.Errorf("%w: invalid change ensemble: from data server is nil", errs.ErrInvalidArgument)
-	}
 	if changeEnsembleAction.To == nil {
 		return fmt.Errorf("%w: invalid change ensemble: to data server is nil", errs.ErrInvalidArgument)
 	}
-	source := changeEnsembleAction.From.GetNameOrDefault()
 	target := changeEnsembleAction.To.GetNameOrDefault()
 	ensembleSize := len(shardMeta.Ensemble)
-	targetEnsemble := slices.DeleteFunc(slices.Clone(shardMeta.Ensemble),
-		dataserver.MatchDataServer(changeEnsembleAction.From))
-	if len(targetEnsemble) != ensembleSize-1 {
-		return fmt.Errorf("%w: invalid change ensemble: source data server %q must appear exactly once in the current ensemble", errs.ErrInvalidArgument, source)
+	// Without a source, the change is a growth: to joins, and nobody leaves
+	targetEnsemble := slices.Clone(shardMeta.Ensemble)
+	if changeEnsembleAction.From != nil {
+		source := changeEnsembleAction.From.GetNameOrDefault()
+		targetEnsemble = slices.DeleteFunc(targetEnsemble, dataserver.MatchDataServer(changeEnsembleAction.From))
+		if len(targetEnsemble) != ensembleSize-1 {
+			return fmt.Errorf("%w: invalid change ensemble: source data server %q must appear exactly once in the current ensemble", errs.ErrInvalidArgument, source)
+		}
 	}
 	ensembleWithoutTarget := slices.DeleteFunc(slices.Clone(shardMeta.Ensemble),
 		dataserver.MatchDataServer(changeEnsembleAction.To))
@@ -679,18 +707,26 @@ func (s *controller) handleElectionWithRetries(electionAction *action.ElectionAc
 // status, unless the shard can't be elected.
 func (s *controller) electLeader(shardMeta *proto.ShardMetadata,
 	changeEnsembleAction *action.ChangeEnsembleAction, preferredLeader string) (*proto.DataServerIdentity, error) {
+	return s.elect(shardMeta, changeEnsembleAction, preferredLeader, s.growthOverdue)
+}
+
+// elect is electLeader, which also undoes a pending growth of the ensemble
+// whose new member isn't among the highest heads when undoGrowth is set.
+func (s *controller) elect(shardMeta *proto.ShardMetadata, changeEnsembleAction *action.ChangeEnsembleAction,
+	preferredLeader string, undoGrowth bool) (*proto.DataServerIdentity, error) {
 	if s.currentElection != nil {
 		s.currentElection.Cancel()
 	}
 	s.currentElection = election.New(s.ctx, s.logger, s.eventListener, s.electionMailbox,
 		s.metadataStore, s.featureSupplier,
-		s.rpc, s.namespace, s.shard, shardMeta, changeEnsembleAction, preferredLeader, s.requiredFeatures,
+		s.rpc, s.namespace, s.shard, shardMeta, changeEnsembleAction, preferredLeader, undoGrowth, s.requiredFeatures,
 		s.leaderElectionLatencyHistogram,
 		s.newTermQuorumLatencyHistogram,
 		s.becomeLeaderLatencyHistogram)
 	leader, err := s.currentElection.Start()
 	if err == nil {
 		s.requiredFeatures = nil
+		s.syncGrowthDeadline()
 		return leader, nil
 	}
 	var enabled *featurepkg.EnabledError
@@ -745,8 +781,8 @@ func (s *controller) deleteShard() error {
 		s.currentElection = nil
 	}
 	servers := slices.Concat(shardMeta.Ensemble, shardMeta.PendingDeleteShardNodes)
-	if change := shardMeta.GetEnsembleChange(); change != nil {
-		servers = append(servers, change.From)
+	if from := shardMeta.GetEnsembleChange().GetFrom(); from != nil {
+		servers = append(servers, from)
 	}
 	for idx, server := range servers {
 		if _, err := s.rpc.DeleteShard(s.ctx, server, &proto.DeleteShardRequest{
@@ -813,6 +849,7 @@ func (s *controller) Close() error {
 		if s.currentElection != nil {
 			s.currentElection.Cancel()
 		}
+		s.stopGrowthDeadline()
 
 	drainPendingOps:
 		for {
@@ -824,6 +861,8 @@ func (s *controller) Close() error {
 			case <-s.featuresDiscoveredOp:
 			case op := <-s.changeEnsembleOp:
 				op.Error(constant.ErrResourceUnavailable)
+			case result := <-s.growthCatchUpOp:
+				result.action.Error(constant.ErrResourceUnavailable)
 			default:
 				break drainPendingOps
 			}
@@ -835,6 +874,11 @@ func (s *controller) Close() error {
 }
 
 func (s *controller) onChangeEnsemble(changeEnsembleAction *action.ChangeEnsembleAction) {
+	if s.growing {
+		changeEnsembleAction.Error(errors.Wrap(errs.ErrUnavailable,
+			"shard is not ready for change ensemble: the new member of a growth is catching up"))
+		return
+	}
 	if s.currentElection != nil {
 		if !s.currentElection.IsQuorumCaughtUp() {
 			s.logger.Warn("Change ensemble rejected: shard is not ready (quorum catch-up still in progress)")
@@ -873,13 +917,32 @@ func (s *controller) onChangeEnsemble(changeEnsembleAction *action.ChangeEnsembl
 		changeEnsembleAction.Error(fmt.Errorf("%w: data server %q is %s", errs.ErrFailedPrecondition, to, state))
 		return
 	}
+	// The copy of a data server pending deletion is deleted at the term of
+	// its removal: a change that adds it back before then could see its new
+	// copy deleted by a coordinator that read the status earlier
+	if slices.ContainsFunc(shardMeta.GetPendingDeleteShardNodes(), dataserver.MatchDataServer(changeEnsembleAction.To)) {
+		changeEnsembleAction.Error(fmt.Errorf("%w: the copy of data server %q is still to be deleted",
+			errs.ErrFailedPrecondition, to))
+		return
+	}
 	if err := s.validateChangeEnsembleFeatures(shardMeta, changeEnsembleAction); err != nil {
 		changeEnsembleAction.Error(err)
 		return
 	}
+	if changeEnsembleAction.From == nil {
+		s.startGrowth(shardMeta, changeEnsembleAction)
+		return
+	}
+	s.runChange(shardMeta, changeEnsembleAction)
+}
+
+// runChange runs the election that changes the ensemble, and completes the
+// action.
+func (s *controller) runChange(shardMeta *proto.ShardMetadata, changeEnsembleAction *action.ChangeEnsembleAction) {
 	// todo: support optimized ensemble change to avoid start a new election
 	leader, err := s.electLeader(shardMeta, changeEnsembleAction, "")
-	if err == nil && leader.GetNameOrDefault() == changeEnsembleAction.From.GetNameOrDefault() {
+	if err == nil && changeEnsembleAction.From != nil &&
+		leader.GetNameOrDefault() == changeEnsembleAction.From.GetNameOrDefault() {
 		changeEnsembleAction.Error(fmt.Errorf("%w: data server %q is ahead of the new ensemble, the change is undone",
 			errs.ErrFailedPrecondition, leader.GetNameOrDefault()))
 		return

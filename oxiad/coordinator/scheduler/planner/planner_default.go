@@ -61,6 +61,9 @@ func New(filters []filter.Filter, tiers []tier.Tier) Planner {
 
 func (p *planner) Plan(s *stats.ClusterStats) ([]action.Action, []model.Blocked) {
 	pl := newPlan(s)
+	if p.grow(s, pl) > 0 {
+		return pl.actions, filter.Blocked(p.filters, s)
+	}
 	for i, ph := range p.phases {
 		planned := 0
 		greedy := algorithm.NewShardGreedy(s, ph.kind, ph.tiers, p.filters)
@@ -91,6 +94,49 @@ func (p *planner) Plan(s *stats.ClusterStats) ([]action.Action, []model.Blocked)
 		}
 	}
 	return pl.actions, filter.Blocked(p.filters, s)
+}
+
+// grow plans a growth of each steady shard whose ensemble is short of the
+// replication factor of its namespace, before any other op: a raised factor
+// makes the shards durable before they are balanced. Each growth adds one
+// member, the data server that Place would choose among the ones the filters
+// pass, and the next rounds add the others. It returns how many it planned.
+func (p *planner) grow(s *stats.ClusterStats, pl *plan) int {
+	planned := 0
+	for _, name := range slices.Sorted(maps.Keys(s.Namespaces)) {
+		ns := s.Namespaces[name]
+		for _, id := range slices.Sorted(maps.Keys(ns.Shards)) {
+			shard := ns.Shards[id]
+			if !shard.Steady || shard.Changing || shard.Splitting || len(shard.Ensemble) >= ns.ReplicationFactor {
+				continue
+			}
+			if to, ok := p.growthTarget(s, pl, name, id); ok {
+				pl.add(model.Candidate{Kind: model.Grow, Namespace: name, Shard: id, To: to,
+					Reason: "replication factor"})
+				planned++
+			}
+		}
+	}
+	return planned
+}
+
+// growthTarget chooses the data server that a growth of the shard adds: the
+// one with the fewest replicas of the namespace, then in total, then by name,
+// among the ones that the filters and the limits of the plan allow.
+func (p *planner) growthTarget(s *stats.ClusterStats, pl *plan, namespace string, shard int64) (string, bool) {
+	counts := pl.dataServerLoad.GetReplicas(namespace)
+	totals := pl.dataServerLoad.GetTotalReplicas()
+	candidates := slices.Clone(pl.dataServerNames)
+	slices.SortFunc(candidates, func(a, b string) int {
+		return cmp.Or(cmp.Compare(counts[a], counts[b]), cmp.Compare(totals[a], totals[b]), strings.Compare(a, b))
+	})
+	for _, to := range candidates {
+		op := model.Candidate{Kind: model.Grow, Namespace: namespace, Shard: shard, To: to}
+		if pl.allows(op) && filter.Check(p.filters, s, op) == nil {
+			return to, true
+		}
+	}
+	return "", false
 }
 
 func (*planner) Place(s *stats.ClusterStats, namespace string, replicas int, antiAffinities []*proto.AntiAffinity,

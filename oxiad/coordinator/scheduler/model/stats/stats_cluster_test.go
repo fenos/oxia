@@ -40,7 +40,8 @@ func TestNew(t *testing.T) {
 		map[string]commonobject.Borrowed[*proto.DataServer]{
 			"n0": commonobject.Borrow(dataServer),
 		},
-		map[string]commonobject.Borrowed[*proto.Namespace]{"a": commonobject.Borrow(&proto.Namespace{AntiAffinities: zones})},
+		map[string]commonobject.Borrowed[*proto.Namespace]{"a": commonobject.Borrow(&proto.Namespace{AntiAffinities: zones,
+			ReplicationFactor: 3})},
 		map[string]commonobject.Borrowed[*proto.NamespaceStatus]{
 			"a": commonobject.Borrow(&proto.NamespaceStatus{Shards: map[int64]*proto.ShardMetadata{
 				1: {Ensemble: []*proto.DataServerIdentity{n0, r}, Leader: n0, Status: proto.ShardStatusSteadyState,
@@ -60,12 +61,12 @@ func TestNew(t *testing.T) {
 		"n0": {DataServer: dataServer},
 		"r":  {DataServer: &proto.DataServer{Identity: r}, Removed: true},
 	}, s.DataServers)
-	assert.Equal(t, &NamespaceStats{AntiAffinities: zones, Shards: map[int64]*ShardStats{
-		1: {Ensemble: []string{"n0", "r"}, Leader: "n0", Splittable: true},
+	assert.Equal(t, &NamespaceStats{ReplicationFactor: 3, AntiAffinities: zones, Shards: map[int64]*ShardStats{
+		1: {Ensemble: []string{"n0", "r"}, Leader: "n0", Steady: true, Splittable: true},
 		2: {Ensemble: []string{"n0"}, Splitting: true},
 		3: {Ensemble: []string{"n0"}, Changing: true},
 		5: {Ensemble: []string{"n0"}},
-		6: {Ensemble: []string{"n0"}},
+		6: {Ensemble: []string{"n0"}, PendingDelete: []string{"r"}},
 	}, DeletingShards: 1}, s.Namespaces["a"])
 	assert.Equal(t, &NamespaceStats{Shards: map[int64]*ShardStats{}}, s.Namespaces["b"])
 }

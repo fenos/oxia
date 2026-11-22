@@ -2378,10 +2378,10 @@ func TestControllerValidateChangeEnsembleFeaturesRejectsInvalidAction(t *testing
 		from *proto.DataServerIdentity
 		to   *proto.DataServerIdentity
 	}{
-		{name: "nil from", from: nil, to: s4},
 		{name: "nil to", from: s1, to: nil},
 		{name: "missing from", from: s4, to: s5},
 		{name: "duplicate to", from: s1, to: s2},
+		{name: "growth to a member", from: nil, to: s2},
 	}
 
 	shardMeta, _ := testShardMetadata(metadata, constant.DefaultNamespace, shard)
@@ -2393,6 +2393,8 @@ func TestControllerValidateChangeEnsembleFeaturesRejectsInvalidAction(t *testing
 	}
 
 	assert.NoError(t, s.validateChangeEnsembleFeatures(shardMeta, action.NewChangeEnsembleAction(shard, s1, s4)))
+	assert.NoError(t, s.validateChangeEnsembleFeatures(shardMeta, action.NewChangeEnsembleAction(shard, nil, s4)),
+		"without a source, the change grows the ensemble")
 }
 
 // A change of the ensemble of the parent or of a child of a split is rejected

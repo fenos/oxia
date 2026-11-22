@@ -54,3 +54,15 @@ func TestConflicts(t *testing.T) {
 }
 
 var zones = []*proto.AntiAffinity{{Labels: []string{"zone"}}}
+
+// A growth keeps every member: its target can share a zone with none of them.
+func TestAntiAffinityRejectsAGrowthIntoAMembersZone(t *testing.T) {
+	s := newStats()
+	s.Namespaces["a"].AntiAffinities = zones
+	grow := model.Candidate{Kind: model.Grow, Namespace: "a", Shard: 1, To: "n2"}
+	assert.NoError(t, AntiAffinity{}.Filter(s, grow))
+
+	s.DataServers["n2"].Metadata.Labels["zone"] = "z0"
+
+	assert.ErrorIs(t, AntiAffinity{}.Filter(s, grow), errs.ErrFailedPrecondition)
+}

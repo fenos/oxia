@@ -26,6 +26,7 @@ func TestKindString(t *testing.T) {
 	assert.Equal(t, "replace", Replace.String())
 	assert.Equal(t, "transfer-leader", TransferLeader.String())
 	assert.Equal(t, "split", Split.String())
+	assert.Equal(t, "grow", Grow.String())
 }
 
 func TestCandidateShardIn(t *testing.T) {

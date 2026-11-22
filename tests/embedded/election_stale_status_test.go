@@ -161,8 +161,9 @@ func TestElectionFromStaleStatusNeverLeadsTwiceUnderOneTerm(t *testing.T) {
 }
 
 // restartableCluster is three data servers and a coordinator on the file
-// metadata provider, with one shard at replication factor 3. Each server
-// restarts on its own addresses and directories.
+// metadata provider, with one shard at replication factor 3 unless the
+// configuration says otherwise. Each server restarts on its own addresses and
+// directories.
 type restartableCluster struct {
 	t         *testing.T
 	dir       string
@@ -174,19 +175,26 @@ type restartableCluster struct {
 
 func newRestartableCluster(t *testing.T) *restartableCluster {
 	t.Helper()
+	return newRestartableClusterWith(t, &proto.ClusterConfiguration{
+		Namespaces: []*proto.Namespace{{Name: constant.DefaultNamespace, ReplicationFactor: 3, InitialShardCount: 1}},
+	})
+}
+
+// newRestartableClusterWith starts the cluster with config, whose servers are
+// the cluster's.
+func newRestartableClusterWith(t *testing.T, config *proto.ClusterConfiguration) *restartableCluster {
+	t.Helper()
 	c := &restartableCluster{t: t, dir: t.TempDir(), ids: newDataServerIdentities(t),
 		servers: make([]*dataserver.Server, 3), adminAddr: mock.FreeAddresses(t, 1)[0]}
 	for i := range c.ids {
 		c.startServer(i)
 	}
+	config.Servers = c.ids
 	options := c.coordinatorOptions()
-	config, err := metadatacodec.ClusterConfigCodec.MarshalYAML(&proto.ClusterConfiguration{
-		Namespaces: []*proto.Namespace{{Name: constant.DefaultNamespace, ReplicationFactor: 3, InitialShardCount: 1}},
-		Servers:    c.ids,
-	})
+	data, err := metadatacodec.ClusterConfigCodec.MarshalYAML(config)
 	require.NoError(t, err)
 	require.NoError(t, os.MkdirAll(options.Metadata.File.Dir, 0o755))
-	require.NoError(t, os.WriteFile(options.Metadata.File.ConfigPath(), config, 0o600))
+	require.NoError(t, os.WriteFile(options.Metadata.File.ConfigPath(), data, 0o600))
 	c.startCoordinator()
 	t.Cleanup(c.stopAll)
 	return c
@@ -351,17 +359,27 @@ func (c *restartableCluster) awaitApplied(i, leader int) {
 // has reports whether the database of server i, which must be stopped, holds
 // key.
 func (c *restartableCluster) has(i int, key string) bool {
+	return len(c.missing(i, []string{key})) == 0
+}
+
+// missing returns the keys that the database of server i, which must be
+// stopped, doesn't hold.
+func (c *restartableCluster) missing(i int, keys []string) []string {
 	factory, err := kvstore.NewPebbleKVFactory(&kvstore.FactoryOptions{DataDir: c.dbDir(i), CacheSizeMB: 1, UseWAL: true})
 	require.NoError(c.t, err)
 	defer factory.Close()
 	kv, err := factory.NewKV(constant.DefaultNamespace, 0, proto.KeySortingType_HIERARCHICAL)
 	require.NoError(c.t, err)
 	defer kv.Close()
-	_, _, closer, err := kv.Get(key, kvstore.ComparisonEqual, kvstore.NoInternalKeys)
-	if errors.Is(err, errs.ErrDBKeyNotFound) {
-		return false
+	var missing []string
+	for _, key := range keys {
+		_, _, closer, err := kv.Get(key, kvstore.ComparisonEqual, kvstore.NoInternalKeys)
+		if errors.Is(err, errs.ErrDBKeyNotFound) {
+			missing = append(missing, key)
+			continue
+		}
+		require.NoError(c.t, err)
+		require.NoError(c.t, closer.Close())
 	}
-	require.NoError(c.t, err)
-	require.NoError(c.t, closer.Close())
-	return true
+	return missing
 }

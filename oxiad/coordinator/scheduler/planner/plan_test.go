@@ -85,3 +85,22 @@ func TestPlanAddReturnsTheActionOfEachKind(t *testing.T) {
 	assert.Equal(t, map[string]int{"n0": 3, "n1": 2, "n2": 1}, pl.dataServerLoad.GetTotalReplicas(),
 		"the replace moved a replica of n1 onto n2")
 }
+
+// A growth is a change of the ensemble without a source, and adds a replica to
+// its target.
+func TestPlanAddGrows(t *testing.T) {
+	s := cluster(3)
+	addShard(s, "a", 1, "n0").Leader = "n0"
+	pl := newPlan(s)
+
+	pl.add(model.Candidate{Kind: model.Grow, Namespace: "a", Shard: 1, To: "n2"})
+
+	assert.Len(t, pl.actions, 1)
+	change := pl.actions[0].(*action.ChangeEnsembleAction)
+	assert.Equal(t, int64(1), change.Shard)
+	assert.Nil(t, change.From)
+	assert.Equal(t, "n2", change.To.GetInternal())
+	assert.Equal(t, map[string]int{"n0": 1, "n2": 1}, pl.dataServerLoad.GetTotalReplicas())
+	assert.False(t, pl.allows(model.Candidate{Kind: model.Replace, Namespace: "a", Shard: 1, From: "n0", To: "n1"}),
+		"one op per shard")
+}

@@ -47,6 +47,7 @@ func New(dataServers map[string]commonobject.Borrowed[*proto.DataServer],
 		ns := &NamespaceStats{Shards: make(map[int64]*ShardStats)}
 		if config, ok := namespaces[name]; ok {
 			ns.AntiAffinities = config.UnsafeBorrow().GetAntiAffinities()
+			ns.ReplicationFactor = int(config.UnsafeBorrow().GetReplicationFactor())
 		}
 		for id, shard := range borrowed.UnsafeBorrow().GetShards() {
 			if shard.GetStatusOrDefault() == proto.ShardStatusDeleting {
@@ -62,11 +63,20 @@ func New(dataServers map[string]commonobject.Borrowed[*proto.DataServer],
 				ensemble = append(ensemble, memberName)
 			}
 			hashRange := shard.GetInt32HashRange()
+			var pendingDelete []string
+			if servers := shard.GetPendingDeleteShardNodes(); len(servers) > 0 {
+				pendingDelete = make([]string, 0, len(servers))
+				for _, server := range servers {
+					pendingDelete = append(pendingDelete, server.GetNameOrDefault())
+				}
+			}
 			ns.Shards[id] = &ShardStats{
-				Ensemble:  ensemble,
-				Leader:    shard.GetLeader().GetNameOrDefault(),
-				Changing:  shard.GetEnsembleChange() != nil,
-				Splitting: shard.GetSplit() != nil,
+				Ensemble:      ensemble,
+				Leader:        shard.GetLeader().GetNameOrDefault(),
+				Changing:      shard.GetEnsembleChange() != nil,
+				Steady:        shard.GetStatusOrDefault() == proto.ShardStatusSteadyState && shard.GetLeader() != nil,
+				Splitting:     shard.GetSplit() != nil,
+				PendingDelete: pendingDelete,
 				Splittable: shard.GetStatusOrDefault() == proto.ShardStatusSteadyState &&
 					hashRange.GetMax()-hashRange.GetMin() >= 1 && len(shard.GetPendingDeleteShardNodes()) == 0,
 			}

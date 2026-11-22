@@ -51,3 +51,20 @@ func TestMembershipTransfersFromTheLeaderToAnotherMember(t *testing.T) {
 func TestMembershipKeepsTheMembersOfASplit(t *testing.T) {
 	assert.NoError(t, Membership{}.Filter(newStats(), split))
 }
+
+// A growth adds a data server that isn't a member, and whose copy of the shard
+// isn't still to be deleted.
+func TestMembershipGrowsWithANewDataServerWithNothingToDelete(t *testing.T) {
+	s := newStats()
+	grow := func(to string) model.Candidate {
+		return model.Candidate{Kind: model.Grow, Namespace: "a", Shard: 1, To: to}
+	}
+
+	assert.NoError(t, Membership{}.Filter(s, grow("n2")))
+	assert.ErrorIs(t, Membership{}.Filter(s, grow("n1")), errs.ErrInvalidArgument)
+
+	s.Namespaces["a"].Shards[1].PendingDelete = []string{"n2"}
+
+	assert.ErrorIs(t, Membership{}.Filter(s, grow("n2")), errs.ErrFailedPrecondition)
+	assert.NoError(t, Membership{}.Filter(s, grow("n3")))
+}

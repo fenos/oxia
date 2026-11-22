@@ -79,3 +79,15 @@ func newLoadStats() *stats.ClusterStats {
 		},
 	}
 }
+
+// A growth adds a replica to the target, and takes none from anybody.
+func TestLoadMoveGrows(t *testing.T) {
+	s := newLoadStats()
+	l := NewLoad(s)
+
+	l.Move(s, model.Candidate{Kind: model.Grow, Namespace: "a", Shard: 1, To: "n1"})
+
+	assert.Equal(t, map[string]int{"n0": 1, "n1": 1}, l.GetReplicas("a"))
+	assert.Equal(t, map[string]int{"n0": 1, "n1": 1}, l.GetTotalReplicas())
+	assert.Equal(t, map[string]int{"n0": 1}, l.GetTotalLeaders())
+}

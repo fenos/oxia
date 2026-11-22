@@ -839,7 +839,7 @@ func TestElectionStartRestoresRemovedDataServerAhead(t *testing.T) {
 	rpc.GetNode(s3).NewTermResponse(2, 4, nil)
 	rpc.GetNode(s4).NewTermResponse(-1, -1, nil)
 	rpc.GetNode(s2).BecomeLeaderResponse(nil)
-	e := New(t.Context(), slog.Default(), nil, nil, metadata, feature.NoOpSupplier, rpc, constant.DefaultNamespace, shard, shardMeta, action.NewChangeEnsembleAction(shard, s2, s4), "", nil,
+	e := New(t.Context(), slog.Default(), nil, nil, metadata, feature.NoOpSupplier, rpc, constant.DefaultNamespace, shard, shardMeta, action.NewChangeEnsembleAction(shard, s2, s4), "", false, nil,
 		metric.NewLatencyHistogram("oxia_coordinator_leader_election_latency", "", nil),
 		metric.NewLatencyHistogram("oxia_coordinator_new_term_quorum_latency", "", nil),
 		metric.NewLatencyHistogram("oxia_coordinator_become_leader_latency", "", nil))
@@ -887,7 +887,7 @@ func TestElectionStartKeepsChangePending(t *testing.T) {
 			mailbox := make(chan async.Mail, 1)
 			e := New(t.Context(), slog.Default(), nil, mailbox, metadata, feature.NoOpSupplier,
 				rpc, constant.DefaultNamespace, shard, shardMeta,
-				action.NewChangeEnsembleAction(shard, s2, s4), "", nil,
+				action.NewChangeEnsembleAction(shard, s2, s4), "", false, nil,
 				metric.NewLatencyHistogram("oxia_coordinator_leader_election_latency", "", nil),
 				metric.NewLatencyHistogram("oxia_coordinator_new_term_quorum_latency", "", nil),
 				metric.NewLatencyHistogram("oxia_coordinator_become_leader_latency", "", nil))
@@ -1017,7 +1017,7 @@ func newTestElection(t *testing.T, metadata coordmetadata.Metadata, rpc coordrpc
 	shardMeta *proto.ShardMetadata) *election {
 	t.Helper()
 	labels := metric.LabelsForShard(constant.DefaultNamespace, shard)
-	e := New(t.Context(), slog.Default(), nil, nil, metadata, feature.NoOpSupplier, rpc, constant.DefaultNamespace, shard, shardMeta, nil, "", nil,
+	e := New(t.Context(), slog.Default(), nil, nil, metadata, feature.NoOpSupplier, rpc, constant.DefaultNamespace, shard, shardMeta, nil, "", false, nil,
 		metric.NewLatencyHistogram("oxia_coordinator_leader_election_latency",
 			"The time it takes to elect a leader for the shard", labels),
 		metric.NewLatencyHistogram("oxia_coordinator_new_term_quorum_latency",
@@ -1360,4 +1360,265 @@ func TestHighestWrittenTerm(t *testing.T) {
 		sharding.Candidates{testDataServer("s1"): candidate(3, 10), testDataServer("s2"): candidate(-1, -1)},
 		sharding.Candidates{testDataServer("removed"): candidate(7, 2)},
 	))
+}
+
+// newGrowthElection stores shardMeta and returns an election of it, which grows
+// the ensemble to to when to is set, and undoes a pending growth when undo is.
+func newGrowthElection(t *testing.T, metadata coordmetadata.Metadata, rpc coordrpc.ControllerRPCProvider,
+	shardMeta *proto.ShardMetadata, to *proto.DataServerIdentity, undo bool) (*election, chan async.Mail) {
+	t.Helper()
+	storeTestShardMetadata(t, metadata, constant.DefaultNamespace, 5, namespaceConfig, shardMeta)
+	var change *action.ChangeEnsembleAction
+	if to != nil {
+		change = action.NewChangeEnsembleAction(5, nil, to)
+	}
+	mailbox := make(chan async.Mail, 1)
+	e := New(t.Context(), slog.Default(), nil, mailbox, metadata, feature.NoOpSupplier,
+		rpc, constant.DefaultNamespace, 5, shardMeta, change, "", undo, nil,
+		metric.NewLatencyHistogram("oxia_coordinator_leader_election_latency", "", nil),
+		metric.NewLatencyHistogram("oxia_coordinator_new_term_quorum_latency", "", nil),
+		metric.NewLatencyHistogram("oxia_coordinator_become_leader_latency", "", nil)).(*election)
+	t.Cleanup(e.Cancel)
+	return e, mailbox
+}
+
+func newGrowthMetadata(t *testing.T) coordmetadata.Metadata {
+	t.Helper()
+	return newTestMetadata(t, memory.NewProvider(metadatacodec.ClusterStatusCodec, metadatacommon.WatchDisabled, ""),
+		&proto.ClusterConfiguration{})
+}
+
+// A growth is recorded with the new term, before any fence: the new member is
+// in the ensemble, and out of the pending deletions, even when the fence then
+// fails, so that no coordinator deletes its copy from then on.
+func TestElectionGrowthIsRecordedWithTheNewTerm(t *testing.T) {
+	s1, to := testDataServer("s1"), testDataServer("to")
+	metadata := newGrowthMetadata(t)
+	rpc := rpctest.NewRpcProvider()
+	rpc.GetNode(s1).NewTermResponse(0, 0, errors.New("unreachable"))
+	rpc.GetNode(to).NewTermResponse(0, 0, errors.New("unreachable"))
+	e, _ := newGrowthElection(t, metadata, rpc, &proto.ShardMetadata{Status: proto.ShardStatusSteadyState, Term: 2,
+		Leader: s1, Ensemble: []*proto.DataServerIdentity{s1}, PendingDeleteShardNodes: []*proto.DataServerIdentity{to}},
+		to, false)
+
+	_, err := e.Start()
+	require.Error(t, err)
+	stored := requireShardMetadata(t, metadata, constant.DefaultNamespace, 5)
+	assert.EqualValues(t, 3, stored.GetTerm())
+	assertShardEnsemble(t, stored.GetEnsemble(), s1, to)
+	require.NotNil(t, stored.GetEnsembleChange())
+	assert.Nil(t, stored.GetEnsembleChange().GetFrom())
+	assert.Equal(t, to.GetNameOrDefault(), stored.GetEnsembleChange().GetTo().GetNameOrDefault())
+	assert.Empty(t, stored.GetPendingDeleteShardNodes())
+}
+
+// The new member tied at the highest head has every committed entry: the
+// growth is finished by the election itself, and nothing is left to delete.
+func TestElectionGrowthFinishesWhenTheNewMemberIsAmongTheHighest(t *testing.T) {
+	s1, to := testDataServer("s1"), testDataServer("to")
+	metadata := newGrowthMetadata(t)
+	rpc := rpctest.NewRpcProvider()
+	rpc.GetNode(s1).NewTermResponse(2, 10, nil)
+	rpc.GetNode(to).NewTermResponse(2, 10, nil)
+	rpc.GetNode(s1).BecomeLeaderResponse(nil)
+	rpc.GetNode(to).BecomeLeaderResponse(nil)
+	e, _ := newGrowthElection(t, metadata, rpc, &proto.ShardMetadata{Status: proto.ShardStatusSteadyState, Term: 2,
+		Leader: s1, Ensemble: []*proto.DataServerIdentity{s1}}, to, false)
+
+	_, err := e.Start()
+	require.NoError(t, err)
+	stored := requireShardMetadata(t, metadata, constant.DefaultNamespace, 5)
+	assertShardEnsemble(t, stored.GetEnsemble(), s1, to)
+	assert.Nil(t, stored.GetEnsembleChange())
+	assert.Empty(t, stored.GetPendingDeleteShardNodes())
+}
+
+// The new member alone at the highest head, at three members, leads: a
+// member below it could miss an entry committed on the new member and one
+// other.
+func TestElectionGrowthLeaderIsTheNewMemberAloneAtTheHighest(t *testing.T) {
+	a, b, to := testDataServer("a"), testDataServer("b"), testDataServer("to")
+	metadata := newGrowthMetadata(t)
+	rpc := rpctest.NewRpcProvider()
+	rpc.GetNode(a).NewTermResponse(3, 8, nil)
+	rpc.GetNode(b).NewTermResponse(3, 9, nil)
+	rpc.GetNode(to).NewTermResponse(3, 12, nil)
+	rpc.GetNode(to).BecomeLeaderResponse(nil)
+	e, _ := newGrowthElection(t, metadata, rpc, &proto.ShardMetadata{Status: proto.ShardStatusSteadyState, Term: 3,
+		Leader: a, Ensemble: []*proto.DataServerIdentity{a, b, to},
+		EnsembleChange: &proto.EnsembleChangeMetadata{To: to}}, nil, false)
+
+	leader, err := e.Start()
+	require.NoError(t, err)
+	assert.Equal(t, to.GetNameOrDefault(), leader.GetNameOrDefault())
+	stored := requireShardMetadata(t, metadata, constant.DefaultNamespace, 5)
+	assert.Nil(t, stored.GetEnsembleChange())
+	assertShardEnsemble(t, stored.GetEnsemble(), a, b, to)
+}
+
+// A new member behind the highest head follows, and the growth stays pending
+// until a majority of the ensemble caught up: Tick then finishes it, with
+// nothing to delete.
+func TestElectionGrowthStaysPendingUntilTheEnsembleCaughtUp(t *testing.T) {
+	s1, to := testDataServer("s1"), testDataServer("to")
+	metadata := newGrowthMetadata(t)
+	rpc := rpctest.NewRpcProvider()
+	rpc.GetNode(s1).NewTermResponse(2, 10, nil)
+	rpc.GetNode(to).NewTermResponse(2, 5, nil)
+	rpc.GetNode(s1).BecomeLeaderResponse(nil)
+	e, mailbox := newGrowthElection(t, metadata, rpc, &proto.ShardMetadata{Status: proto.ShardStatusSteadyState,
+		Term: 2, Leader: s1, Ensemble: []*proto.DataServerIdentity{s1}}, to, false)
+
+	leader, err := e.Start()
+	require.NoError(t, err)
+	assert.Equal(t, s1.GetNameOrDefault(), leader.GetNameOrDefault())
+	stored := requireShardMetadata(t, metadata, constant.DefaultNamespace, 5)
+	require.NotNil(t, stored.GetEnsembleChange(), "pending while the new member is behind")
+
+	rpc.GetNode(to).GetStatusResponse(3, proto.ServingStatus_FOLLOWER, 10, 10)
+	<-mailbox
+	require.NoError(t, e.Tick())
+	stored = requireShardMetadata(t, metadata, constant.DefaultNamespace, 5)
+	assert.Nil(t, stored.GetEnsembleChange())
+	assertShardEnsemble(t, stored.GetEnsemble(), s1, to)
+	assert.Empty(t, stored.GetPendingDeleteShardNodes())
+}
+
+// A growth is undone, back to the ensemble before it and with the new member
+// to delete, when the fence can't reach a majority of the ensemble, e.g. the
+// new member is down, and when it missed its deadline with the new member
+// behind; the ensemble before it is fenced in both cases.
+func TestElectionGrowthIsUndone(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		undo bool
+		down bool
+	}{
+		{name: "the new member is down", down: true},
+		{name: "the growth missed its deadline", undo: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s1, to := testDataServer("s1"), testDataServer("to")
+			metadata := newGrowthMetadata(t)
+			rpc := rpctest.NewRpcProvider()
+			rpc.GetNode(s1).NewTermResponse(3, 10, nil)
+			if test.down {
+				rpc.GetNode(to).NewTermResponse(0, 0, errors.New("unreachable"))
+			} else {
+				rpc.GetNode(to).NewTermResponse(3, 5, nil)
+			}
+			rpc.GetNode(s1).BecomeLeaderResponse(nil)
+			e, _ := newGrowthElection(t, metadata, rpc, &proto.ShardMetadata{Status: proto.ShardStatusSteadyState,
+				Term: 3, Leader: s1, Ensemble: []*proto.DataServerIdentity{s1, to},
+				EnsembleChange: &proto.EnsembleChangeMetadata{To: to}}, nil, test.undo)
+
+			leader, err := e.Start()
+			require.NoError(t, err)
+			assert.Equal(t, s1.GetNameOrDefault(), leader.GetNameOrDefault())
+			rpc.GetNode(s1).ExpectBecomeLeaderRequest(t, 5, 4, 1)
+			stored := requireShardMetadata(t, metadata, constant.DefaultNamespace, 5)
+			assertShardEnsemble(t, stored.GetEnsemble(), s1)
+			assert.Nil(t, stored.GetEnsembleChange())
+			assertShardEnsemble(t, stored.GetPendingDeleteShardNodes(), to)
+		})
+	}
+}
+
+// An overdue growth isn't undone without a majority of the ensemble before it:
+// the election fails, to be retried, and doesn't stop the elections.
+func TestElectionGrowthIsNotUndoneWithoutAMajorityBeforeIt(t *testing.T) {
+	a, b, to := testDataServer("a"), testDataServer("b"), testDataServer("to")
+	metadata := newGrowthMetadata(t)
+	rpc := rpctest.NewRpcProvider()
+	rpc.GetNode(a).NewTermResponse(3, 10, nil)
+	rpc.GetNode(b).NewTermResponse(0, 0, errors.New("unreachable"))
+	rpc.GetNode(to).NewTermResponse(3, 5, nil)
+	e, _ := newGrowthElection(t, metadata, rpc, &proto.ShardMetadata{Status: proto.ShardStatusSteadyState, Term: 3,
+		Leader: a, Ensemble: []*proto.DataServerIdentity{a, b, to},
+		EnsembleChange: &proto.EnsembleChangeMetadata{To: to}}, nil, true)
+
+	_, err := e.Start()
+	require.ErrorIs(t, err, errGrowthNotUndone)
+	require.ErrorIs(t, err, errs.ErrUnavailable)
+	assert.NotErrorIs(t, err, errs.ErrShardNotElectable)
+	stored := requireShardMetadata(t, metadata, constant.DefaultNamespace, 5)
+	assertShardEnsemble(t, stored.GetEnsemble(), a, b, to)
+	require.NotNil(t, stored.GetEnsembleChange())
+}
+
+// The fence of a growth overlaps every majority of the ensemble before it,
+// which is one member smaller, and reaches a majority of the ensemble after
+// it, or the majority before it for an undo.
+func TestElectionGrowthFenceQuorum(t *testing.T) {
+	a, b, to := testDataServer("a"), testDataServer("b"), testDataServer("to")
+	growth := &proto.EnsembleChangeMetadata{To: to}
+	ensemble := []*proto.DataServerIdentity{a, b, to}
+
+	rpc := rpctest.NewRpcProvider()
+	e := newTestElection(t, nil, rpc, 5, &proto.ShardMetadata{})
+	rpc.GetNode(a).NewTermResponse(3, 1, nil)
+	rpc.GetNode(b).NewTermResponse(0, 0, errors.New("unreachable"))
+	rpc.GetNode(to).NewTermResponse(3, 1, nil)
+	heads, retained, _, err := e.fenceQuorum(4, &proto.NewTermOptions{}, ensemble, growth)
+	require.NoError(t, err, "one member before it and a majority after it")
+	assert.Len(t, heads, 2)
+	assert.Empty(t, retained, "a growth retains nobody")
+
+	rpc = rpctest.NewRpcProvider()
+	e = newTestElection(t, nil, rpc, 5, &proto.ShardMetadata{})
+	rpc.GetNode(a).NewTermResponse(0, 0, errors.New("unreachable"))
+	rpc.GetNode(b).NewTermResponse(0, 0, errors.New("unreachable"))
+	rpc.GetNode(to).NewTermResponse(3, 1, nil)
+	_, _, _, err = e.fenceQuorum(4, &proto.NewTermOptions{}, ensemble, growth)
+	assert.ErrorContains(t, err, "quorum not reached", "the new member alone overlaps no majority before it")
+
+	rpc = rpctest.NewRpcProvider()
+	e = newTestElection(t, nil, rpc, 5, &proto.ShardMetadata{})
+	rpc.GetNode(a).NewTermResponse(3, 1, nil)
+	rpc.GetNode(b).NewTermResponse(0, 0, errors.New("unreachable"))
+	_, _, _, err = e.fenceQuorum(4, &proto.NewTermOptions{}, []*proto.DataServerIdentity{a, b},
+		&proto.EnsembleChangeMetadata{To: b})
+	require.NoError(t, err, "a majority before it suffices to undo it")
+}
+
+// The writes of an election compare the stored term with the one it started
+// from: a shard that another coordinator elected since isn't overwritten, and
+// the election fails, to be retried from the stored status.
+func TestElectionWritesCompareTheTerm(t *testing.T) {
+	s1 := testDataServer("s1")
+	for _, test := range []struct {
+		name   string
+		writes int
+	}{
+		{name: "the new term", writes: 1},
+		{name: "the new leader", writes: 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			base := newGrowthMetadata(t)
+			shardMeta := &proto.ShardMetadata{Status: proto.ShardStatusSteadyState, Term: 2, Leader: s1,
+				Ensemble: []*proto.DataServerIdentity{s1}}
+			storeTestShardMetadata(t, base, constant.DefaultNamespace, 5, namespaceConfig, shardMeta)
+			metadata := &hookedMetadata{Metadata: base}
+			writes := 0
+			metadata.patchShardStatus = func(namespace string, shard int64, modify func(*proto.ShardMetadata) (bool, error)) error {
+				if writes++; writes == test.writes {
+					// Another coordinator elected the shard meanwhile
+					require.NoError(t, base.PatchShardStatus(namespace, shard, func(current *proto.ShardMetadata) (bool, error) {
+						current.Term += 5
+						return true, nil
+					}))
+				}
+				return base.PatchShardStatus(namespace, shard, modify)
+			}
+			rpc := rpctest.NewRpcProvider()
+			rpc.GetNode(s1).NewTermResponse(2, 0, nil)
+			e := newTestElection(t, metadata, rpc, 5, shardMeta)
+
+			_, err := e.Start()
+			require.ErrorIs(t, err, errTermMoved)
+			require.ErrorIs(t, err, errs.ErrUnavailable)
+			stored := requireShardMetadata(t, base, constant.DefaultNamespace, 5)
+			assert.EqualValues(t, 2+test.writes+4, stored.GetTerm(), "the term of the other coordinator stays")
+		})
+	}
 }

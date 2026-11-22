@@ -78,7 +78,7 @@ func (l *Load) Move(s *stats.ClusterStats, op model.Candidate) {
 	if op.Kind == model.TransferLeader {
 		counts, total = l.leaders, l.totalLeader
 	}
-	if !s.DataServers[op.From].Removed {
+	if op.Kind != model.Grow && !s.DataServers[op.From].Removed {
 		add(counts, total, op.Namespace, op.From, -1)
 	}
 	add(counts, total, op.Namespace, op.To, 1)

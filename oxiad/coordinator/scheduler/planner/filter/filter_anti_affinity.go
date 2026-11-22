@@ -23,7 +23,7 @@ import (
 	"github.com/oxia-db/oxia/oxiad/coordinator/scheduler/model/stats"
 )
 
-// AntiAffinity rejects a replace whose target breaks an anti-affinity of the
+// AntiAffinity rejects a replace or a growth whose target breaks an anti-affinity of the
 // namespace: e.g. with an anti-affinity on the label zone, no two members of a
 // shard may share a zone, so that losing a zone loses at most one replica. A
 // transfer and a split keep the ensemble, so they can't break one. It runs
@@ -35,7 +35,7 @@ func (AntiAffinity) GetName() string {
 }
 
 func (AntiAffinity) Filter(s *stats.ClusterStats, op model.Candidate) error {
-	if op.Kind != model.Replace {
+	if op.Kind != model.Replace && op.Kind != model.Grow {
 		return nil
 	}
 	ns, shard := op.GetShard(s)
