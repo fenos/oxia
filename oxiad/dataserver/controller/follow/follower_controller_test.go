@@ -1743,6 +1743,9 @@ func TestFollower_SplitHashRangeFiltering(t *testing.T) {
 
 	snapshot, err := snapshotDb.Snapshot()
 	assert.NoError(t, err)
+	// The database stops its notification trimmer: left running, it reads the
+	// files the test's cleanup deletes
+	assert.NoError(t, snapshotDb.Close())
 	assert.NoError(t, snapshotKvFactory.Close())
 
 	// Install snapshot
