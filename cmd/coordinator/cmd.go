@@ -21,9 +21,7 @@ import (
 	"io"
 	"log/slog"
 
-	"github.com/fsnotify/fsnotify"
 	"github.com/spf13/cobra"
-	"github.com/spf13/viper"
 
 	"github.com/oxia-db/oxia/common/codec"
 
@@ -31,6 +29,7 @@ import (
 	"github.com/oxia-db/oxia/cmd/common/version"
 	"github.com/oxia-db/oxia/common/constant"
 	"github.com/oxia-db/oxia/common/process"
+	commonfile "github.com/oxia-db/oxia/oxiad/common/file"
 	oxiadcommonoption "github.com/oxia-db/oxia/oxiad/common/option"
 	commonwatch "github.com/oxia-db/oxia/oxiad/common/watch"
 	"github.com/oxia-db/oxia/oxiad/coordinator"
@@ -121,10 +120,7 @@ func exec(cmd *cobra.Command, _ []string) error {
 			if err := codec.TryReadAndInitConf(sconfFile, coordinatorOptions); err != nil {
 				return nil, err
 			}
-			// start listener
-			v := viper.New()
-			v.SetConfigFile(sconfFile)
-			v.OnConfigChange(func(fsnotify.Event) {
+			commonfile.ReloadOnChange(ctx, sconfFile, func() {
 				temporaryOptions := option.NewDefaultOptions()
 				if err := codec.TryReadAndInitConf(sconfFile, temporaryOptions); err != nil {
 					slog.Warn("parse updated configuration file failed", slog.Any("err", err))
@@ -136,7 +132,6 @@ func exec(cmd *cobra.Command, _ []string) error {
 					slog.Any("current", temporaryOptions))
 				optionsWatch.Publish(temporaryOptions)
 			})
-			v.WatchConfig()
 		} else {
 			coordinatorOptions.WithDefault()
 			if err := coordinatorOptions.Validate(); err != nil {

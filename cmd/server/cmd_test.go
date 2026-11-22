@@ -16,6 +16,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -30,6 +31,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/oxia-db/oxia/common/codec"
+	"github.com/oxia-db/oxia/common/failpoint"
 	"github.com/oxia-db/oxia/oxiad/dataserver/option"
 )
 
@@ -329,6 +331,31 @@ func TestExecReloadsChangedConfigFile(t *testing.T) {
 	require.True(t, handler.waitFor("parse updated configuration file failed"))
 	overwriteConfigFile(t, configPath, config)
 	require.True(t, handler.waitFor("configuration file has changed."))
+	cancel()
+
+	assert.NoError(t, <-errs)
+}
+
+// A host out of inotify instances can't watch the configuration file: the
+// process runs on, and reads the file again at its next start.
+func TestExecRunsOnWhenTheConfigFileCantBeWatched(t *testing.T) {
+	if !failpoint.Enabled {
+		t.Skip("needs failpoints: disabled by the disable_trap tag")
+	}
+	resetCmd(t)
+	failpoint.Enable("watchFile.newWatcher", errors.New("too many open files"))
+	t.Cleanup(func() { failpoint.Disable("watchFile.newWatcher") })
+	handler := newRecordingHandler(t)
+	configPath := writeConfigFile(t, validConfig(t.TempDir()))
+	Cmd.SetArgs([]string{"--sconfig", configPath})
+	ctx, cancel := context.WithCancel(t.Context())
+	errs := make(chan error, 1)
+	go func() {
+		errs <- Cmd.ExecuteContext(ctx)
+	}()
+
+	require.True(t, handler.waitFor("Failed to watch the file: its changes apply at the next start"))
+	require.True(t, handler.waitFor("Starting Oxia DATASERVER"))
 	cancel()
 
 	assert.NoError(t, <-errs)

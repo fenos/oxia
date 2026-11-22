@@ -473,6 +473,31 @@ func TestExecReloadsChangedConfigFile(t *testing.T) {
 	assert.NoError(t, <-errs)
 }
 
+// A host out of inotify instances can't watch the configuration file: the
+// process runs on, and reads the file again at its next start.
+func TestExecRunsOnWhenTheConfigFileCantBeWatched(t *testing.T) {
+	if !failpoint.Enabled {
+		t.Skip("needs failpoints: disabled by the disable_trap tag")
+	}
+	resetCmd(t)
+	failpoint.Enable("watchFile.newWatcher", errors.New("too many open files"))
+	t.Cleanup(func() { failpoint.Disable("watchFile.newWatcher") })
+	handler := newRecordingHandler(t)
+	configPath := writeConfigFile(t, validConfig)
+	Cmd.SetArgs([]string{"--sconfig", configPath})
+	ctx, cancel := context.WithCancel(t.Context())
+	errs := make(chan error, 1)
+	go func() {
+		errs <- Cmd.ExecuteContext(ctx)
+	}()
+
+	require.True(t, handler.waitFor("Failed to watch the file: its changes apply at the next start"))
+	require.True(t, handler.waitFor("Starting Oxia coordinator"))
+	cancel()
+
+	assert.NoError(t, <-errs)
+}
+
 func TestExecReturnsValidationError(t *testing.T) {
 	resetCmd(t)
 	Cmd.SetArgs([]string{"--metadata", "invalid-provider", "--public-addr", "localhost:0",

@@ -21,13 +21,12 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/fsnotify/fsnotify"
 	"github.com/spf13/cobra"
-	"github.com/spf13/viper"
 
 	"github.com/oxia-db/oxia/common/codec"
 
 	"github.com/oxia-db/oxia/common/constant"
+	commonfile "github.com/oxia-db/oxia/oxiad/common/file"
 	oxiadcommonoption "github.com/oxia-db/oxia/oxiad/common/option"
 	commonwatch "github.com/oxia-db/oxia/oxiad/common/watch"
 	"github.com/oxia-db/oxia/oxiad/dataserver/option"
@@ -128,7 +127,10 @@ func init() {
 
 func exec(cmd *cobra.Command, _ []string) error {
 	version.RegisterMetric(version.Get(cmd.Root().Version))
-	return process.RunProcess(cmd.Context(), "DATASERVER", func() (io.Closer, error) {
+	// The watch of the configuration file lasts as long as the process
+	ctx, cancel := context.WithCancel(cmd.Context())
+	defer cancel()
+	return process.RunProcess(ctx, "DATASERVER", func() (io.Closer, error) {
 		optionsWatch := commonwatch.New(dataServerOptions)
 		switch {
 		case cmd.Flags().Changed("sconfig"):
@@ -136,10 +138,7 @@ func exec(cmd *cobra.Command, _ []string) error {
 			if err := codec.TryReadAndInitConf(sconfFile, dataServerOptions); err != nil {
 				return nil, err
 			}
-			// start listener
-			v := viper.New()
-			v.SetConfigFile(sconfFile)
-			v.OnConfigChange(func(fsnotify.Event) {
+			commonfile.ReloadOnChange(ctx, sconfFile, func() {
 				temporaryOptions := option.NewDefaultOptions()
 				if err := codec.TryReadAndInitConf(sconfFile, temporaryOptions); err != nil {
 					slog.Warn("parse updated configuration file failed", slog.Any("err", err))
@@ -151,7 +150,6 @@ func exec(cmd *cobra.Command, _ []string) error {
 					slog.Any("current", temporaryOptions))
 				optionsWatch.Publish(temporaryOptions)
 			})
-			v.WatchConfig()
 		default:
 			dataServerOptions.WithDefault()
 			if err := dataServerOptions.Validate(); err != nil {

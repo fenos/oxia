@@ -69,16 +69,73 @@ func TestWatchFileReturnsErrorForMissingDirectory(t *testing.T) {
 }
 
 func TestWatchFileReturnsWatcherCreationError(t *testing.T) {
-	skipWithoutFailpoints(t)
-	injected := errors.New("injected")
-	failpoints := failpoint.New(map[string]func() error{
-		"watchFile.newWatcher": func() error { return injected },
+	failWatcherCreation(t)
+
+	changes, err := WatchFile(t.Context(), filepath.Join(t.TempDir(), "config.yaml"))
+
+	assert.ErrorIs(t, err, errWatcherCreation)
+	assert.Nil(t, changes)
+}
+
+// A Kubernetes ConfigMap volume updates a file by swapping the link of its
+// directory: the file's own path sees no event.
+func TestWatchFileSignalsWhenThePathLinksToAnotherFile(t *testing.T) {
+	dir := t.TempDir()
+	writeVersion := func(version string) {
+		require.NoError(t, os.Mkdir(filepath.Join(dir, version), 0o700))
+		require.NoError(t, os.WriteFile(filepath.Join(dir, version, "config.yaml"), []byte(version), 0o600))
+	}
+	writeVersion("..v1")
+	require.NoError(t, os.Symlink("..v1", filepath.Join(dir, "..data")))
+	path := filepath.Join(dir, "config.yaml")
+	require.NoError(t, os.Symlink(filepath.Join("..data", "config.yaml"), path))
+
+	changes, err := WatchFile(t.Context(), path)
+	require.NoError(t, err)
+
+	writeVersion("..v2")
+	require.NoError(t, os.Symlink("..v2", filepath.Join(dir, "..data_tmp")))
+	require.NoError(t, os.Rename(filepath.Join(dir, "..data_tmp"), filepath.Join(dir, "..data")))
+	select {
+	case _, ok := <-changes:
+		assert.True(t, ok)
+	case <-time.After(10 * time.Second):
+		require.FailNow(t, "no change signalled for the swapped link")
+	}
+	content, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, "..v2", string(content))
+}
+
+func TestReloadOnChangeReloadsTheChangedFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	reloads := make(chan struct{}, 1)
+
+	ReloadOnChange(t.Context(), path, func() {
+		select {
+		case reloads <- struct{}{}:
+		default:
+		}
 	})
 
-	changes, err := watchFile(t.Context(), filepath.Join(t.TempDir(), "config.yaml"), failpoints)
+	require.NoError(t, os.WriteFile(path, []byte("a: 1"), 0o600))
+	select {
+	case <-reloads:
+	case <-time.After(10 * time.Second):
+		require.FailNow(t, "the changed file was not reloaded")
+	}
+}
 
-	assert.ErrorIs(t, err, injected)
-	assert.Nil(t, changes)
+// A host out of inotify instances fails the creation of the watcher: the
+// process runs on, without the reloads.
+func TestReloadOnChangeRunsOnWithoutAWatch(t *testing.T) {
+	failWatcherCreation(t)
+
+	assert.NotPanics(t, func() {
+		ReloadOnChange(t.Context(), filepath.Join(t.TempDir(), "config.yaml"), func() {
+			assert.Fail(t, "reloaded without a watch")
+		})
+	})
 }
 
 func TestWatchFileClosesWhenTheWatchFails(t *testing.T) {
@@ -178,6 +235,17 @@ func assertClosed(t *testing.T, changes <-chan struct{}) {
 	case <-time.After(10 * time.Second):
 		require.FailNow(t, "the changes channel was not closed")
 	}
+}
+
+var errWatcherCreation = errors.New("too many open files")
+
+// failWatcherCreation fails the creation of the file watchers of the process
+// with errWatcherCreation until the test ends.
+func failWatcherCreation(t *testing.T) {
+	t.Helper()
+	skipWithoutFailpoints(t)
+	failpoint.Enable("watchFile.newWatcher", errWatcherCreation)
+	t.Cleanup(func() { failpoint.Disable("watchFile.newWatcher") })
 }
 
 func skipWithoutFailpoints(t *testing.T) {
