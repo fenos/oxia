@@ -35,6 +35,7 @@ import (
 	"github.com/oxia-db/oxia/common/constant"
 	"github.com/oxia-db/oxia/common/failpoint"
 	"github.com/oxia-db/oxia/oxiad/dataserver/database"
+	"github.com/oxia-db/oxia/oxiad/dataserver/database/kvstore"
 	dataserverrpc "github.com/oxia-db/oxia/oxiad/dataserver/rpc"
 
 	"github.com/oxia-db/oxia/oxiad/dataserver/wal"
@@ -421,6 +422,11 @@ func (fc *followerCursor) sendSnapshot() error {
 
 	defer snapshot.Close()
 
+	manifest, err := newSnapshotManifest(snapshot)
+	if err != nil {
+		return err
+	}
+
 	var chunksCount, totalSize int64
 	startTime := time.Now()
 
@@ -437,13 +443,17 @@ func (fc *followerCursor) sendSnapshot() error {
 			slog.Int("chunk-size", len(content)),
 		)
 
-		if err := stream.Send(&proto.SnapshotChunk{
+		snapshotChunk := &proto.SnapshotChunk{
 			Term:       fc.term,
 			Name:       chunk.Name(),
 			ChunkIndex: chunk.Index(),
 			ChunkCount: chunk.TotalCount(),
 			Content:    content,
-		}); err != nil {
+		}
+		if chunksCount == 0 {
+			snapshotChunk.Manifest = manifest
+		}
+		if err := stream.Send(snapshotChunk); err != nil {
 			return err
 		}
 
@@ -475,6 +485,19 @@ func (fc *followerCursor) sendSnapshot() error {
 	fc.ackOffset.Store(response.AckOffset)
 	fc.snapshotsCompletedCounter.Inc()
 	return nil
+}
+
+// newSnapshotManifest describes a snapshot to the follower, from its files.
+func newSnapshotManifest(snapshot kvstore.Snapshot) (*proto.SnapshotManifest, error) {
+	state, err := database.ReadCheckpoint(snapshot.BasePath())
+	if err != nil {
+		return nil, err
+	}
+	return &proto.SnapshotManifest{
+		CommitOffset: state.CommitOffset,
+		CommitTerm:   state.CommitTerm,
+		TotalSize:    snapshot.Size(),
+	}, nil
 }
 
 func (fc *followerCursor) streamEntriesLoop(ctx context.Context, reader wal.Reader, currentOffset int64) error {

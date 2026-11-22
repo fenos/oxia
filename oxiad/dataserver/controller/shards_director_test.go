@@ -159,9 +159,9 @@ func TestShardsDirectorRoutesCheckpointAndCommitOffsetToTheHostingController(t *
 	assert.EqualValues(t, 1, offset)
 	checkpoint, err := sd.Checkpoint(led)
 	require.NoError(t, err)
-	commitOffset, _, err := database.ReadCheckpoint(checkpoint.BasePath())
+	state, err := database.ReadCheckpoint(checkpoint.BasePath())
 	require.NoError(t, err)
-	assert.EqualValues(t, 1, commitOffset)
+	assert.EqualValues(t, 1, state.CommitOffset)
 	assert.NoError(t, checkpoint.Close())
 	require.NoError(t, sd.WithDatabase(led, checkpoint.Generation, func(dir string) error {
 		assert.Equal(t, sd.DatabaseDir(constant.DefaultNamespace, led), dir)
@@ -405,7 +405,7 @@ func TestShardsDirectorNewInstallerFailsWhenClosed(t *testing.T) {
 	sd := newTestShardsDirector(t)
 	require.NoError(t, sd.Close())
 
-	_, err := sd.NewInstaller(constant.DefaultNamespace, 1)
+	_, err := sd.NewInstaller(context.Background(), constant.DefaultNamespace, 1)
 	assert.ErrorIs(t, err, constant.ErrResourceUnavailable)
 }
 
@@ -415,7 +415,7 @@ func TestShardsDirectorNewInstallerFollowerCloseError(t *testing.T) {
 	follower := &fakeFollowerController{close: func() error { return closeErr }}
 	sd.followers[1] = follower
 
-	_, err := sd.NewInstaller(constant.DefaultNamespace, 1)
+	_, err := sd.NewInstaller(context.Background(), constant.DefaultNamespace, 1)
 	assert.ErrorIs(t, err, closeErr)
 
 	// The follower stays in place

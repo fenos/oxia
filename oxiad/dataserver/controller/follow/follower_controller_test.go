@@ -1104,10 +1104,9 @@ func (s *abortedSnapshotStream) Recv() (*proto.SnapshotChunk, error) {
 	return nil, context.Canceled
 }
 
-// The installation of a snapshot replaces the wal and the database of the
-// follower, which must stop reporting the entries that it had: while it
-// installs the snapshot, and when the installation fails, where it recovers an
-// empty database.
+// A follower receives a snapshot beside its wal and its database, which it keeps
+// until the snapshot replaces them: it reports their entries while it receives
+// the snapshot, and after an installation that fails.
 func TestFollower_FailedSnapshotInstall(t *testing.T) {
 	var shardId int64
 	kvFactory, err := kvstore.NewPebbleKVFactory(kvstore.NewFactoryOptionsForTest(t))
@@ -1144,21 +1143,23 @@ func TestFollower_FailedSnapshotInstall(t *testing.T) {
 	}
 	installErr := make(chan error, 1)
 	go func() { installErr <- fc.InstallSnapshot(abortedStream) }()
-	assert.Eventually(t, func() bool {
-		status, err := fc.GetStatus(&proto.GetStatusRequest{Shard: shardId})
-		return err == nil && status.HeadOffset == wal.InvalidOffset && status.CommitOffset == wal.InvalidOffset
-	}, 10*time.Second, 10*time.Millisecond, "the follower reports the entries that it is replacing")
+	require.Eventually(t, writerIsWaiting(fc.(*followerController)), 10*time.Second, 10*time.Millisecond,
+		"the follower receives the snapshot")
+	status, err = fc.GetStatus(&proto.GetStatusRequest{Shard: shardId})
+	require.NoError(t, err)
+	assert.EqualValues(t, 99, status.HeadOffset)
+	assert.EqualValues(t, 99, status.CommitOffset)
 	close(abortedStream.abort)
 	assert.Error(t, <-installErr)
 
 	status, err = fc.GetStatus(&proto.GetStatusRequest{Shard: shardId})
 	require.NoError(t, err)
-	assert.EqualValues(t, wal.InvalidOffset, status.HeadOffset)
-	assert.EqualValues(t, wal.InvalidOffset, status.CommitOffset)
+	assert.EqualValues(t, 99, status.HeadOffset)
+	assert.EqualValues(t, 99, status.CommitOffset)
 
 	res, err := fc.NewTerm(&proto.NewTermRequest{Term: 2})
 	require.NoError(t, err)
-	assertProtoEqual(t, constant2.InvalidEntryId, res.HeadEntryId)
+	assertProtoEqual(t, &proto.EntryId{Term: 1, Offset: 99}, res.HeadEntryId)
 
 	assert.NoError(t, snapshot.Close())
 	assert.NoError(t, fc.Close())
@@ -3404,19 +3405,19 @@ func TestFollowerControllerCheckpointReadsTheDatabase(t *testing.T) {
 
 	checkpoint, err := fc.Checkpoint()
 	require.NoError(t, err)
-	commitOffset, term, err := database.ReadCheckpoint(checkpoint.BasePath())
+	state, err := database.ReadCheckpoint(checkpoint.BasePath())
 	require.NoError(t, err)
-	assert.EqualValues(t, wal.InvalidOffset, commitOffset)
-	assert.EqualValues(t, wal.InvalidTerm, term)
+	assert.EqualValues(t, wal.InvalidOffset, state.CommitOffset)
+	assert.EqualValues(t, wal.InvalidTerm, state.Term)
 	require.NoError(t, checkpoint.Close())
 
 	_, err = fc.NewTerm(&proto.NewTermRequest{Term: 4})
 	require.NoError(t, err)
 	checkpoint, err = fc.Checkpoint()
 	require.NoError(t, err)
-	_, term, err = database.ReadCheckpoint(checkpoint.BasePath())
+	state, err = database.ReadCheckpoint(checkpoint.BasePath())
 	require.NoError(t, err)
-	assert.EqualValues(t, 4, term, "the term is recorded in the database")
+	assert.EqualValues(t, 4, state.Term, "the term is recorded in the database")
 	require.NoError(t, checkpoint.Close())
 
 	// The database is still the one of the checkpoint
@@ -3956,11 +3957,12 @@ func TestFollowerControllerInstallSnapshotRecoversFromFailures(t *testing.T) {
 		kvHooks  kvHooks
 		err      string
 	}{
-		{"clear-wal", walHooks{clear: failing}, kvHooks{}, "failed to clear WAL"},
+		// The install completes when the follower reopens its database
+		{"clear-wal", walHooks{clear: failingOnce(1)}, kvHooks{}, "failed to clear log"},
 		{"new-loader", walHooks{}, kvHooks{newSnapshotLoader: failing}, "failed to create snapshot loader"},
 		{"first-chunk", walHooks{}, kvHooks{addChunk: failing}, "failed to add snapshot chunk"},
 		{"next-chunk", walHooks{}, kvHooks{addChunk: failingOnce(2)}, "failed to add snapshot chunk"},
-		{"complete", walHooks{}, kvHooks{complete: failing}, "failed to complete snapshot"},
+		{"install", walHooks{}, kvHooks{install: failing}, "failed to install snapshot"},
 		{"open", walHooks{}, kvHooks{newKV: failingOnce(1)}, "failed to initialize database"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -3984,22 +3986,137 @@ func TestFollowerControllerInstallSnapshotRecoversFromFailures(t *testing.T) {
 	}
 }
 
-// A follower that fails to install a snapshot, and then to re-open its
-// database, is left without a database.
+// A follower that fails to install a snapshot, and then to complete the
+// install or to re-open its database, is left without a database.
 func TestFollowerControllerInstallSnapshotFailsToRecoverDatabase(t *testing.T) {
+	failing := func() error { return errors.New("injected") }
+	for _, test := range []struct {
+		name     string
+		walHooks walHooks
+		kvHooks  kvHooks
+		err      string
+	}{
+		{"complete-install", walHooks{clear: failing}, kvHooks{}, "failed to clear log"},
+		{"open", walHooks{}, kvHooks{newKV: failing}, "failed to initialize database"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			walFactory, kvFactory := newHookFactories(t)
+			fc := newFencedFollower(t, walFactory, kvFactory)
+
+			walFactory.setHooks(func(h *walHooks) { *h = test.walHooks })
+			kvFactory.setHooks(func(h *kvHooks) { *h = test.kvHooks })
+			err := fc.InstallSnapshot(newSnapshotStream(snapshotChunks(t, 1)))
+			assert.ErrorContains(t, err, test.err)
+			fci := fc.(*followerController)
+			assert.Nil(t, fci.db)
+
+			// Close needs the database: release the rest
+			fci.cancel()
+			fci.waitGroup.Wait()
+			walFactory.setHooks(func(h *walHooks) { *h = walHooks{} })
+			assert.NoError(t, fci.wal.Close())
+		})
+	}
+}
+
+// The leader announces the commit entry of the snapshot on its first chunk: a
+// snapshot that doesn't hold it, or that doesn't open, never replaces the
+// database of the follower.
+func TestFollowerControllerInstallSnapshotChecksTheSnapshot(t *testing.T) {
+	chunks := snapshotChunks(t, 1)
+	for _, test := range []struct {
+		name   string
+		chunks []*proto.SnapshotChunk
+		err    error
+	}{
+		{"commit-offset", withManifest(chunks, &proto.SnapshotManifest{CommitOffset: 150, CommitTerm: 1}),
+			errs.ErrDataCorrupted},
+		{"commit-term", withManifest(chunks, &proto.SnapshotManifest{CommitOffset: 99, CommitTerm: 2}),
+			errs.ErrDataCorrupted},
+		// A leader that doesn't announce the commit entry sends the snapshot of
+		// its term
+		{"term", withTerm(snapshotChunks(t, 2), 1), errs.ErrDataCorrupted},
+		{"files", []*proto.SnapshotChunk{{Term: 1, Name: "CURRENT", Content: []byte("garbage"), ChunkCount: 1}},
+			nil},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			walFactory, kvFactory := newHookFactories(t)
+			fc := newReplicatingFollower(t, walFactory, kvFactory)
+			appendUncommittedEntries(t, fc, 3)
+
+			err := fc.InstallSnapshot(newSnapshotStream(test.chunks))
+			assert.ErrorContains(t, err, "failed to install snapshot")
+			if test.err != nil {
+				assert.ErrorIs(t, err, test.err)
+			}
+
+			// The follower keeps its entries
+			status, err := fc.GetStatus(&proto.GetStatusRequest{})
+			require.NoError(t, err)
+			assert.EqualValues(t, 2, status.HeadOffset)
+			assert.NoError(t, fc.Close())
+		})
+	}
+}
+
+func TestFollowerControllerInstallSnapshotAcceptsTheAnnouncedSnapshot(t *testing.T) {
 	walFactory, kvFactory := newHookFactories(t)
 	fc := newFencedFollower(t, walFactory, kvFactory)
 
-	kvFactory.setHooks(func(h *kvHooks) { h.newKV = func() error { return errors.New("open failed") } })
-	err := fc.InstallSnapshot(newSnapshotStream(snapshotChunks(t, 1)))
-	assert.ErrorContains(t, err, "failed to initialize database")
-	fci := fc.(*followerController)
-	assert.Nil(t, fci.db)
+	err := fc.InstallSnapshot(newSnapshotStream(withManifest(snapshotChunks(t, 1),
+		&proto.SnapshotManifest{CommitOffset: 99, CommitTerm: 1})))
+	require.NoError(t, err)
+	assert.EqualValues(t, 99, fc.CommitOffset())
+	assert.NoError(t, fc.Close())
+}
 
-	// Close needs the database: release the rest
-	fci.cancel()
-	fci.waitGroup.Wait()
-	assert.NoError(t, fci.wal.Close())
+// A follower refuses a snapshot that the disk has no room for, and keeps its
+// entries.
+func TestFollowerControllerInstallSnapshotRefusesASnapshotWithoutRoom(t *testing.T) {
+	walFactory, kvFactory := newHookFactories(t)
+	fc := newReplicatingFollower(t, walFactory, kvFactory)
+	appendUncommittedEntries(t, fc, 3)
+
+	err := fc.InstallSnapshot(newSnapshotStream(withManifest(snapshotChunks(t, 1),
+		&proto.SnapshotManifest{CommitOffset: 99, CommitTerm: 1, TotalSize: math.MaxInt64 / 2})))
+	assert.ErrorIs(t, err, errs.ErrUnavailable)
+	assert.ErrorContains(t, err, "failed to create snapshot loader")
+
+	status, err := fc.GetStatus(&proto.GetStatusRequest{})
+	require.NoError(t, err)
+	assert.EqualValues(t, 2, status.HeadOffset)
+	assert.NoError(t, fc.Close())
+}
+
+// A crash interrupts the install of a snapshot once it replaced the database,
+// before the WAL of the replaced database got cleared: the follower completes
+// the install when it opens.
+func TestNewFollowerControllerCompletesAnInterruptedSnapshotInstall(t *testing.T) {
+	walFactory, kvFactory := newHookFactories(t)
+	fc := newReplicatingFollower(t, walFactory, kvFactory)
+	appendUncommittedEntries(t, fc, 3)
+	require.NoError(t, fc.Close())
+
+	loader, err := kvFactory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 0, 0)
+	require.NoError(t, err)
+	for _, chunk := range snapshotChunks(t, 1) {
+		require.NoError(t, loader.AddChunk(chunk.Name, chunk.ChunkIndex, chunk.ChunkCount, chunk.Content))
+	}
+	errCrash := errors.New("crash")
+	require.ErrorIs(t, loader.Install(func(string) error { return nil }, func() error { return errCrash }), errCrash)
+	require.NoError(t, loader.Close())
+
+	_, err = NewFollowerController(&option.StorageOptions{}, constant.DefaultNamespace, 0, failingWalFactory{},
+		kvFactory, nil)
+	assert.ErrorContains(t, err, "failed to complete the install of a snapshot")
+
+	fc, err = NewFollowerController(&option.StorageOptions{}, constant.DefaultNamespace, 0, walFactory, kvFactory, nil)
+	require.NoError(t, err)
+	status, err := fc.GetStatus(&proto.GetStatusRequest{})
+	require.NoError(t, err)
+	assert.EqualValues(t, 99, status.HeadOffset, "the entries of the replaced database are gone")
+	assert.EqualValues(t, 99, status.CommitOffset)
+	assert.NoError(t, fc.Close())
 }
 
 func TestFollowerControllerInstallSnapshotFailsWhenSplitFilterFails(t *testing.T) {
@@ -4202,6 +4319,26 @@ func writerIsWaiting(fc *followerController) func() bool {
 	}
 }
 
+// withManifest returns copies of the chunks, the first one with the manifest.
+func withManifest(chunks []*proto.SnapshotChunk, manifest *proto.SnapshotManifest) []*proto.SnapshotChunk {
+	copied := make([]*proto.SnapshotChunk, len(chunks))
+	for i, chunk := range chunks {
+		copied[i] = chunk.CloneVT()
+	}
+	copied[0].Manifest = manifest
+	return copied
+}
+
+// withTerm returns copies of the chunks, sent by a leader of the term.
+func withTerm(chunks []*proto.SnapshotChunk, term int64) []*proto.SnapshotChunk {
+	copied := make([]*proto.SnapshotChunk, len(chunks))
+	for i, chunk := range chunks {
+		copied[i] = chunk.CloneVT()
+		copied[i].Term = term
+	}
+	return copied
+}
+
 func newSnapshotStream(chunks []*proto.SnapshotChunk) *rpc.MockServerSendSnapshotStream {
 	stream := rpc.NewMockServerSendSnapshotStream()
 	for _, chunk := range chunks {
@@ -4359,7 +4496,7 @@ type kvHooks struct {
 	rangeScan         func() error
 	get               func(key string) error
 	addChunk          func() error
-	complete          func() error
+	install           func() error
 }
 
 type hookKVFactory struct {
@@ -4391,11 +4528,12 @@ func (f *hookKVFactory) NewKV(namespace string, shardId int64, keySorting proto.
 	return &hookKV{KV: kv, factory: f}, nil
 }
 
-func (f *hookKVFactory) NewSnapshotLoader(namespace string, shardId int64) (kvstore.SnapshotLoader, error) {
+func (f *hookKVFactory) NewSnapshotLoader(ctx context.Context, namespace string, shardId int64,
+	size int64) (kvstore.SnapshotLoader, error) {
 	if err := runHook(f.getHooks().newSnapshotLoader); err != nil {
 		return nil, err
 	}
-	loader, err := f.Factory.NewSnapshotLoader(namespace, shardId)
+	loader, err := f.Factory.NewSnapshotLoader(ctx, namespace, shardId, size)
 	if err != nil {
 		return nil, err
 	}
@@ -4451,11 +4589,11 @@ func (l *hookSnapshotLoader) AddChunk(fileName string, chunkIndex int32, chunkCo
 	return l.SnapshotLoader.AddChunk(fileName, chunkIndex, chunkCount, content)
 }
 
-func (l *hookSnapshotLoader) Complete() error {
-	if err := runHook(l.factory.getHooks().complete); err != nil {
+func (l *hookSnapshotLoader) Install(check func(dir string) error, clearLog func() error) error {
+	if err := runHook(l.factory.getHooks().install); err != nil {
 		return err
 	}
-	return l.SnapshotLoader.Complete()
+	return l.SnapshotLoader.Install(check, clearLog)
 }
 
 // The entries of the terms before a new leader's own, which it sends after its

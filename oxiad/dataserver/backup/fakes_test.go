@@ -285,7 +285,7 @@ func (h *fakeHost) DatabaseDir(namespace string, shard int64) string {
 	return filepath.Join(h.t.TempDir(), fmt.Sprintf("shard-%d", shard))
 }
 
-func (h *fakeHost) NewInstaller(_ string, shard int64) (controller.Installer, error) {
+func (h *fakeHost) NewInstaller(_ context.Context, _ string, shard int64) (controller.Installer, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.installerErr != nil {

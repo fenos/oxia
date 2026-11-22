@@ -20,6 +20,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -231,8 +233,24 @@ func TestFollowerCursor_SendSnapshot(t *testing.T) {
 	assert.NoError(t, err)
 
 	s := stream.SendSnapshotStream
+	var chunks []*proto.SnapshotChunk
 	for req := range s.Requests {
 		assert.EqualValues(t, 1, req.Term)
+		chunks = append(chunks, req)
+	}
+	// The first chunk describes the snapshot, for the follower to check it
+	require.NotEmpty(t, chunks)
+	manifest := chunks[0].GetManifest()
+	require.NotNil(t, manifest)
+	assert.EqualValues(t, n-1, manifest.CommitOffset)
+	assert.EqualValues(t, 0, manifest.CommitTerm)
+	var size int64
+	for _, chunk := range chunks {
+		size += int64(len(chunk.Content))
+	}
+	assert.Equal(t, size, manifest.TotalSize)
+	for _, chunk := range chunks[1:] {
+		assert.Nil(t, chunk.Manifest)
 	}
 
 	slog.Info("Snapshot complete")
@@ -849,6 +867,10 @@ func TestFollowerCursorRetriesTheSnapshotWhenItCantBeRead(t *testing.T) {
 			snapshot, err := kv.Snapshot()
 			return failingChunkSnapshot{snapshot}, err
 		}},
+		{"manifest", func(kv kvstore.KV) (kvstore.Snapshot, error) {
+			snapshot, err := kv.Snapshot()
+			return misplacedSnapshot{snapshot}, err
+		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			snapshots := &atomic.Int64{}
@@ -1160,6 +1182,16 @@ type failingChunkSnapshot struct {
 
 func (failingChunkSnapshot) Chunk() (kvstore.SnapshotChunk, error) {
 	return nil, errInjected
+}
+
+// misplacedSnapshot reports a path that holds no database: the cursor can't
+// describe the snapshot.
+type misplacedSnapshot struct {
+	kvstore.Snapshot
+}
+
+func (misplacedSnapshot) BasePath() string {
+	return filepath.Join(os.TempDir(), "oxia-no-such-checkpoint")
 }
 
 // hookStreamProvider opens the replicate streams of a mock rpc client, which

@@ -15,12 +15,12 @@
 package controller
 
 import (
+	"context"
 	"io"
 
 	"github.com/pkg/errors"
 	"go.uber.org/multierr"
 
-	"github.com/oxia-db/oxia/common/constant"
 	"github.com/oxia-db/oxia/common/proto"
 	commontime "github.com/oxia-db/oxia/common/time"
 	"github.com/oxia-db/oxia/oxiad/dataserver/database"
@@ -31,14 +31,17 @@ import (
 
 // Installer installs the database of a shard from its files, for a restore
 // from a backup: the files are written through the snapshot loader, which
-// makes them durable, and the database is then opened once to filter it to
-// the hash range of the shard and read its commit offset and term. The next
-// term of the shard opens it as usual.
+// stages them beside the database of the shard until they replace it, and the
+// database is then opened once to filter it to the hash range of the shard and
+// read its commit offset and term. The next term of the shard opens it as
+// usual.
 type Installer interface {
 	// AddFile writes a file of the database, of the given size.
 	AddFile(name string, size int64, r io.Reader) error
-	// Complete makes the files durable, filters the database to the hash
-	// range, and returns its commit offset and term.
+	// Complete replaces the database of the shard with the files, unless they
+	// don't open as a database, and clears its WAL, which the restored
+	// database is ahead of. It then filters the database to the hash range,
+	// and returns its commit offset and term.
 	Complete(hashRange *proto.HashRange) (commitOffset int64, term int64, err error)
 	// Close deletes the files of an installation that didn't complete.
 	Close() error
@@ -48,23 +51,17 @@ type installer struct {
 	storageOptions *option.StorageOptions
 	namespace      string
 	shardId        int64
+	walFactory     wal.Factory
 	kvFactory      kvstore.Factory
 	loader         kvstore.SnapshotLoader
-	completed      bool
 }
 
-// newInstaller clears the WAL of the shard, which the restored database is
-// ahead of, and prepares the snapshot loader, which wipes the database.
-func newInstaller(storageOptions *option.StorageOptions, namespace string, shardId int64,
+// newInstaller prepares the snapshot loader. A restore doesn't know the size
+// of the database up front: the loader only checks the headroom it leaves on
+// the disk.
+func newInstaller(ctx context.Context, storageOptions *option.StorageOptions, namespace string, shardId int64,
 	walFactory wal.Factory, kvFactory kvstore.Factory) (Installer, error) {
-	shardWal, err := walFactory.NewWal(namespace, shardId, noCommitOffset{})
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to open the WAL")
-	}
-	if err := multierr.Combine(shardWal.Clear(), shardWal.Close()); err != nil {
-		return nil, errors.Wrap(err, "failed to clear the WAL")
-	}
-	loader, err := kvFactory.NewSnapshotLoader(namespace, shardId)
+	loader, err := kvFactory.NewSnapshotLoader(ctx, namespace, shardId, 0)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to create the snapshot loader")
 	}
@@ -72,6 +69,7 @@ func newInstaller(storageOptions *option.StorageOptions, namespace string, shard
 		storageOptions: storageOptions,
 		namespace:      namespace,
 		shardId:        shardId,
+		walFactory:     walFactory,
 		kvFactory:      kvFactory,
 		loader:         loader,
 	}, nil
@@ -98,10 +96,15 @@ func (i *installer) AddFile(name string, size int64, r io.Reader) error {
 }
 
 func (i *installer) Complete(hashRange *proto.HashRange) (commitOffset int64, term int64, err error) {
-	if err := i.loader.Complete(); err != nil {
-		return 0, 0, errors.Wrap(err, "failed to complete the snapshot")
+	err = i.loader.Install(func(dir string) error {
+		_, err := database.ReadCheckpoint(dir)
+		return err
+	}, func() error {
+		return wal.ClearShard(i.walFactory, i.namespace, i.shardId)
+	})
+	if err != nil {
+		return 0, 0, errors.Wrap(err, "failed to install the database")
 	}
-	i.completed = true
 	db, err := database.NewDB(i.namespace, i.shardId, i.kvFactory, proto.KeySortingType_UNKNOWN,
 		i.storageOptions.Notification.Retention.ToDuration(), commontime.SystemClock)
 	if err != nil {
@@ -131,20 +134,5 @@ func filterRestoredDatabase(db database.DB, hashRange *proto.HashRange) (commitO
 }
 
 func (i *installer) Close() error {
-	if i.completed {
-		return nil
-	}
 	return i.loader.Close()
-}
-
-// noCommitOffset is the commit offset provider of a WAL opened only to be
-// cleared: nothing is applied from it.
-type noCommitOffset struct{}
-
-func (noCommitOffset) CommitOffset() int64 {
-	return constant.I64NegativeOne
-}
-
-func (noCommitOffset) FlushDatabase() error {
-	return nil
 }

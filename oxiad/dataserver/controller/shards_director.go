@@ -15,6 +15,7 @@
 package controller
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -67,8 +68,9 @@ type ShardsDirector interface {
 	WithDatabase(shardId int64, generation uint64, fn func(dir string) error) error
 	// NewInstaller starts the installation of a database of a shard from its
 	// files, for a restore. The shard must not be led from here. A follower
-	// of it is closed, and created again by the next term.
-	NewInstaller(namespace string, shardId int64) (Installer, error)
+	// of it is closed, and created again by the next term. It waits, as long
+	// as ctx allows, for the install of a snapshot of another shard.
+	NewInstaller(ctx context.Context, namespace string, shardId int64) (Installer, error)
 	// DatabaseDir returns the directory of the database of a shard.
 	DatabaseDir(namespace string, shardId int64) string
 }
@@ -311,23 +313,34 @@ func (s *shardsDirector) WithDatabase(shardId int64, generation uint64, fn func(
 	}
 }
 
-func (s *shardsDirector) NewInstaller(namespace string, shardId int64) (Installer, error) {
+func (s *shardsDirector) NewInstaller(ctx context.Context, namespace string, shardId int64) (Installer, error) {
+	if err := s.closeForInstall(shardId); err != nil {
+		return nil, err
+	}
+	// Not under the lock: the installer waits for the install of a snapshot
+	// of another shard
+	return newInstaller(ctx, s.storageOptions, namespace, shardId, s.walFactory, s.kvFactory)
+}
+
+// closeForInstall closes the follower of a shard whose database gets
+// installed, which must not be led from here.
+func (s *shardsDirector) closeForInstall(shardId int64) error {
 	s.Lock()
 	defer s.Unlock()
 	if s.closed {
-		return nil, constant.ErrResourceUnavailable
+		return constant.ErrResourceUnavailable
 	}
 	if _, ok := s.leaders[shardId]; ok {
-		return nil, errors.Join(constant.ErrResourceConflict, errors.New("the shard is led from this data server"))
+		return errors.Join(constant.ErrResourceConflict, errors.New("the shard is led from this data server"))
 	}
 	if follower, ok := s.followers[shardId]; ok {
 		if err := follower.Close(); err != nil {
-			return nil, err
+			return err
 		}
 		delete(s.followers, shardId)
 		s.followersCounter.Dec()
 	}
-	return newInstaller(s.storageOptions, namespace, shardId, s.walFactory, s.kvFactory)
+	return nil
 }
 
 func (s *shardsDirector) DatabaseDir(namespace string, shardId int64) string {

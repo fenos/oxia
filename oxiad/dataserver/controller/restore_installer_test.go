@@ -73,7 +73,7 @@ func TestInstallerInstallsACheckpointAsTheDatabaseOfAShard(t *testing.T) {
 	target := NewShardsDirector(&option.StorageOptions{}, newTestWalFactory(t), kvFactory, rpc.NewMockRpcClient())
 	defer func() { assert.NoError(t, target.Close()) }()
 
-	installer, err := target.NewInstaller(constant.DefaultNamespace, shard)
+	installer, err := target.NewInstaller(context.Background(), constant.DefaultNamespace, shard)
 	require.NoError(t, err)
 	installCheckpoint(t, installer, checkpoint)
 	commitOffset, term, err := installer.Complete(&proto.HashRange{Min: 0, Max: ^uint32(0)})
@@ -114,7 +114,7 @@ func TestInstallerFiltersTheDatabaseToTheHashRange(t *testing.T) {
 	require.NoError(t, err)
 	target := NewShardsDirector(&option.StorageOptions{}, newTestWalFactory(t), kvFactory, rpc.NewMockRpcClient())
 	defer func() { assert.NoError(t, target.Close()) }()
-	installer, err := target.NewInstaller(constant.DefaultNamespace, shard)
+	installer, err := target.NewInstaller(context.Background(), constant.DefaultNamespace, shard)
 	require.NoError(t, err)
 	installCheckpoint(t, installer, checkpoint)
 	_, _, err = installer.Complete(&proto.HashRange{Min: 0, Max: 1<<31 - 1})
@@ -137,7 +137,7 @@ func TestInstallerRejectsAFileOfTheWrongSize(t *testing.T) {
 	require.NoError(t, err)
 	target := NewShardsDirector(&option.StorageOptions{}, newTestWalFactory(t), kvFactory, rpc.NewMockRpcClient())
 	defer func() { assert.NoError(t, target.Close()) }()
-	installer, err := target.NewInstaller(constant.DefaultNamespace, 1)
+	installer, err := target.NewInstaller(context.Background(), constant.DefaultNamespace, 1)
 	require.NoError(t, err)
 	defer func() { assert.NoError(t, installer.Close()) }()
 	assert.ErrorContains(t, installer.AddFile("short", 10, strings.NewReader("12345")), "want 10 bytes")
@@ -148,7 +148,7 @@ func TestInstallerRejectsAFileOfTheWrongSize(t *testing.T) {
 func TestShardsDirectorNewInstallerRefusesALedShardAndClosesAFollower(t *testing.T) {
 	const shard int64 = 3
 	sd := newLeaderWithEntries(t, shard, "a")
-	_, err := sd.NewInstaller(constant.DefaultNamespace, shard)
+	_, err := sd.NewInstaller(context.Background(), constant.DefaultNamespace, shard)
 	assert.ErrorIs(t, err, constant.ErrResourceConflict)
 
 	kvFactory, err := kvstore.NewPebbleKVFactory(kvstore.NewFactoryOptionsForTest(t))
@@ -157,7 +157,7 @@ func TestShardsDirectorNewInstallerRefusesALedShardAndClosesAFollower(t *testing
 	defer func() { assert.NoError(t, other.Close()) }()
 	_, err = other.GetOrCreateFollower(constant.DefaultNamespace, shard, 1, nil)
 	require.NoError(t, err)
-	installer, err := other.NewInstaller(constant.DefaultNamespace, shard)
+	installer, err := other.NewInstaller(context.Background(), constant.DefaultNamespace, shard)
 	require.NoError(t, err)
 	assert.NoError(t, installer.Close())
 	_, err = other.GetFollower(shard)
@@ -179,32 +179,19 @@ func installCheckpoint(t *testing.T, installer Installer, checkpoint *database.C
 	}
 }
 
-func TestInstallerCompleteFailsWhenTheDatabaseDirectoryIsGone(t *testing.T) {
-	kvFactory, err := kvstore.NewPebbleKVFactory(kvstore.NewFactoryOptionsForTest(t))
-	require.NoError(t, err)
-	target := NewShardsDirector(&option.StorageOptions{}, newTestWalFactory(t), kvFactory, rpc.NewMockRpcClient())
-	defer func() { assert.NoError(t, target.Close()) }()
-	installer, err := target.NewInstaller(constant.DefaultNamespace, 1)
-	require.NoError(t, err)
-	defer func() { assert.NoError(t, installer.Close()) }()
-	require.NoError(t, os.RemoveAll(target.DatabaseDir(constant.DefaultNamespace, 1)))
-
-	_, _, err = installer.Complete(&proto.HashRange{Min: 0, Max: ^uint32(0)})
-	assert.ErrorContains(t, err, "failed to complete the snapshot")
-}
-
 func TestInstallerCompleteFailsOnADatabaseThatDoesNotOpen(t *testing.T) {
 	kvFactory, err := kvstore.NewPebbleKVFactory(kvstore.NewFactoryOptionsForTest(t))
 	require.NoError(t, err)
 	target := NewShardsDirector(&option.StorageOptions{}, newTestWalFactory(t), kvFactory, rpc.NewMockRpcClient())
 	defer func() { assert.NoError(t, target.Close()) }()
-	installer, err := target.NewInstaller(constant.DefaultNamespace, 1)
+	installer, err := target.NewInstaller(context.Background(), constant.DefaultNamespace, 1)
 	require.NoError(t, err)
 	defer func() { assert.NoError(t, installer.Close()) }()
 	require.NoError(t, installer.AddFile("CURRENT", 7, strings.NewReader("garbage")))
 
 	_, _, err = installer.Complete(&proto.HashRange{Min: 0, Max: ^uint32(0)})
-	assert.ErrorContains(t, err, "failed to open the database")
+	assert.ErrorContains(t, err, "failed to install the database")
+	assert.ErrorContains(t, err, "failed to open the checkpoint")
 }
 
 // failingKVFactory wraps the databases of a factory.
@@ -256,6 +243,7 @@ func TestInstallerCompleteReportsTheFailuresOfTheFilter(t *testing.T) {
 		kv      failingKV
 		message string
 	}{
+		"open":          {failingKV{getErr: map[string]error{constant.InternalKeyPrefix + "last-version-id": errFailed}}, "failed to open the database"},
 		"scan":          {failingKV{rangeScanErr: errFailed}, "failed to filter the database"},
 		"flush":         {failingKV{flushErr: errFailed}, "disk failed"},
 		"commit offset": {failingKV{getErr: map[string]error{constant.InternalKeyPrefix + "commit-offset": errFailed}}, "failed to read the commit offset"},
@@ -276,7 +264,7 @@ func TestInstallerCompleteReportsTheFailuresOfTheFilter(t *testing.T) {
 				failing.KV = kv
 				return &failing
 			}}
-			installer, err := newInstaller(&option.StorageOptions{}, constant.DefaultNamespace, shard, newTestWalFactory(t), kvFactory)
+			installer, err := newInstaller(context.Background(), &option.StorageOptions{}, constant.DefaultNamespace, shard, newTestWalFactory(t), kvFactory)
 			require.NoError(t, err)
 			defer func() { assert.NoError(t, installer.Close()) }()
 			installCheckpoint(t, installer, checkpoint)
@@ -324,8 +312,45 @@ type failingLoaderFactory struct {
 	err error
 }
 
-func (f *failingLoaderFactory) NewSnapshotLoader(string, int64) (kvstore.SnapshotLoader, error) {
+func (f *failingLoaderFactory) NewSnapshotLoader(context.Context, string, int64, int64) (kvstore.SnapshotLoader, error) {
 	return nil, f.err
+}
+
+// The restored database replaces the database of the shard before the WAL gets
+// cleared: a failure to clear it is reported, and the next controller of the
+// shard completes the install.
+func TestInstallerCompleteReportsTheFailuresOfTheWALClear(t *testing.T) {
+	errFailed := errors.New("disk failed")
+	for name, test := range map[string]struct {
+		walFactory *failingWalFactory
+		message    string
+	}{
+		"open the WAL":  {&failingWalFactory{newWalErr: errFailed}, "failed to open the WAL"},
+		"clear the WAL": {&failingWalFactory{clearErr: errFailed}, "failed to clear the WAL"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			shard := int64(7)
+			source := newLeaderWithEntries(t, shard, "a")
+			checkpoint, err := source.Checkpoint(shard)
+			require.NoError(t, err)
+			defer func() { assert.NoError(t, checkpoint.Close()) }()
+			kvFactory, err := kvstore.NewPebbleKVFactory(kvstore.NewFactoryOptionsForTest(t))
+			require.NoError(t, err)
+			defer func() { assert.NoError(t, kvFactory.Close()) }()
+			test.walFactory.Factory = newTestWalFactory(t)
+
+			installer, err := newInstaller(context.Background(), &option.StorageOptions{}, constant.DefaultNamespace,
+				shard, test.walFactory, kvFactory)
+			require.NoError(t, err)
+			defer func() { assert.NoError(t, installer.Close()) }()
+			installCheckpoint(t, installer, checkpoint)
+
+			_, _, err = installer.Complete(&proto.HashRange{Min: 0, Max: ^uint32(0)})
+			assert.ErrorIs(t, err, errFailed)
+			assert.ErrorContains(t, err, "failed to install the database")
+			assert.ErrorContains(t, err, test.message)
+		})
+	}
 }
 
 func TestNewInstallerReportsTheFailuresOfThePreparation(t *testing.T) {
@@ -338,12 +363,11 @@ func TestNewInstallerReportsTheFailuresOfThePreparation(t *testing.T) {
 		kvFactory  kvstore.Factory
 		message    string
 	}{
-		"open the WAL":  {&failingWalFactory{Factory: newTestWalFactory(t), newWalErr: errFailed}, pebbleFactory, "failed to open the WAL"},
-		"clear the WAL": {&failingWalFactory{Factory: newTestWalFactory(t), clearErr: errFailed}, pebbleFactory, "failed to clear the WAL"},
-		"loader":        {newTestWalFactory(t), &failingLoaderFactory{Factory: pebbleFactory, err: errFailed}, "failed to create the snapshot loader"},
+		"loader": {newTestWalFactory(t), &failingLoaderFactory{Factory: pebbleFactory, err: errFailed}, "failed to create the snapshot loader"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			_, err := newInstaller(&option.StorageOptions{}, constant.DefaultNamespace, 1, test.walFactory, test.kvFactory)
+			_, err := newInstaller(context.Background(), &option.StorageOptions{}, constant.DefaultNamespace, 1,
+				test.walFactory, test.kvFactory)
 			assert.ErrorIs(t, err, errFailed)
 			assert.ErrorContains(t, err, test.message)
 		})
@@ -355,13 +379,8 @@ func TestInstallerRejectsAFileNameOutsideTheDatabase(t *testing.T) {
 	require.NoError(t, err)
 	target := NewShardsDirector(&option.StorageOptions{}, newTestWalFactory(t), kvFactory, rpc.NewMockRpcClient())
 	defer func() { assert.NoError(t, target.Close()) }()
-	installer, err := target.NewInstaller(constant.DefaultNamespace, 1)
+	installer, err := target.NewInstaller(context.Background(), constant.DefaultNamespace, 1)
 	require.NoError(t, err)
 	defer func() { assert.NoError(t, installer.Close()) }()
 	assert.ErrorContains(t, installer.AddFile("../outside", 1, strings.NewReader("x")), "failed to write ../outside")
-}
-
-func TestNoCommitOffsetAppliesNothing(t *testing.T) {
-	assert.Equal(t, constant.I64NegativeOne, noCommitOffset{}.CommitOffset())
-	assert.NoError(t, noCommitOffset{}.FlushDatabase())
 }

@@ -2836,6 +2836,41 @@ func TestLeaderController_ConcurrentWrite(t *testing.T) {
 	}
 }
 
+// addSnapshotChunks adds to the loader the chunks of a snapshot of a database
+// with the entries of the term 1 up to count-1.
+func addSnapshotChunks(t *testing.T, loader kvstore.SnapshotLoader, count int64) {
+	t.Helper()
+	kvFactory, err := kvstore.NewPebbleKVFactory(kvstore.NewFactoryOptionsForTest(t))
+	require.NoError(t, err)
+	defer func() { assert.NoError(t, kvFactory.Close()) }()
+	db, err := database.NewDB(constant.DefaultNamespace, 0, kvFactory, proto.KeySortingType_HIERARCHICAL, time.Hour,
+		time2.SystemClock)
+	require.NoError(t, err)
+	defer func() { assert.NoError(t, db.Close()) }()
+	for offset := range count {
+		_, err := db.ProcessWrite(&proto.WriteRequest{Puts: []*proto.PutRequest{{Key: "k", Value: []byte("v")}}},
+			1, offset, 0, database.NoOpCallback)
+		require.NoError(t, err)
+	}
+	snapshot, err := db.Snapshot()
+	require.NoError(t, err)
+	defer func() { assert.NoError(t, snapshot.Close()) }()
+	for ; snapshot.Valid(); snapshot.Next() {
+		chunk, err := snapshot.Chunk()
+		require.NoError(t, err)
+		require.NoError(t, loader.AddChunk(chunk.Name(), chunk.Index(), chunk.TotalCount(), chunk.Content()))
+	}
+}
+
+// failingWalFactory fails to open the WALs.
+type failingWalFactory struct {
+	wal.Factory
+}
+
+func (failingWalFactory) NewWal(string, int64, wal.CommitOffsetProvider) (wal.Wal, error) {
+	return nil, errInjected
+}
+
 func newTestWalFactory(t *testing.T) wal.Factory {
 	t.Helper()
 
@@ -3797,10 +3832,10 @@ func TestLeaderControllerCheckpointHoldsTheCommitOffsetAndTerm(t *testing.T) {
 
 	checkpoint, err := lc.Checkpoint()
 	require.NoError(t, err)
-	commitOffset, term, err := database.ReadCheckpoint(checkpoint.BasePath())
+	state, err := database.ReadCheckpoint(checkpoint.BasePath())
 	require.NoError(t, err)
-	assert.EqualValues(t, 2, commitOffset)
-	assert.EqualValues(t, 2, term)
+	assert.EqualValues(t, 2, state.CommitOffset)
+	assert.EqualValues(t, 2, state.Term)
 	assert.NoError(t, checkpoint.Close())
 
 	// The database is still the one of the checkpoint
@@ -3904,6 +3939,39 @@ func collectInt64Gauge(t *testing.T, reader sdkmetric.Reader, name string) (int6
 		}
 	}
 	return 0, false
+}
+
+// A crash interrupts the install of a snapshot once it replaced the database,
+// before the WAL of the replaced database got cleared: the leader completes the
+// install when it opens.
+func TestNewLeaderControllerCompletesAnInterruptedSnapshotInstall(t *testing.T) {
+	kvFactory, walFactory := newHookFactories(t)
+	var shard int64 = 1
+	w, err := walFactory.NewWal(constant.DefaultNamespace, shard, nil)
+	require.NoError(t, err)
+	for offset := range int64(3) {
+		require.NoError(t, w.Append(&proto.LogEntry{Term: 1, Offset: offset, Value: []byte("v")}))
+	}
+	require.NoError(t, w.Close())
+
+	loader, err := kvFactory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, shard, 0)
+	require.NoError(t, err)
+	addSnapshotChunks(t, loader, 10)
+	errCrash := errors.New("crash")
+	require.ErrorIs(t, loader.Install(func(string) error { return nil }, func() error { return errCrash }), errCrash)
+	require.NoError(t, loader.Close())
+
+	_, err = NewLeaderController(&option.StorageOptions{}, constant.DefaultNamespace, shard, rpc.NewMockRpcClient(),
+		failingWalFactory{walFactory}, kvFactory, nil)
+	assert.ErrorContains(t, err, "failed to complete the install of a snapshot")
+
+	lc, err := NewLeaderController(&option.StorageOptions{}, constant.DefaultNamespace, shard, rpc.NewMockRpcClient(),
+		walFactory, kvFactory, nil)
+	require.NoError(t, err)
+	lci := lc.(*leaderController)
+	assert.EqualValues(t, wal.InvalidOffset, lci.wal.LastOffset(), "the entries of the replaced database are gone")
+	assert.EqualValues(t, 9, lci.dbCommitOffset.Load())
+	assert.NoError(t, lc.Close())
 }
 
 func TestNewLeaderControllerFailsWhenTheDatabaseFailsToOpen(t *testing.T) {

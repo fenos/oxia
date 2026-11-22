@@ -69,8 +69,9 @@ type Host interface {
 	// executor keeps its record.
 	DatabaseDir(namespace string, shardId int64) string
 	// NewInstaller starts the installation of the database of a shard from
-	// its files.
-	NewInstaller(namespace string, shardId int64) (controller.Installer, error)
+	// its files. It waits, as long as ctx allows, for the install of a
+	// snapshot of another shard.
+	NewInstaller(ctx context.Context, namespace string, shardId int64) (controller.Installer, error)
 }
 
 // Options configures an Executor. Only Host is required.
@@ -578,7 +579,7 @@ func (e *Executor) runRestore(ctx context.Context, req *proto.RestoreShardReques
 		e.restoresFailed.Inc()
 		return nil, err
 	}
-	installer, err := e.host.NewInstaller(req.GetNamespace(), req.GetShard())
+	installer, err := e.host.NewInstaller(ctx, req.GetNamespace(), req.GetShard())
 	if err != nil {
 		e.restoresFailed.Inc()
 		return nil, fmt.Errorf("prepare the installation: %w", err)

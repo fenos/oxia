@@ -241,6 +241,14 @@ func newLeaderController(storageOptions *option.StorageOptions, namespace string
 	// The session manager already runs its expiry goroutine: Close the
 	// controller on any failure from here on
 	var err error
+	// The install of a snapshot that a crash interrupted completes before the
+	// WAL and the database open: the entries of the WAL belong to the replaced
+	// database
+	if err = kvFactory.RecoverSnapshotInstall(namespace, shardId, func() error {
+		return wal.ClearShard(walFactory, namespace, shardId)
+	}); err != nil {
+		return nil, multierr.Append(errors.Wrap(err, "failed to complete the install of a snapshot"), lc.Close())
+	}
 	keySorting := proto.KeySortingType_UNKNOWN
 	if newTermOptions != nil {
 		keySorting = newTermOptions.KeySorting

@@ -17,6 +17,7 @@ package kvstore
 import (
 	"bytes"
 	"cmp"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -25,6 +26,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"unsafe"
 
@@ -35,6 +37,7 @@ import (
 	"github.com/cockroachdb/pebble/v2/vfs/errorfs"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/multierr"
 
 	"github.com/oxia-db/oxia/common/compare"
 	"github.com/oxia-db/oxia/common/constant"
@@ -1017,12 +1020,15 @@ func TestPebbleDatabaseGenerationCountsReplacementsAndDeletions(t *testing.T) {
 	assert.EqualValues(t, 0, factory.DatabaseGeneration(constant.DefaultNamespace, 1))
 	require.NoError(t, kv.Close())
 
-	loader, err := factory.NewSnapshotLoader(constant.DefaultNamespace, 1)
+	loader, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, 0)
 	require.NoError(t, err)
-	assert.EqualValues(t, 1, factory.DatabaseGeneration(constant.DefaultNamespace, 1),
-		"a snapshot loader replaces the database from its creation")
-	assert.EqualValues(t, 0, factory.DatabaseGeneration(constant.DefaultNamespace, 2), "other shards are not affected")
 	require.NoError(t, loader.Close())
+	assert.EqualValues(t, 0, factory.DatabaseGeneration(constant.DefaultNamespace, 1),
+		"a loader that doesn't install keeps the database")
+
+	installSnapshot(t, factory, snapshotChunksOf(t, "new"))
+	assert.EqualValues(t, 1, factory.DatabaseGeneration(constant.DefaultNamespace, 1), "an install replaces the database")
+	assert.EqualValues(t, 0, factory.DatabaseGeneration(constant.DefaultNamespace, 2), "other shards are not affected")
 
 	kv, err = factory.NewKV(constant.DefaultNamespace, 1, proto.KeySortingType_NATURAL)
 	require.NoError(t, err)
@@ -1032,170 +1038,326 @@ func TestPebbleDatabaseGenerationCountsReplacementsAndDeletions(t *testing.T) {
 	assert.NoError(t, factory.Close())
 }
 
-func TestPebbleSnapshot_Loader(t *testing.T) {
-	originalLocation := t.TempDir()
-	newLocation := t.TempDir()
-
-	factory, err := NewPebbleKVFactory(&FactoryOptions{
-		DataDir:     originalLocation,
-		CacheSizeMB: 1,
-	})
-	assert.NoError(t, err)
+func TestPebbleSnapshotLoaderInstallReplacesTheDatabase(t *testing.T) {
+	factory, err := NewPebbleKVFactory(NewFactoryOptionsForTest(t))
+	require.NoError(t, err)
+	defer func() { assert.NoError(t, factory.Close()) }()
 	kv, err := factory.NewKV(constant.DefaultNamespace, 1, proto.KeySortingType_NATURAL)
-	assert.NoError(t, err)
+	require.NoError(t, err)
+	putKeys(t, kv, "old")
+	require.NoError(t, kv.Close())
 
-	for i := 0; i < 100; i++ {
-		wb := kv.NewWriteBatch()
-		for j := 0; j < 100; j++ {
-			assert.NoError(t, wb.Put(fmt.Sprintf("key-%d-%d", i, j),
-				[]byte(fmt.Sprintf("value-%d-%d", i, j))))
-		}
+	loader, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, 0)
+	require.NoError(t, err)
+	addChunks(t, loader, snapshotChunksOf(t, "new"))
+	var checked []string
+	logClears := 0
+	require.NoError(t, loader.Install(func(dir string) error {
+		checked = append(checked, dir)
+		return nil
+	}, func() error {
+		logClears++
+		return nil
+	}))
+	require.NoError(t, loader.Close())
 
-		assert.NoError(t, wb.Commit())
-		assert.NoError(t, wb.Close())
-	}
+	paths := newInstallPaths(factory.(*PebbleFactory).getKVPath(constant.DefaultNamespace, 1))
+	assert.Equal(t, []string{paths.stage}, checked, "the check reads the snapshot before it replaces the database")
+	assert.Equal(t, 1, logClears)
+	assertNoInstallFiles(t, vfs.Default, paths)
+	kv, err = factory.NewKV(constant.DefaultNamespace, 1, proto.KeySortingType_NATURAL)
+	require.NoError(t, err)
+	assertKeys(t, kv, "new")
+	assertNoKeys(t, kv, "old")
+	assert.NoError(t, kv.Close())
+}
 
-	snapshot, err := kv.Snapshot()
-	assert.NoError(t, err)
+func TestPebbleSnapshotLoaderInstallKeepsTheDatabaseWhenTheCheckFails(t *testing.T) {
+	factory, err := NewPebbleKVFactory(NewFactoryOptionsForTest(t))
+	require.NoError(t, err)
+	defer func() { assert.NoError(t, factory.Close()) }()
+	kv, err := factory.NewKV(constant.DefaultNamespace, 1, proto.KeySortingType_NATURAL)
+	require.NoError(t, err)
+	putKeys(t, kv, "old")
+	require.NoError(t, kv.Close())
 
-	// Use the snapshot to load a new DB
-	factory2, err := NewPebbleKVFactory(&FactoryOptions{
-		DataDir:     newLocation,
-		CacheSizeMB: 1,
+	loader, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, 0)
+	require.NoError(t, err)
+	addChunks(t, loader, snapshotChunksOf(t, "new"))
+	errCheck := errors.New("the snapshot is not the announced one")
+	logClears := 0
+	err = loader.Install(func(string) error { return errCheck }, func() error {
+		logClears++
+		return nil
 	})
-	assert.NoError(t, err)
+	assert.ErrorIs(t, err, errCheck)
+	require.NoError(t, loader.Close())
 
-	kv2, err := factory2.NewKV(constant.DefaultNamespace, 1, proto.KeySortingType_NATURAL)
-	assert.NoError(t, err)
+	assert.Zero(t, logClears)
+	assert.EqualValues(t, 0, factory.DatabaseGeneration(constant.DefaultNamespace, 1))
+	assertNoInstallFiles(t, vfs.Default, newInstallPaths(factory.(*PebbleFactory).getKVPath(constant.DefaultNamespace, 1)))
+	kv, err = factory.NewKV(constant.DefaultNamespace, 1, proto.KeySortingType_NATURAL)
+	require.NoError(t, err)
+	assertKeys(t, kv, "old")
+	assert.NoError(t, kv.Close())
+}
 
-	// Any existing key would be removed when we load the snapshot
-	wb := kv2.NewWriteBatch()
-	assert.NoError(t, wb.Put("my-key-2", []byte("my-value-2")))
-	assert.NoError(t, wb.Commit())
-	assert.NoError(t, wb.Close())
-	assert.NoError(t, kv2.Close())
+func TestPebbleSnapshotLoaderCloseKeepsTheDatabase(t *testing.T) {
+	factory, err := NewPebbleKVFactory(NewFactoryOptionsForTest(t))
+	require.NoError(t, err)
+	defer func() { assert.NoError(t, factory.Close()) }()
+	kv, err := factory.NewKV(constant.DefaultNamespace, 1, proto.KeySortingType_NATURAL)
+	require.NoError(t, err)
+	putKeys(t, kv, "old")
+	require.NoError(t, kv.Close())
 
-	loader, err := factory2.NewSnapshotLoader(constant.DefaultNamespace, 1)
-	assert.NoError(t, err)
+	loader, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, 0)
+	require.NoError(t, err)
+	chunks := snapshotChunksOf(t, "new")
+	// The stream ends in the middle of the last file
+	last := chunks[len(chunks)-1]
+	addChunks(t, loader, chunks[:len(chunks)-1])
+	require.NoError(t, loader.AddChunk(last.name, 0, 2, bytes.Clone(last.content)))
+	require.NoError(t, loader.Close())
 
-	for ; snapshot.Valid(); snapshot.Next() {
-		f, err := snapshot.Chunk()
-		assert.NoError(t, err)
-		assert.NoError(t, loader.AddChunk(f.Name(), f.Index(), f.TotalCount(), f.Content()))
-	}
+	assertNoInstallFiles(t, vfs.Default, newInstallPaths(factory.(*PebbleFactory).getKVPath(constant.DefaultNamespace, 1)))
+	kv, err = factory.NewKV(constant.DefaultNamespace, 1, proto.KeySortingType_NATURAL)
+	require.NoError(t, err)
+	assertKeys(t, kv, "old")
+	assert.NoError(t, kv.Close())
+}
 
-	assert.NoError(t, loader.Complete())
+func TestPebbleSnapshotLoaderInstallRefusesAnUnfinishedFile(t *testing.T) {
+	factory := newMemFactory(t, memFSWithRoom(), nil)
+	loader, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, 0)
+	require.NoError(t, err)
+	require.NoError(t, loader.AddChunk("a", 0, 2, []byte("first")))
+
+	err = loader.Install(noCheck, noLogClear)
+	assert.ErrorContains(t, err, "last file not finished")
 	assert.NoError(t, loader.Close())
-	assert.NoError(t, snapshot.Close())
+}
 
-	kv2, err = factory2.NewKV(constant.DefaultNamespace, 1, proto.KeySortingType_NATURAL)
-	assert.NoError(t, err)
+func TestPebbleSnapshotLoaderInstallLeavesTheReplacementToRecoveryWhenTheLogClearFails(t *testing.T) {
+	fs := memFSWithRoom()
+	factory := newMemFactory(t, fs, nil)
+	dbPath := factory.getKVPath(constant.DefaultNamespace, 1)
+	writeMemDB(t, fs, dbPath, "old")
 
-	for i := 0; i < 100; i++ {
-		for j := 0; j < 100; j++ {
-			k := fmt.Sprintf("key-%d-%d", i, j)
-			key, r, closer, err := kv2.Get(k, ComparisonEqual, NoInternalKeys)
-			assert.NoError(t, err)
-			assert.Equal(t, k, key)
-			assert.Equal(t, fmt.Sprintf("value-%d-%d", i, j), string(r))
-			assert.NoError(t, closer.Close())
-		}
-	}
+	loader, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, 0)
+	require.NoError(t, err)
+	addChunks(t, loader, snapshotChunksOf(t, "new"))
+	errClear := errors.New("the log can't be cleared")
+	assert.ErrorIs(t, loader.Install(noCheck, func() error { return errClear }), errClear)
+	require.NoError(t, loader.Close())
 
-	key, r, closer, err := kv2.Get("my-key", ComparisonEqual, NoInternalKeys)
-	assert.ErrorIs(t, err, errs.ErrDBKeyNotFound)
-	assert.Equal(t, "", key)
-	assert.Nil(t, r)
-	assert.Nil(t, closer)
-
-	assert.NoError(t, kv2.Close())
-	assert.NoError(t, factory2.Close())
+	logClears := 0
+	require.NoError(t, factory.RecoverSnapshotInstall(constant.DefaultNamespace, 1, func() error {
+		logClears++
+		return nil
+	}))
+	assert.Equal(t, 1, logClears)
+	assert.EqualValues(t, 1, factory.DatabaseGeneration(constant.DefaultNamespace, 1),
+		"recovery raises the generation to the one of the install, once")
+	assert.Equal(t, map[string]int{"new": 100}, keysOnFS(t, fs, dbPath))
+	assertNoInstallFiles(t, fs, newInstallPaths(dbPath))
 }
 
 // The leader never sends the snapshot again once the follower acked it, so the
-// installed database must survive a machine crash, which loses whatever was not
-// synced to disk.
-func TestPebbleSnapshotLoader_SurvivesMachineCrash(t *testing.T) {
+// install must leave the shard with its database or the snapshot after a
+// machine crash at any step, which loses whatever was not synced to disk.
+func TestPebbleSnapshotLoaderInstallSurvivesACrashAtEveryStep(t *testing.T) {
+	skipWithoutFailpoints(t)
+	chunks := snapshotChunksOf(t, "new")
 	for _, test := range []struct {
-		name string
-		// The follower opens the installed database before acking the snapshot
-		openBeforeCrash bool
+		step string
+		// replaced is whether the snapshot is the database after the crash
+		replaced bool
 	}{
-		{"crash-after-install", false},
-		{"crash-after-open", true},
+		{"remove-stage", false},
+		{"create-stage", false},
+		{"check-room", false},
+		{"check-files", false},
+		{"sync-stage", false},
+		{"check-stage", false},
+		{"mark", false},
+		{"swap", true},
+		{"clear-log", true},
+		{"remove-replaced", true},
+		{"unmark", true},
 	} {
-		t.Run(test.name, func(t *testing.T) {
-			factory, err := NewPebbleKVFactory(NewFactoryOptionsForTest(t))
-			require.NoError(t, err)
-			kv, err := factory.NewKV(constant.DefaultNamespace, 1, proto.KeySortingType_NATURAL)
-			require.NoError(t, err)
+		t.Run(test.step, func(t *testing.T) {
+			fs := memFSWithRoom()
+			var crashed *vfs.MemFS
+			factory := newMemFactory(t, fs, failpoint.New(map[string]func() error{
+				"snapshot.install." + test.step: func() error {
+					crashed = fs.CrashClone(vfs.CrashCloneCfg{})
+					return errFailpoint
+				},
+			}))
+			dbPath := factory.getKVPath(constant.DefaultNamespace, 1)
+			writeMemDB(t, fs, dbPath, "old")
 
-			wb := kv.NewWriteBatch()
-			for i := 0; i < 100; i++ {
-				require.NoError(t, wb.Put(fmt.Sprintf("key-%d", i), []byte(fmt.Sprintf("value-%d", i))))
+			loader, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, 0)
+			if err == nil {
+				addChunks(t, loader, chunks)
+				err = loader.Install(noCheck, noLogClear)
+				require.NoError(t, loader.Close())
 			}
-			require.NoError(t, wb.Commit())
-			require.NoError(t, wb.Close())
+			require.ErrorIs(t, err, errFailpoint)
+			require.NotNil(t, crashed)
 
-			snapshot, err := kv.Snapshot()
-			require.NoError(t, err)
-
-			fs := vfs.NewCrashableMem()
-			pf := &PebbleFactory{dataDir: "/data"}
-			dbPath := pf.getKVPath(constant.DefaultNamespace, 1)
-			openDB := func(fs vfs.FS) (*pebble.DB, error) {
-				return pebble.Open(dbPath, &pebble.Options{
-					FS:                 fs,
-					DisableWAL:         true,
-					Logger:             &pebbleLogger{slog.Default()},
-					FormatMajorVersion: pebble.FormatVirtualSSTables,
-				})
+			// The server restarts on what the crash kept
+			restarted := newMemFactory(t, crashed, nil)
+			logClears := 0
+			require.NoError(t, restarted.RecoverSnapshotInstall(constant.DefaultNamespace, 1, func() error {
+				logClears++
+				return nil
+			}))
+			if test.replaced {
+				assert.Equal(t, map[string]int{"new": 100}, keysOnFS(t, crashed, dbPath))
+				assert.Equal(t, 1, logClears, "the entries of the log belong to the replaced database")
+			} else {
+				assert.Equal(t, map[string]int{"old": 100}, keysOnFS(t, crashed, dbPath))
+				assert.Zero(t, logClears)
 			}
-
-			// The follower already has a database, which the snapshot replaces
-			db, err := openDB(fs)
-			require.NoError(t, err)
-			require.NoError(t, db.Close())
-
-			loader, err := newPebbleSnapshotLoader(pf, fs, constant.DefaultNamespace, 1)
-			require.NoError(t, err)
-			for ; snapshot.Valid(); snapshot.Next() {
-				chunk, err := snapshot.Chunk()
-				require.NoError(t, err)
-				require.NoError(t, loader.AddChunk(chunk.Name(), chunk.Index(), chunk.TotalCount(), chunk.Content()))
-			}
-			require.NoError(t, loader.Complete())
-			require.NoError(t, loader.Close())
-			require.NoError(t, snapshot.Close())
-			require.NoError(t, kv.Close())
-			require.NoError(t, factory.Close())
-
-			if test.openBeforeCrash {
-				db, err = openDB(fs)
-				require.NoError(t, err)
-				defer db.Close()
-			}
-
-			crashed := fs.CrashClone(vfs.CrashCloneCfg{})
-
-			db, err = openDB(crashed)
-			require.NoError(t, err)
-			defer db.Close()
-			for i := 0; i < 100; i++ {
-				value, closer, err := db.Get(compare.EncoderNatural.Encode(fmt.Sprintf("key-%d", i)))
-				require.NoError(t, err)
-				assert.Equal(t, fmt.Sprintf("value-%d", i), string(value))
-				require.NoError(t, closer.Close())
-			}
-
-			marker, err := crashed.Open(filepath.Join(dbPath, markerFileName))
-			require.NoError(t, err)
-			defer marker.Close()
-			encoding, err := io.ReadAll(marker)
-			require.NoError(t, err)
-			assert.Equal(t, compare.EncoderNatural.Name(), string(encoding))
+			assertNoInstallFiles(t, crashed, newInstallPaths(dbPath))
 		})
 	}
+}
+
+func TestPebbleRecoverSnapshotInstallCompletesAnInterruptedSwap(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		interrupt func(t *testing.T, fs vfs.FS, paths installPaths)
+	}{
+		{"database-moved-aside", func(t *testing.T, fs vfs.FS, paths installPaths) {
+			t.Helper()
+			require.NoError(t, fs.Rename(paths.db, paths.replaced))
+		}},
+		{"replaced-database-left-over", func(t *testing.T, fs vfs.FS, paths installPaths) {
+			t.Helper()
+			writeMemDB(t, fs, paths.replaced, "older")
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fs := memFSWithRoom()
+			factory := newMemFactory(t, fs, nil)
+			paths := newInstallPaths(factory.getKVPath(constant.DefaultNamespace, 1))
+			writeMemDB(t, fs, paths.db, "old")
+			writeMemDB(t, fs, paths.stage, "new")
+			require.NoError(t, writeInstallMarker(fs, paths.marker, 3))
+			test.interrupt(t, fs, paths)
+
+			require.NoError(t, factory.RecoverSnapshotInstall(constant.DefaultNamespace, 1, noLogClear))
+
+			assert.Equal(t, map[string]int{"new": 100}, keysOnFS(t, fs, paths.db))
+			assert.EqualValues(t, 3, factory.DatabaseGeneration(constant.DefaultNamespace, 1))
+			assertNoInstallFiles(t, fs, paths)
+		})
+	}
+}
+
+func TestPebbleRecoverSnapshotInstallTakesTheNextGenerationFromAMarkerWithoutContent(t *testing.T) {
+	fs := memFSWithRoom()
+	factory := newMemFactory(t, fs, nil)
+	paths := newInstallPaths(factory.getKVPath(constant.DefaultNamespace, 1))
+	writeMemDB(t, fs, paths.db, "old")
+	writeMemDB(t, fs, paths.stage, "new")
+	marker, err := fs.Create(paths.marker, vfs.WriteCategoryUnspecified)
+	require.NoError(t, err)
+	require.NoError(t, marker.Close())
+
+	require.NoError(t, factory.RecoverSnapshotInstall(constant.DefaultNamespace, 1, noLogClear))
+
+	assert.Equal(t, map[string]int{"new": 100}, keysOnFS(t, fs, paths.db))
+	assert.EqualValues(t, 1, factory.DatabaseGeneration(constant.DefaultNamespace, 1))
+	assertNoInstallFiles(t, fs, paths)
+}
+
+func TestPebbleRecoverSnapshotInstallRejectsAnInvalidNamespace(t *testing.T) {
+	factory := newMemFactory(t, memFSWithRoom(), nil)
+	err := factory.RecoverSnapshotInstall("../escaped-ns", 1, noLogClear)
+	assert.ErrorContains(t, err, "invalid path traversal sequence")
+}
+
+func TestPebbleNewSnapshotLoaderChecksTheRoomOnTheDisk(t *testing.T) {
+	const size = 1 << 30
+	for _, test := range []struct {
+		name     string
+		total    uint64
+		avail    uint64
+		admitted bool
+	}{
+		// The headroom is 5% of the disk, at least 1 GiB and at most 8 GiB
+		{"room-for-the-snapshot-and-5%", 100 << 30, size + 5<<30, true},
+		{"short-of-5%", 100 << 30, size + 5<<30 - 1, false},
+		{"room-for-the-snapshot-and-1-gib", 10 << 30, size + 1<<30, true},
+		{"short-of-1-gib", 10 << 30, size + 1<<30 - 1, false},
+		{"room-for-the-snapshot-and-8-gib", 500 << 30, size + 8<<30, true},
+		{"short-of-8-gib", 500 << 30, size + 8<<30 - 1, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fs := vfs.NewMem()
+			fs.TestingSetDiskUsage(vfs.DiskUsage{TotalBytes: test.total, AvailBytes: test.avail})
+			factory := newMemFactory(t, fs, nil)
+
+			loader, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, size)
+			if test.admitted {
+				require.NoError(t, err)
+				assert.NoError(t, loader.Close())
+				return
+			}
+			assert.ErrorIs(t, err, errs.ErrUnavailable)
+			assert.ErrorContains(t, err, fmt.Sprintf("the disk has %d free", test.avail))
+			assertNoInstallFiles(t, fs, newInstallPaths(factory.getKVPath(constant.DefaultNamespace, 1)))
+
+			// The refusal frees the install slot
+			loader, err = factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, 0)
+			require.NoError(t, err)
+			assert.NoError(t, loader.Close())
+		})
+	}
+}
+
+func TestPebbleNewSnapshotLoaderWaitsForTheInstallInProgress(t *testing.T) {
+	factory := newMemFactory(t, memFSWithRoom(), nil)
+	first, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, 0)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = factory.NewSnapshotLoader(ctx, constant.DefaultNamespace, 2, 0)
+	assert.ErrorIs(t, err, context.Canceled)
+
+	admitted := make(chan error, 1)
+	go func() {
+		second, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 2, 0)
+		if err == nil {
+			err = second.Close()
+		}
+		admitted <- err
+	}()
+	require.NoError(t, first.Close())
+	assert.NoError(t, <-admitted)
+}
+
+func TestPebbleDeleteRemovesTheFilesOfAnUnfinishedInstall(t *testing.T) {
+	factory, err := NewPebbleKVFactory(NewFactoryOptionsForTest(t))
+	require.NoError(t, err)
+	defer func() { assert.NoError(t, factory.Close()) }()
+	kv, err := factory.NewKV(constant.DefaultNamespace, 1, proto.KeySortingType_NATURAL)
+	require.NoError(t, err)
+	paths := newInstallPaths(factory.(*PebbleFactory).getKVPath(constant.DefaultNamespace, 1))
+	require.NoError(t, os.MkdirAll(paths.stage, 0755))
+	require.NoError(t, os.MkdirAll(paths.replaced, 0755))
+	require.NoError(t, os.WriteFile(paths.marker, []byte("1"), 0600))
+
+	require.NoError(t, kv.Delete())
+
+	assertNoInstallFiles(t, vfs.Default, paths)
+	_, err = os.Stat(paths.db)
+	assert.ErrorIs(t, err, os.ErrNotExist)
 }
 
 func TestPebbleSnapshotLoader_RejectsPathTraversal(t *testing.T) {
@@ -1206,14 +1368,14 @@ func TestPebbleSnapshotLoader_RejectsPathTraversal(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	loader, err := factory.NewSnapshotLoader(constant.DefaultNamespace, 1)
+	loader, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, 0)
 	require.NoError(t, err)
 
-	dbPath := filepath.Join(dataDir, constant.DefaultNamespace, "shard-1")
+	stagePath := filepath.Join(dataDir, constant.DefaultNamespace, "shard-1.staging")
 	// Point the chunk name above the data dir; the sender only ever emits plain
 	// file names, so a name carrying ".." can only come from a hostile peer.
 	outside := filepath.Join(filepath.Dir(dataDir), "escape-marker.txt")
-	rel, err := filepath.Rel(dbPath, outside)
+	rel, err := filepath.Rel(stagePath, outside)
 	require.NoError(t, err)
 
 	err = loader.AddChunk(rel, 0, 1, []byte("payload"))
@@ -1251,7 +1413,7 @@ func TestPebbleFactoryNewSnapshotLoaderRejectsEmptyNamespace(t *testing.T) {
 	require.NoError(t, err)
 	defer factory.Close()
 
-	loader, err := factory.NewSnapshotLoader("", 1)
+	loader, err := factory.NewSnapshotLoader(context.Background(), "", 1, 0)
 
 	assert.ErrorContains(t, err, "namespace must not be empty")
 	assert.Nil(t, loader)
@@ -2029,7 +2191,7 @@ func TestPebbleRejectsInvalidNamespace(t *testing.T) {
 	_, err = factory.NewKV("../escaped-ns", 7, proto.KeySortingType_HIERARCHICAL)
 	assert.ErrorContains(t, err, "invalid path traversal sequence")
 
-	_, err = factory.NewSnapshotLoader("../escaped-ns", 7)
+	_, err = factory.NewSnapshotLoader(context.Background(), "../escaped-ns", 7, 0)
 	assert.ErrorContains(t, err, "invalid path traversal sequence")
 
 	// The data dir is a t.TempDir(), so its parent is the per-test temp root
@@ -2252,50 +2414,98 @@ func TestPebbleBatchPutMarshalableFailsWhenMarshalingFillsLessThanItsSize(t *tes
 }
 
 func TestPebbleSnapshotLoaderAddChunkRejectsUnfinishedFile(t *testing.T) {
-	pf := &PebbleFactory{dataDir: "/data"}
-	loader, err := newPebbleSnapshotLoader(pf, vfs.NewMem(), constant.DefaultNamespace, 1)
+	factory := newMemFactory(t, memFSWithRoom(), nil)
+	loader, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, 0)
 	require.NoError(t, err)
 
 	require.NoError(t, loader.AddChunk("a", 0, 2, []byte("first")))
 	err = loader.AddChunk("b", 0, 1, []byte("other"))
 	assert.ErrorContains(t, err, "previous file not finished")
+	assert.NoError(t, loader.Close())
 }
 
 func TestPebbleSnapshotLoaderFailsOnFilesystemErrors(t *testing.T) {
-	pf := &PebbleFactory{dataDir: "/data"}
-	dbPath := pf.getKVPath(constant.DefaultNamespace, 1)
+	paths := newInstallPaths(filepath.Join("/data", constant.DefaultNamespace, "shard-1"))
+	parent := filepath.Dir(paths.db)
 	addChunk := func(loader SnapshotLoader) error { return loader.AddChunk("a", 0, 1, []byte("content")) }
+	install := func(loader SnapshotLoader) error {
+		return multierr.Append(addChunk(loader), loader.Install(noCheck, noLogClear))
+	}
+	swapped := opIs(errorfs.OpRename, paths.stage)
 	for _, test := range []struct {
 		name   string
 		inject func(op errorfs.Op) bool
 		// The step that fails, after the loader got created
 		step func(loader SnapshotLoader) error
 	}{
-		{"remove-existing-db", opIs(errorfs.OpRemoveAll, ""), nil},
-		{"create-db-dir", opIs(errorfs.OpMkdirAll, ""), nil},
-		{"create-file", opIs(errorfs.OpCreate, ""), addChunk},
+		{"remove-stage", opIs(errorfs.OpRemoveAll, paths.stage), nil},
+		{"create-stage", opIs(errorfs.OpMkdirAll, paths.stage), nil},
+		{"read-disk-usage", opIs(errorfs.OpGetDiskUsage, ""), nil},
+		{"create-file", opIs(errorfs.OpCreate, filepath.Join(paths.stage, "a")), addChunk},
 		{"write-file", opIs(errorfs.OpFileWrite, ""), addChunk},
 		{"sync-file", func(op errorfs.Op) bool {
 			return op.Kind == errorfs.OpFileSync || op.Kind == errorfs.OpFileSyncData || op.Kind == errorfs.OpFileSyncTo
 		}, addChunk},
-		{"open-db-dir", opIs(errorfs.OpOpenDir, dbPath), SnapshotLoader.Complete},
-		{"open-parent-dir", opIs(errorfs.OpOpenDir, filepath.Dir(dbPath)), SnapshotLoader.Complete},
+		{"sync-stage", opIs(errorfs.OpOpenDir, paths.stage), install},
+		{"create-marker", opIs(errorfs.OpCreate, paths.marker), install},
+		{"stat-stage", opIs(errorfs.OpStat, paths.stage), install},
+		{"remove-leftover", opIs(errorfs.OpRemoveAll, paths.replaced), install},
+		{"move-database-aside", opIs(errorfs.OpRename, paths.db), install},
+		{"move-stage", opIs(errorfs.OpRename, paths.stage), install},
+		{"sync-swap", afterOp(swapped, opIs(errorfs.OpOpenDir, parent)), install},
+		{"remove-replaced", afterOp(swapped, opIs(errorfs.OpRemoveAll, paths.replaced)), install},
+		{"unmark", opIs(errorfs.OpRemove, paths.marker), install},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			fs := errorfs.Wrap(vfs.NewMem(), errorfs.InjectorFunc(func(op errorfs.Op) error {
+			mem := memFSWithRoom()
+			require.NoError(t, mem.MkdirAll(paths.db, 0755))
+			fs := errorfs.Wrap(mem, errorfs.InjectorFunc(func(op errorfs.Op) error {
 				if test.inject(op) {
 					return errorfs.ErrInjected
 				}
 				return nil
 			}))
+			factory := newMemFactory(t, fs, nil)
 
-			loader, err := newPebbleSnapshotLoader(pf, fs, constant.DefaultNamespace, 1)
+			loader, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, 0)
 			if test.step == nil {
 				assert.ErrorIs(t, err, errorfs.ErrInjected)
 				return
 			}
 			require.NoError(t, err)
 			assert.ErrorIs(t, test.step(loader), errorfs.ErrInjected)
+			assert.NoError(t, loader.Close())
+		})
+	}
+}
+
+func TestPebbleRecoverSnapshotInstallFailsOnFilesystemErrors(t *testing.T) {
+	paths := newInstallPaths(filepath.Join("/data", constant.DefaultNamespace, "shard-1"))
+	for _, test := range []struct {
+		name   string
+		marked bool
+		inject func(op errorfs.Op) bool
+	}{
+		{"open-marker", true, opIs(errorfs.OpOpen, paths.marker)},
+		{"read-marker", true, opIs(errorfs.OpFileRead, paths.marker)},
+		{"remove-stage", false, opIs(errorfs.OpRemoveAll, paths.stage)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			mem := memFSWithRoom()
+			require.NoError(t, mem.MkdirAll(paths.stage, 0755))
+			if test.marked {
+				require.NoError(t, writeInstallMarker(mem, paths.marker, 1))
+			}
+			fs := errorfs.Wrap(mem, errorfs.InjectorFunc(func(op errorfs.Op) error {
+				if test.inject(op) {
+					return errorfs.ErrInjected
+				}
+				return nil
+			}))
+			factory := newMemFactory(t, fs, nil)
+
+			err := factory.RecoverSnapshotInstall(constant.DefaultNamespace, 1, noLogClear)
+			assert.ErrorIs(t, err, errorfs.ErrInjected)
 		})
 	}
 }
@@ -2630,5 +2840,172 @@ func skipWithoutFailpoints(t *testing.T) {
 	t.Helper()
 	if !failpoint.Enabled {
 		t.Skip("needs failpoints: disabled by the disable_trap tag")
+	}
+}
+
+// snapshotChunk is a chunk of a snapshot, read ahead.
+type snapshotChunk struct {
+	name    string
+	index   int32
+	count   int32
+	content []byte
+}
+
+// snapshotChunksOf returns the chunks of a snapshot of a database that holds
+// the keys <prefix>-0 to <prefix>-99.
+func snapshotChunksOf(t *testing.T, prefix string) []snapshotChunk {
+	t.Helper()
+	factory, err := NewPebbleKVFactory(NewFactoryOptionsForTest(t))
+	require.NoError(t, err)
+	defer func() { assert.NoError(t, factory.Close()) }()
+	kv, err := factory.NewKV(constant.DefaultNamespace, 1, proto.KeySortingType_NATURAL)
+	require.NoError(t, err)
+	defer func() { assert.NoError(t, kv.Close()) }()
+	putKeys(t, kv, prefix)
+
+	snapshot, err := kv.Snapshot()
+	require.NoError(t, err)
+	defer func() { assert.NoError(t, snapshot.Close()) }()
+	var chunks []snapshotChunk
+	for ; snapshot.Valid(); snapshot.Next() {
+		chunk, err := snapshot.Chunk()
+		require.NoError(t, err)
+		chunks = append(chunks, snapshotChunk{chunk.Name(), chunk.Index(), chunk.TotalCount(), bytes.Clone(chunk.Content())})
+	}
+	return chunks
+}
+
+// addChunks adds copies of the chunks: the in-memory filesystem scribbles
+// over what it writes in the builds with invariants, which the race detector
+// enables.
+func addChunks(t *testing.T, loader SnapshotLoader, chunks []snapshotChunk) {
+	t.Helper()
+	for _, chunk := range chunks {
+		require.NoError(t, loader.AddChunk(chunk.name, chunk.index, chunk.count, bytes.Clone(chunk.content)))
+	}
+}
+
+// installSnapshot installs the chunks as the database of shard 1.
+func installSnapshot(t *testing.T, factory Factory, chunks []snapshotChunk) {
+	t.Helper()
+	loader, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, 0)
+	require.NoError(t, err)
+	addChunks(t, loader, chunks)
+	require.NoError(t, loader.Install(noCheck, noLogClear))
+	require.NoError(t, loader.Close())
+}
+
+func noCheck(string) error { return nil }
+
+func noLogClear() error { return nil }
+
+func putKeys(t *testing.T, kv KV, prefix string) {
+	t.Helper()
+	wb := kv.NewWriteBatch()
+	for i := range 100 {
+		require.NoError(t, wb.Put(fmt.Sprintf("%s-%d", prefix, i), []byte(prefix)))
+	}
+	require.NoError(t, wb.Commit())
+	require.NoError(t, wb.Close())
+}
+
+func assertKeys(t *testing.T, kv KV, prefix string) {
+	t.Helper()
+	for i := range 100 {
+		key := fmt.Sprintf("%s-%d", prefix, i)
+		_, value, closer, err := kv.Get(key, ComparisonEqual, NoInternalKeys)
+		require.NoError(t, err, key)
+		assert.Equal(t, prefix, string(value))
+		require.NoError(t, closer.Close())
+	}
+}
+
+func assertNoKeys(t *testing.T, kv KV, prefix string) {
+	t.Helper()
+	_, _, _, err := kv.Get(prefix+"-0", ComparisonEqual, NoInternalKeys)
+	assert.ErrorIs(t, err, errs.ErrDBKeyNotFound)
+}
+
+// assertNoInstallFiles asserts that no install of a snapshot is in progress.
+func assertNoInstallFiles(t *testing.T, fs vfs.FS, paths installPaths) {
+	t.Helper()
+	for _, path := range []string{paths.stage, paths.marker, paths.replaced} {
+		_, err := fs.Stat(path)
+		assert.ErrorIs(t, err, os.ErrNotExist, path)
+	}
+}
+
+// memFSWithRoom returns a filesystem in memory, which reports a disk with room
+// for any snapshot.
+func memFSWithRoom() *vfs.MemFS {
+	fs := vfs.NewCrashableMem()
+	fs.TestingSetDiskUsage(vfs.DiskUsage{TotalBytes: 1 << 40, AvailBytes: 1 << 40})
+	return fs
+}
+
+func newMemFactory(t *testing.T, fs vfs.FS, failpoints *failpoint.Failpoints) *PebbleFactory {
+	t.Helper()
+	factory, err := NewPebbleKVFactory(&FactoryOptions{DataDir: "/data", CacheSizeMB: 1, FS: fs, Failpoints: failpoints})
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, factory.Close()) })
+	return factory.(*PebbleFactory)
+}
+
+func memDBOptions(fs vfs.FS) *pebble.Options {
+	return &pebble.Options{
+		FS:                 fs,
+		DisableWAL:         true,
+		Logger:             &pebbleLogger{slog.Default()},
+		FormatMajorVersion: pebble.FormatVirtualSSTables,
+	}
+}
+
+// writeMemDB writes a database at path on fs that holds the keys <prefix>-0
+// to <prefix>-99, and syncs it.
+func writeMemDB(t *testing.T, fs vfs.FS, path string, prefix string) {
+	t.Helper()
+	db, err := pebble.Open(path, memDBOptions(fs))
+	require.NoError(t, err)
+	for i := range 100 {
+		require.NoError(t, db.Set(compare.EncoderNatural.Encode(fmt.Sprintf("%s-%d", prefix, i)), []byte(prefix), pebble.NoSync))
+	}
+	require.NoError(t, db.Flush())
+	require.NoError(t, db.Close())
+}
+
+// keysOnFS returns how many of the keys "old-<i>" and "new-<i>" the database at
+// path on fs holds, by prefix.
+func keysOnFS(t *testing.T, fs vfs.FS, path string) map[string]int {
+	t.Helper()
+	options := memDBOptions(fs)
+	options.ReadOnly = true
+	db, err := pebble.Open(path, options)
+	require.NoError(t, err)
+	defer func() { assert.NoError(t, db.Close()) }()
+	keys := map[string]int{}
+	for _, prefix := range []string{"old", "new"} {
+		for i := range 100 {
+			_, closer, err := db.Get(compare.EncoderNatural.Encode(fmt.Sprintf("%s-%d", prefix, i)))
+			if errors.Is(err, pebble.ErrNotFound) {
+				continue
+			}
+			require.NoError(t, err)
+			require.NoError(t, closer.Close())
+			keys[prefix]++
+		}
+	}
+	return keys
+}
+
+// afterOp matches the operations that target matches, once trigger matched
+// one.
+func afterOp(trigger, target func(op errorfs.Op) bool) func(op errorfs.Op) bool {
+	var triggered atomic.Bool
+	return func(op errorfs.Op) bool {
+		if trigger(op) {
+			triggered.Store(true)
+			return false
+		}
+		return triggered.Load() && target(op)
 	}
 }

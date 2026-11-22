@@ -31,6 +31,7 @@ type pebbleSnapshot struct {
 	fs         vfs.FS
 	path       string
 	files      []string
+	size       int64
 	chunkCount int32
 	chunkIndex int32
 	file       vfs.File
@@ -83,6 +84,7 @@ func newPebbleSnapshot(p *Pebble) (Snapshot, error) {
 		}
 		if !stat.IsDir() {
 			ps.files = append(ps.files, name)
+			ps.size += stat.Size()
 		}
 	}
 
@@ -99,6 +101,10 @@ func (ps *pebbleSnapshot) Close() error {
 
 func (ps *pebbleSnapshot) BasePath() string {
 	return ps.path
+}
+
+func (ps *pebbleSnapshot) Size() int64 {
+	return ps.size
 }
 
 func (ps *pebbleSnapshot) Valid() bool {

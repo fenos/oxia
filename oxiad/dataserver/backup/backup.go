@@ -79,7 +79,7 @@ func (j *backupJob) run(ctx context.Context) (*LastBackup, error) {
 	// Reading the checkpoint opens it with Pebble, which adds its lock file
 	// to the directory: the listing comes first, so that the backup holds
 	// the files of the checkpoint alone
-	commitOffset, term, err := database.ReadCheckpoint(j.checkpoint.BasePath())
+	state, err := database.ReadCheckpoint(j.checkpoint.BasePath())
 	if err != nil {
 		return nil, fmt.Errorf("read the checkpoint: %w", err)
 	}
@@ -105,8 +105,8 @@ func (j *backupJob) run(ctx context.Context) (*LastBackup, error) {
 		Shard:           j.path.Shard,
 		Range:           j.hashRange,
 		NamespaceConfig: j.namespaceConfig,
-		Term:            term,
-		CommitOffset:    commitOffset,
+		Term:            state.Term,
+		CommitOffset:    state.CommitOffset,
 		CreatedAt:       started,
 	}
 	var uploadedBytes int64

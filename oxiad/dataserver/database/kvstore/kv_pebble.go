@@ -23,6 +23,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -112,6 +113,9 @@ type PebbleFactory struct {
 	generationsLock sync.Mutex
 	generations     map[string]uint64
 
+	// installSlot admits one snapshot loader at a time, across the shards
+	installSlot chan struct{}
+
 	gaugeCacheSize metric.Gauge
 }
 
@@ -137,6 +141,7 @@ func NewPebbleKVFactory(options *FactoryOptions) (Factory, error) {
 		dataDir:       options.DataDir,
 		options:       options,
 		memTableSlots: memTableSlots,
+		installSlot:   make(chan struct{}, 1),
 
 		// Share a single cache instance across the databases for all the shards
 		cache: blockCache,
@@ -194,8 +199,9 @@ func (p *PebbleFactory) NewKV(namespace string, shardId int64, keySorting proto.
 	return newKVPebble(p, namespace, shardId, keySorting, p.options.Failpoints)
 }
 
-func (p *PebbleFactory) NewSnapshotLoader(namespace string, shardId int64) (SnapshotLoader, error) {
-	return newPebbleSnapshotLoader(p, p.options.FS, namespace, shardId)
+func (p *PebbleFactory) NewSnapshotLoader(ctx context.Context, namespace string, shardId int64,
+	size int64) (SnapshotLoader, error) {
+	return newPebbleSnapshotLoader(ctx, p, namespace, shardId, size)
 }
 
 func (p *PebbleFactory) DatabaseDir(namespace string, shardId int64) string {
@@ -208,15 +214,21 @@ func (p *PebbleFactory) DatabaseGeneration(namespace string, shardId int64) uint
 	return p.generations[generationKey(namespace, shardId)]
 }
 
-// databaseReplaced records that the database of a shard is being replaced
-// or deleted.
-func (p *PebbleFactory) databaseReplaced(namespace string, shardId int64) {
+// databaseDeleted records that the database of a shard is being deleted.
+func (p *PebbleFactory) databaseDeleted(namespace string, shardId int64) {
+	p.raiseDatabaseGeneration(namespace, shardId, p.DatabaseGeneration(namespace, shardId)+1)
+}
+
+// raiseDatabaseGeneration records that the database of a shard is replaced by
+// the one of the given generation. Raising it again to the same is a no-op.
+func (p *PebbleFactory) raiseDatabaseGeneration(namespace string, shardId int64, generation uint64) {
 	p.generationsLock.Lock()
 	defer p.generationsLock.Unlock()
 	if p.generations == nil {
 		p.generations = map[string]uint64{}
 	}
-	p.generations[generationKey(namespace, shardId)]++
+	key := generationKey(namespace, shardId)
+	p.generations[key] = max(p.generations[key], generation)
 }
 
 func generationKey(namespace string, shardId int64) string {
@@ -544,10 +556,16 @@ func (p *Pebble) Close() error {
 }
 
 func (p *Pebble) Delete() error {
-	p.factory.databaseReplaced(p.namespace, p.shardId)
+	p.factory.databaseDeleted(p.namespace, p.shardId)
+	fs := p.factory.options.FS
+	paths := newInstallPaths(p.factory.getKVPath(p.namespace, p.shardId))
+	// The files of an install that didn't complete go with the database
 	return multierr.Combine(
 		p.Close(),
-		os.RemoveAll(p.factory.getKVPath(p.namespace, p.shardId)),
+		os.RemoveAll(paths.db),
+		fs.RemoveAll(paths.stage),
+		fs.RemoveAll(paths.replaced),
+		fs.RemoveAll(paths.marker),
 	)
 }
 
@@ -1270,54 +1288,142 @@ func (p *PebblePrefixIterator) backward() bool {
 	return p.valid
 }
 
-// pebbleSnapshotLoader writes the snapshot files through fs, which is
-// FactoryOptions.FS. The tests also install a snapshot on
-// vfs.NewCrashableMem, which simulates a machine crash by keeping only what
-// was synced.
+// The install of a snapshot stages its files beside the database of the
+// shard, and puts them in place only once they are complete and checked. Next
+// to the directory of the database:
+//   - <database>.staging holds the snapshot while it is received;
+//   - <database>.install, the marker, holds the generation of the database the
+//     install leads to: once it exists, the snapshot is the database of the
+//     shard, and RecoverSnapshotInstall completes the replacement after a
+//     failure or a crash;
+//   - <database>.old holds the replaced database, until it is removed.
+//
+// Each step syncs what it changed before the next one, so a machine crash
+// leaves the state of one of them.
+type installPaths struct {
+	db       string
+	stage    string
+	marker   string
+	replaced string
+}
+
+func newInstallPaths(dbPath string) installPaths {
+	return installPaths{
+		db:       dbPath,
+		stage:    dbPath + ".staging",
+		marker:   dbPath + ".install",
+		replaced: dbPath + ".old",
+	}
+}
+
+// The headroom an install leaves free on the disk protects the writes of the
+// other shards while it runs: the logs of every shard on the disk fail their
+// appends when it fills up. It is 5% of the disk, at least
+// minInstallHeadroom, and at most maxInstallHeadroom, which covers those
+// writes on any volume without refusing the installs on a large shared disk.
+const (
+	minInstallHeadroom = 1 << 30
+	maxInstallHeadroom = 8 << 30
+)
+
+// installHeadroom returns the headroom of an install on a disk of total bytes.
+func installHeadroom(total uint64) uint64 {
+	return min(max(total/20, minInstallHeadroom), maxInstallHeadroom)
+}
+
+// installStep is a step of the install of a snapshot. A failpoint named after
+// it, "snapshot.install.<name>", runs before it.
+type installStep struct {
+	name string
+	run  func() error
+}
+
+func (p *PebbleFactory) runInstallSteps(steps ...installStep) error {
+	for _, step := range steps {
+		if err := p.options.Failpoints.Trigger("snapshot.install." + step.name); err != nil {
+			return err
+		}
+		if err := step.run(); err != nil {
+			return errors.Wrapf(err, "failed to %s", strings.ReplaceAll(step.name, "-", " "))
+		}
+	}
+	return nil
+}
+
+// pebbleSnapshotLoader writes the snapshot files through FactoryOptions.FS.
+// The tests also install a snapshot on vfs.NewCrashableMem, which simulates a
+// machine crash by keeping only what was synced.
 type pebbleSnapshotLoader struct {
 	pf        *PebbleFactory
 	namespace string
 	shard     int64
 	fs        vfs.FS
-	dbPath    string
-	complete  bool
-	file      vfs.File
+	paths     installPaths
+	// release frees the install slot of the factory
+	release func()
+	// installing is set once the marker exists: the snapshot is then the
+	// database of the shard, even if the replacement fails
+	installing bool
+	file       vfs.File
 }
 
-func newPebbleSnapshotLoader(pf *PebbleFactory, fs vfs.FS, namespace string, shard int64) (SnapshotLoader, error) {
+func newPebbleSnapshotLoader(ctx context.Context, pf *PebbleFactory, namespace string, shard int64,
+	size int64) (SnapshotLoader, error) {
 	if err := validation.ValidateNamespace(namespace); err != nil {
 		return nil, err
 	}
 
+	select {
+	case pf.installSlot <- struct{}{}:
+	case <-ctx.Done():
+		return nil, errors.Wrap(ctx.Err(), "failed to wait for the install of another snapshot")
+	}
 	sl := &pebbleSnapshotLoader{
 		pf:        pf,
 		namespace: namespace,
 		shard:     shard,
-		fs:        fs,
-		dbPath:    pf.getKVPath(namespace, shard),
+		fs:        pf.options.FS,
+		paths:     newInstallPaths(pf.getKVPath(namespace, shard)),
+		release:   sync.OnceFunc(func() { <-pf.installSlot }),
 	}
-
-	// The database is replaced from here on, whether or not the install
-	// completes
-	pf.databaseReplaced(namespace, shard)
-	if err := fs.RemoveAll(sl.dbPath); err != nil {
-		return nil, errors.Wrap(err, "failed to remove existing database")
+	// A stage left by a loader that didn't install it holds another snapshot
+	err := pf.runInstallSteps(
+		installStep{"remove-stage", func() error { return sl.fs.RemoveAll(sl.paths.stage) }},
+		installStep{"create-stage", func() error { return sl.fs.MkdirAll(sl.paths.stage, 0755) }},
+		installStep{"check-room", func() error { return checkInstallRoom(sl.fs, sl.paths.stage, size) }},
+	)
+	if err != nil {
+		return nil, multierr.Append(err, sl.Close())
 	}
-
-	if err := fs.MkdirAll(sl.dbPath, 0755); err != nil {
-		return nil, errors.Wrap(err, "failed to create database dir")
-	}
-
 	return sl, nil
 }
 
-func (sl *pebbleSnapshotLoader) Close() error {
-	if sl.complete {
-		return nil
+// checkInstallRoom refuses an install of size bytes that would leave less than
+// the headroom free on the disk of dir.
+func checkInstallRoom(fs vfs.FS, dir string, size int64) error {
+	usage, err := fs.GetDiskUsage(dir)
+	if err != nil {
+		return err
 	}
+	needed := uint64(max(size, 0)) + installHeadroom(usage.TotalBytes)
+	if usage.AvailBytes < needed {
+		return fmt.Errorf("%w: the snapshot of %d bytes and the headroom need %d bytes, the disk has %d free",
+			errs.ErrUnavailable, size, needed, usage.AvailBytes)
+	}
+	return nil
+}
 
-	// If we failed to successfully load, remove all intermediate files
-	return sl.fs.RemoveAll(sl.dbPath)
+func (sl *pebbleSnapshotLoader) Close() error {
+	defer sl.release()
+	var err error
+	if sl.file != nil {
+		err = sl.file.Close()
+		sl.file = nil
+	}
+	if sl.installing {
+		return err
+	}
+	return multierr.Append(err, sl.fs.RemoveAll(sl.paths.stage))
 }
 
 func (sl *pebbleSnapshotLoader) AddChunk(fileName string, chunkIndex int32, chunkCount int32, content []byte) error {
@@ -1333,13 +1439,12 @@ func (sl *pebbleSnapshotLoader) AddChunk(fileName string, chunkIndex int32, chun
 		if fileName != filepath.Base(fileName) || fileName == "." || !filepath.IsLocal(fileName) {
 			return errors.Errorf("invalid snapshot chunk file name: %q", fileName)
 		}
-		sl.file, err = sl.fs.Create(filepath.Join(sl.dbPath, fileName), vfs.WriteCategoryUnspecified)
+		sl.file, err = sl.fs.Create(filepath.Join(sl.paths.stage, fileName), vfs.WriteCategoryUnspecified)
 		if err != nil {
 			return err
 		}
-		// Closing the file syncs it. Once the follower acks the snapshot, the
-		// leader only sends the entries that follow it: the snapshot must
-		// survive a machine crash
+		// Closing the file syncs it: the snapshot must be durable before the
+		// marker makes it the database
 		sl.file = vfs.NewSyncingFile(sl.file, vfs.SyncingFileOptions{})
 	}
 	for len(content) > 0 {
@@ -1360,17 +1465,116 @@ func (sl *pebbleSnapshotLoader) AddChunk(fileName string, chunkIndex int32, chun
 	return nil
 }
 
-func (sl *pebbleSnapshotLoader) Complete() error {
-	// The files are synced already. Sync the directory entries too: of the
-	// files, and of the database directory, which was re-created
-	if err := syncDir(sl.fs, sl.dbPath); err != nil {
+func (sl *pebbleSnapshotLoader) Install(check func(dir string) error, clearLog func() error) error {
+	generation := sl.pf.DatabaseGeneration(sl.namespace, sl.shard) + 1
+	err := sl.pf.runInstallSteps(
+		installStep{"check-files", func() error {
+			if sl.file != nil {
+				return errors.New("inconsistent snapshot: last file not finished")
+			}
+			return nil
+		}},
+		// The files are synced already. Sync the directory entries too: of the
+		// files, and of the stage
+		installStep{"sync-stage", func() error {
+			return multierr.Combine(syncDir(sl.fs, sl.paths.stage), syncDir(sl.fs, filepath.Dir(sl.paths.stage)))
+		}},
+		installStep{"check-stage", func() error { return check(sl.paths.stage) }},
+		installStep{"mark", func() error { return writeInstallMarker(sl.fs, sl.paths.marker, generation) }},
+	)
+	if err != nil {
 		return err
 	}
-	if err := syncDir(sl.fs, filepath.Dir(sl.dbPath)); err != nil {
+	sl.installing = true
+	return sl.pf.completeInstall(sl.namespace, sl.shard, generation, clearLog)
+}
+
+// completeInstall puts the snapshot of a shard in place once its marker
+// exists. Each step is idempotent: RecoverSnapshotInstall runs them again
+// after a failure or a crash at any point.
+func (p *PebbleFactory) completeInstall(namespace string, shard int64, generation uint64, clearLog func() error) error {
+	fs := p.options.FS
+	paths := newInstallPaths(p.getKVPath(namespace, shard))
+	return p.runInstallSteps(
+		installStep{"swap", func() error { return swapStage(fs, paths) }},
+		// The entries of the log belong to the replaced database
+		installStep{"clear-log", clearLog},
+		installStep{"remove-replaced", func() error {
+			p.raiseDatabaseGeneration(namespace, shard, generation)
+			return fs.RemoveAll(paths.replaced)
+		}},
+		installStep{"unmark", func() error {
+			return multierr.Append(fs.Remove(paths.marker), syncDir(fs, filepath.Dir(paths.marker)))
+		}},
+	)
+}
+
+// swapStage puts the stage in place of the database, unless an earlier run did.
+func swapStage(fs vfs.FS, paths installPaths) error {
+	if _, err := fs.Stat(paths.stage); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
 		return err
 	}
-	sl.complete = true
-	return nil
+	// A database replaced by an earlier install, left by a crash, would fail
+	// the rename
+	if err := fs.RemoveAll(paths.replaced); err != nil {
+		return err
+	}
+	if err := fs.Rename(paths.db, paths.replaced); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := fs.Rename(paths.stage, paths.db); err != nil {
+		return err
+	}
+	return syncDir(fs, filepath.Dir(paths.db))
+}
+
+func writeInstallMarker(fs vfs.FS, path string, generation uint64) error {
+	f, err := fs.Create(path, vfs.WriteCategoryUnspecified)
+	if err != nil {
+		return err
+	}
+	_, err = f.Write([]byte(strconv.FormatUint(generation, 10)))
+	return multierr.Combine(err, f.Sync(), f.Close(), syncDir(fs, filepath.Dir(path)))
+}
+
+// readInstallMarker returns the generation the marker holds. A machine crash
+// can leave the marker without its content: the generation is then the next.
+func (p *PebbleFactory) readInstallMarker(namespace string, shard int64, path string) (generation uint64, marked bool,
+	err error) {
+	f, err := p.options.FS.Open(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	content, err := io.ReadAll(f)
+	if err = multierr.Append(err, f.Close()); err != nil {
+		return 0, false, err
+	}
+	if generation, err = strconv.ParseUint(string(content), 10, 64); err != nil {
+		generation = p.DatabaseGeneration(namespace, shard) + 1
+	}
+	return generation, true, nil
+}
+
+func (p *PebbleFactory) RecoverSnapshotInstall(namespace string, shardId int64, clearLog func() error) error {
+	if err := validation.ValidateNamespace(namespace); err != nil {
+		return err
+	}
+	paths := newInstallPaths(p.getKVPath(namespace, shardId))
+	generation, marked, err := p.readInstallMarker(namespace, shardId, paths.marker)
+	if err != nil {
+		return errors.Wrap(err, "failed to read the marker of the snapshot install")
+	}
+	if !marked {
+		// The snapshot was never checked: the database stands
+		return p.options.FS.RemoveAll(paths.stage)
+	}
+	return p.completeInstall(namespace, shardId, generation, clearLog)
 }
 
 func syncDir(fs vfs.FS, path string) error {

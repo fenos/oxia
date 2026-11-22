@@ -15,6 +15,7 @@
 package kvstore
 
 import (
+	"context"
 	"io"
 	"testing"
 
@@ -130,19 +131,30 @@ type Snapshot interface {
 	io.Closer
 
 	BasePath() string
+	// Size returns the size of the files of the snapshot, in bytes.
+	Size() int64
 
 	Valid() bool
 	Chunk() (SnapshotChunk, error)
 	Next() bool
 }
 
+// SnapshotLoader stages a snapshot beside the database of its shard, which it
+// leaves untouched until Install: a failure or a crash at any step leaves the
+// shard with either its database or the snapshot.
 type SnapshotLoader interface {
+	// Close releases the loader, and removes the snapshot unless Install
+	// started to put it in place.
 	io.Closer
 
 	AddChunk(fileName string, chunkIndex int32, chunkCount int32, content []byte) error
 
-	// Complete signals that the snapshot is now complete, and makes it durable
-	Complete() error
+	// Install makes the snapshot durable, has check read its directory, and
+	// replaces the database of the shard with it, unless check fails. The
+	// caller has closed the database. clearLog clears the log of the shard,
+	// whose entries belong to the replaced database. Once the replacement
+	// started, a failure leaves it to Factory.RecoverSnapshotInstall.
+	Install(check func(dir string) error, clearLog func() error) error
 }
 
 type ComparisonType proto.KeyComparisonType
@@ -246,17 +258,28 @@ type Factory interface {
 
 	NewKV(namespace string, shardId int64, keySorting proto.KeySortingType) (KV, error)
 
-	NewSnapshotLoader(namespace string, shardId int64) (SnapshotLoader, error)
+	// NewSnapshotLoader prepares the install of a snapshot of size bytes. It
+	// waits, as long as ctx allows, for the install of another snapshot to
+	// finish: one at a time keeps the room it checks for free. It refuses when
+	// the disk can't hold the snapshot and a headroom, which the logs of the
+	// shards need.
+	NewSnapshotLoader(ctx context.Context, namespace string, shardId int64, size int64) (SnapshotLoader, error)
+
+	// RecoverSnapshotInstall completes the install of a snapshot of the shard
+	// that a failure or a crash interrupted once the replacement started, and
+	// removes a snapshot that didn't get that far. The caller runs it before it
+	// opens the log or the database of the shard: clearLog clears the log.
+	RecoverSnapshotInstall(namespace string, shardId int64, clearLog func() error) error
 
 	// DatabaseDir returns the directory that holds the database of a shard,
-	// which NewSnapshotLoader replaces as a whole. The files kept next to the
-	// database, e.g. the backup record of the shard, go with it.
+	// which the install of a snapshot replaces as a whole. The files kept next
+	// to the database, e.g. the backup record of the shard, go with it.
 	DatabaseDir(namespace string, shardId int64) string
 
 	// DatabaseGeneration counts the replacements of the database of a shard
-	// since the factory opened: a snapshot loader created for it, or its
-	// deletion. A caller that took a checkpoint compares it to tell whether
-	// the database on disk is still the one it checkpointed.
+	// since the factory opened: a snapshot installed in it, or its deletion. A
+	// caller that took a checkpoint compares it to tell whether the database
+	// on disk is still the one it checkpointed.
 	DatabaseGeneration(namespace string, shardId int64) uint64
 }
 

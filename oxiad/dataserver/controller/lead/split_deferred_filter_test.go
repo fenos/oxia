@@ -218,12 +218,12 @@ func installSplitSnapshot(t *testing.T, rpcClient *rpc.MockRpcClient, kvFactory 
 	childShard int64) (database.DB, int64) {
 	t.Helper()
 
-	loader, err := kvFactory.NewSnapshotLoader(constant.DefaultNamespace, childShard)
+	loader, err := kvFactory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, childShard, 0)
 	require.NoError(t, err)
 	for _, chunk := range receiveSnapshot(t, rpcClient) {
 		require.NoError(t, loader.AddChunk(chunk.Name, chunk.ChunkIndex, chunk.ChunkCount, chunk.Content))
 	}
-	require.NoError(t, loader.Complete())
+	require.NoError(t, loader.Install(func(string) error { return nil }, func() error { return nil }))
 	require.NoError(t, loader.Close())
 
 	childDb, err := database.NewDB(constant.DefaultNamespace, childShard, kvFactory, proto.KeySortingType_UNKNOWN,

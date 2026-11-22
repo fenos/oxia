@@ -148,6 +148,21 @@ message SnapshotChunk {
   bytes content = 3;
   int32 chunk_index = 4;
   int32 chunk_count = 5;
+  // Set on the first chunk: the follower checks the room for the snapshot
+  // before it receives it, and the snapshot it received before it replaces its
+  // database with it. A follower that doesn't know the field ignores it.
+  SnapshotManifest manifest = 100;
+}
+
+// SnapshotManifest describes a snapshot, as read from its files by the leader
+// that sends it.
+message SnapshotManifest {
+  // The last entry applied to the database of the snapshot. The term is -1
+  // when the database didn't record it.
+  int64 commit_offset = 1;
+  int64 commit_term = 2;
+  // The size of the files of the snapshot, in bytes.
+  int64 total_size = 3;
 }
 
 enum KeySortingType {

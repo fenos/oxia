@@ -197,6 +197,15 @@ func NewFollowerController(storageOptions *option.StorageOptions, namespace stri
 		return nil, err
 	}
 
+	// The install of a snapshot that a crash interrupted completes before the
+	// WAL and the database open: the entries of the WAL belong to the replaced
+	// database
+	if err := kvFactory.RecoverSnapshotInstall(namespace, shardId, func() error {
+		return wal.ClearShard(wf, namespace, shardId)
+	}); err != nil {
+		return nil, errors.Wrap(err, "failed to complete the install of a snapshot")
+	}
+
 	rawTerm, rawCommitOffset, db, err := initDatabase(namespace, shardId, newTermOptions, storageOptions, kvFactory)
 	if err != nil {
 		return nil, err
@@ -770,14 +779,28 @@ func (fc *followerController) InstallSnapshot(stream proto.OxiaLogReplication_Se
 		return err
 	}
 
-	// From here on the WAL and the database content get replaced, even if
-	// the install fails: the state applier must not apply what it read before
-	fc.snapshotGeneration++
-	if err = fc.wal.Clear(); err != nil {
-		return errors.Wrapf(multierr.Combine(constant.ErrResourceUnavailable, err), "failed to clear WAL")
+	// The snapshot is received beside the database: the follower keeps its
+	// WAL and its database until the snapshot is complete and checked
+	var loader kvstore.SnapshotLoader
+	loader, err = fc.kvFactory.NewSnapshotLoader(stream.Context(), fc.namespace, fc.shardId, fc.snapshotSize(firstChunk))
+	if err != nil {
+		return errors.Wrapf(multierr.Combine(constant.ErrResourceUnavailable, err), "failed to create snapshot loader")
 	}
-	// The database gets replaced as well: until the snapshot is installed, the
-	// follower has no entries
+	defer func() {
+		// A snapshot the loader fails to remove is removed by the next
+		// install, or when the shard opens again
+		_ = loader.Close()
+	}()
+
+	totalSize, err := fc.loadSnapshotChunks(loader, firstChunk, stream)
+	if err != nil {
+		return err
+	}
+
+	// From here on the WAL and the database content get replaced, unless the
+	// snapshot fails its check: the state applier must not apply what it
+	// read before
+	fc.snapshotGeneration++
 	fc.lastAppendedOffset.Store(wal.InvalidOffset)
 	fc.commitOffset.Store(wal.InvalidOffset)
 	fc.advertisedCommitOffset.Store(wal.InvalidOffset)
@@ -785,18 +808,7 @@ func (fc *followerController) InstallSnapshot(stream proto.OxiaLogReplication_Se
 	// so the follower controller remains usable for retries.
 	defer func() {
 		if err != nil && fc.db == nil {
-			fc.log.Warn("Recovering database after failed snapshot install", slog.Any("error", err))
-			_, commitOffset, db, initErr := initDatabase(fc.namespace, fc.shardId, nil, fc.storageOptions, fc.kvFactory)
-			if initErr == nil {
-				fc.db = db
-				// The follower is left with the entries of the recovered
-				// database: none if the snapshot loader wiped it already
-				fc.lastAppendedOffset.Store(commitOffset)
-				fc.commitOffset.Store(commitOffset)
-				fc.advertisedCommitOffset.Store(commitOffset)
-			} else {
-				fc.log.Error("Failed to recover database, follower is in a broken state", slog.Any("error", initErr))
-			}
+			fc.reopenAfterFailedInstall(err)
 		}
 	}()
 	// Pebble closes the database even when Close reports an error (e.g. leaked
@@ -806,21 +818,8 @@ func (fc *followerController) InstallSnapshot(stream proto.OxiaLogReplication_Se
 	if err = oldDb.Close(); err != nil {
 		return errors.Wrapf(multierr.Combine(constant.ErrResourceUnavailable, err), "failed to close Database")
 	}
-	var loader kvstore.SnapshotLoader
-	loader, err = fc.kvFactory.NewSnapshotLoader(fc.namespace, fc.shardId)
-	if err != nil {
-		return errors.Wrapf(multierr.Combine(constant.ErrResourceUnavailable, err), "failed to create snapshot loader")
-	}
-	defer func() {
-		_ = loader.Close()
-	}()
-
-	totalSize, err := fc.loadSnapshotChunks(loader, firstChunk, stream)
-	if err != nil {
-		return err
-	}
-	if err = loader.Complete(); err != nil {
-		return errors.Wrapf(multierr.Combine(constant.ErrResourceUnavailable, err), "failed to complete snapshot")
+	if err = loader.Install(func(dir string) error { return checkSnapshot(dir, firstChunk) }, fc.wal.Clear); err != nil {
+		return errors.Wrapf(multierr.Combine(constant.ErrResourceUnavailable, err), "failed to install snapshot")
 	}
 
 	var db database.DB
@@ -855,6 +854,67 @@ func (fc *followerController) InstallSnapshot(stream proto.OxiaLogReplication_Se
 		slog.Int64("commit-offset", rawCommitOffset),
 	)
 	return nil
+}
+
+// snapshotSize returns the size of the snapshot that the leader announced on
+// its first chunk. A leader that doesn't announce it sends a snapshot of the
+// shard: the database it replaces gives an estimate.
+func (fc *followerController) snapshotSize(firstChunk *proto.SnapshotChunk) int64 {
+	if manifest := firstChunk.GetManifest(); manifest != nil {
+		return manifest.TotalSize
+	}
+	return int64(fc.db.RawKV().DiskSpaceUsage())
+}
+
+// checkSnapshot checks the snapshot in dir before it replaces the database: it
+// must open, and hold the commit entry that the leader announced. A leader that
+// doesn't announce it sends the snapshot of its term.
+func checkSnapshot(dir string, firstChunk *proto.SnapshotChunk) error {
+	state, err := database.ReadCheckpoint(dir)
+	if err != nil {
+		return err
+	}
+	if manifest := firstChunk.GetManifest(); manifest != nil {
+		if state.CommitOffset != manifest.CommitOffset || state.CommitTerm != manifest.CommitTerm {
+			return fmt.Errorf("%w: the snapshot holds the commit entry {term: %d, offset: %d}, the leader announced "+
+				"{term: %d, offset: %d}", errs.ErrDataCorrupted, state.CommitTerm, state.CommitOffset,
+				manifest.CommitTerm, manifest.CommitOffset)
+		}
+		return nil
+	}
+	if firstChunk.Term != wal.InvalidTerm && state.Term != firstChunk.Term {
+		return fmt.Errorf("%w: the snapshot is of the term %d, the leader of the term %d", errs.ErrDataCorrupted,
+			state.Term, firstChunk.Term)
+	}
+	return nil
+}
+
+// reopenAfterFailedInstall reopens the database after an install of a snapshot
+// failed with err. The install completes first if it got as far as replacing
+// the database: the WAL then belongs to the replaced one, and gets cleared. A
+// follower that can't do either is left without a database.
+func (fc *followerController) reopenAfterFailedInstall(err error) {
+	fc.log.Warn("Recovering database after failed snapshot install", slog.Any("error", err))
+	if recoverErr := fc.kvFactory.RecoverSnapshotInstall(fc.namespace, fc.shardId, fc.wal.Clear); recoverErr != nil {
+		fc.log.Error("Failed to complete the snapshot install, follower is in a broken state",
+			slog.Any("error", recoverErr))
+		return
+	}
+	_, commitOffset, db, initErr := initDatabase(fc.namespace, fc.shardId, nil, fc.storageOptions, fc.kvFactory)
+	if initErr != nil {
+		fc.log.Error("Failed to recover database, follower is in a broken state", slog.Any("error", initErr))
+		return
+	}
+	fc.db = db
+	// The follower is left with the entries of the WAL, if the install didn't
+	// clear it, and of the database otherwise
+	lastAppendedOffset := fc.wal.LastOffset()
+	if lastAppendedOffset == wal.InvalidOffset {
+		lastAppendedOffset = commitOffset
+	}
+	fc.lastAppendedOffset.Store(lastAppendedOffset)
+	fc.commitOffset.Store(commitOffset)
+	fc.advertisedCommitOffset.Store(commitOffset)
 }
 
 // filterSplitSnapshot filters the snapshot of its parent that a split child

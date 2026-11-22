@@ -24,7 +24,6 @@ import (
 	"github.com/oxia-db/oxia/common/proto"
 	commontime "github.com/oxia-db/oxia/common/time"
 	"github.com/oxia-db/oxia/oxiad/dataserver/database/kvstore"
-	"github.com/oxia-db/oxia/oxiad/dataserver/wal"
 )
 
 func TestReadCheckpointReturnsTheCommitOffsetAndTermOfTheFiles(t *testing.T) {
@@ -37,7 +36,7 @@ func TestReadCheckpointReturnsTheCommitOffsetAndTermOfTheFiles(t *testing.T) {
 	require.NoError(t, db.UpdateTerm(3, TermOptions{}))
 	for offset := range int64(5) {
 		_, err := db.ProcessWrite(&proto.WriteRequest{Puts: []*proto.PutRequest{{Key: "k", Value: []byte("v")}}},
-			0, offset, 0, NoOpCallback)
+			2, offset, 0, NoOpCallback)
 		require.NoError(t, err)
 	}
 
@@ -48,10 +47,9 @@ func TestReadCheckpointReturnsTheCommitOffsetAndTermOfTheFiles(t *testing.T) {
 		0, 5, 0, NoOpCallback)
 	require.NoError(t, err)
 
-	commitOffset, term, err := ReadCheckpoint(snapshot.BasePath())
+	state, err := ReadCheckpoint(snapshot.BasePath())
 	require.NoError(t, err)
-	assert.EqualValues(t, 4, commitOffset)
-	assert.EqualValues(t, 3, term)
+	assert.Equal(t, CheckpointState{CommitOffset: 4, CommitTerm: 2, Term: 3}, state)
 
 	require.NoError(t, snapshot.Close())
 	_, err = os.Stat(snapshot.BasePath())
@@ -59,15 +57,15 @@ func TestReadCheckpointReturnsTheCommitOffsetAndTermOfTheFiles(t *testing.T) {
 }
 
 func TestReadCheckpointFailsWithoutDatabase(t *testing.T) {
-	commitOffset, term, err := ReadCheckpoint(t.TempDir())
+	state, err := ReadCheckpoint(t.TempDir())
 	assert.ErrorContains(t, err, "failed to open the checkpoint")
-	assert.EqualValues(t, wal.InvalidOffset, commitOffset)
-	assert.EqualValues(t, wal.InvalidTerm, term)
+	assert.Zero(t, state)
 }
 
 func TestReadCheckpointFailsOnCorruptState(t *testing.T) {
 	for key, message := range map[string]string{
 		commitOffsetKey: "failed to read the commit offset of the checkpoint",
+		commitTermKey:   "failed to read the commit term of the checkpoint",
 		termKey:         "failed to read the term of the checkpoint",
 	} {
 		t.Run(key, func(t *testing.T) {
@@ -85,10 +83,9 @@ func TestReadCheckpointFailsOnCorruptState(t *testing.T) {
 			require.NoError(t, err)
 			defer func() { assert.NoError(t, snapshot.Close()) }()
 
-			commitOffset, term, err := ReadCheckpoint(snapshot.BasePath())
+			state, err := ReadCheckpoint(snapshot.BasePath())
 			assert.ErrorContains(t, err, message)
-			assert.EqualValues(t, wal.InvalidOffset, commitOffset)
-			assert.EqualValues(t, wal.InvalidTerm, term)
+			assert.Zero(t, state)
 		})
 	}
 }
