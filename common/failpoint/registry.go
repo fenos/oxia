@@ -16,7 +16,10 @@
 
 package failpoint
 
-import "sync"
+import (
+	"context"
+	"sync"
+)
 
 // registry holds the values of the failpoints enabled for the whole process,
 // by name, for the end-to-end tests that can't reach the *Failpoints of the
@@ -47,4 +50,16 @@ func Eval[T any](name string) (T, bool) {
 	}
 	typed, ok := value.(T)
 	return typed, ok
+}
+
+// Step runs the hook that a test enabled at the step name of a sequence, a
+// func(context.Context) error, with ctx. A hook that returns an error stops
+// the sequence at that step, e.g. as a process that stops there: it blocks
+// until ctx is done, and returns its error. Step returns nil when no hook is
+// enabled.
+func Step(ctx context.Context, name string) error {
+	if hook, ok := Eval[func(context.Context) error](name); ok {
+		return hook(ctx)
+	}
+	return nil
 }

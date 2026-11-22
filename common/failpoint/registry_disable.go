@@ -16,6 +16,8 @@
 
 package failpoint
 
+import "context"
+
 func Enable(string, any) {}
 
 func Disable(string) {}
@@ -23,4 +25,8 @@ func Disable(string) {}
 func Eval[T any](string) (T, bool) {
 	var zero T
 	return zero, false
+}
+
+func Step(context.Context, string) error {
+	return nil
 }

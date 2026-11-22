@@ -17,6 +17,8 @@
 package failpoint
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -30,4 +32,11 @@ func TestEvalDisabled(t *testing.T) {
 	value, ok := Eval[time.Duration]("point")
 	assert.False(t, ok)
 	assert.Zero(t, value)
+}
+
+func TestStepDisabled(t *testing.T) {
+	Enable("step", func(context.Context) error { return errors.New("stopped") })
+	t.Cleanup(func() { Disable("step") })
+
+	assert.NoError(t, Step(t.Context(), "step"))
 }

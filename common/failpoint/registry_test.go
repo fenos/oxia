@@ -17,6 +17,8 @@
 package failpoint
 
 import (
+	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -72,4 +74,21 @@ func TestEvalWhileEnabling(t *testing.T) {
 		}
 	}
 	wg.Wait()
+}
+
+func TestStepRunsTheHook(t *testing.T) {
+	stopped := errors.New("stopped")
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	// A hook that stops the sequence waits for the end of ctx
+	Enable("step", func(hookCtx context.Context) error {
+		<-hookCtx.Done()
+		return errors.Join(stopped, hookCtx.Err())
+	})
+	t.Cleanup(func() { Disable("step") })
+
+	err := Step(ctx, "step")
+	assert.ErrorIs(t, err, stopped)
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.NoError(t, Step(ctx, "other"))
 }
