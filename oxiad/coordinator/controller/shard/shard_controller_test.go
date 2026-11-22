@@ -4848,3 +4848,33 @@ func TestControllerDispatchChangeEnsembleFailsWhenTheControllerStopsMeanwhile(t 
 	_, err := ac.Wait(t.Context())
 	assert.ErrorIs(t, err, constant.ErrResourceUnavailable)
 }
+
+// An election whose status can't be read is dispatched again a second later,
+// instead of retried in the event loop.
+func TestControllerElectionIsDispatchedAgainWhenTheStatusCantBeRead(t *testing.T) {
+	var shard int64 = 5
+	metadata := &hookedMetadata{
+		Metadata: newTestMetadata(t, memory.NewProvider(metadatacodec.ClusterStatusCodec, metadatacommon.WatchDisabled, ""),
+			&proto.ClusterConfiguration{}),
+		getShardStatus: func(string, int64) (commonobject.Borrowed[*proto.ShardMetadata], bool, error) {
+			return commonobject.Borrowed[*proto.ShardMetadata]{}, false, errors.New("store unavailable")
+		},
+	}
+	s := &controller{
+		ctx:           t.Context(),
+		shard:         shard,
+		metadataStore: metadata,
+		electionOp:    make(chan *action.ElectionAction, 1),
+		logger:        slog.Default(),
+	}
+	electionAction := action.NewElectionAction(shard)
+
+	s.handleElectionWithRetries(electionAction)
+
+	select {
+	case queued := <-s.electionOp:
+		assert.Same(t, electionAction, queued)
+	case <-time.After(10 * time.Second):
+		assert.Fail(t, "the election was not dispatched again")
+	}
+}

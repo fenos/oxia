@@ -1979,3 +1979,24 @@ func (*sessionManagerKeysIterator) SeekGE(string) bool { panic("not supported") 
 func (*sessionManagerKeysIterator) SeekLT(string) bool { panic("not supported") }
 
 func (*sessionManagerKeysIterator) Error() error { return nil }
+
+// Closing a session while the shard is frozen for the cutover of a split
+// fails: the deletion of its record isn't written, and the client retries.
+func TestSessionManager_CloseSessionFailsWhileTheShardIsFrozen(t *testing.T) {
+	shardId := int64(1)
+	kvf, walf, sManager, lc := createSessionManager(t)
+	created, err := sManager.CreateSession(&proto.CreateSessionRequest{
+		Shard:            shardId,
+		SessionTimeoutMs: uint32(time.Minute.Milliseconds()),
+	})
+	require.NoError(t, err)
+
+	lc.frozen.Store(true)
+	_, err = sManager.CloseSession(&proto.CloseSessionRequest{Shard: shardId, SessionId: created.SessionId})
+	assert.ErrorIs(t, err, constant.ErrNodeIsNotLeader)
+	lc.frozen.Store(false)
+
+	assert.NoError(t, lc.Close())
+	assert.NoError(t, kvf.Close())
+	assert.NoError(t, walf.Close())
+}

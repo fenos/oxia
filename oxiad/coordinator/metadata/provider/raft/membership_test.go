@@ -428,3 +428,44 @@ func TestHeartbeatObservationsAreTheOnesKept(t *testing.T) {
 	assert.True(t, isHeartbeatObservation(&hashicorpraft.Observation{Data: hashicorpraft.ResumedHeartbeatObservation{}}))
 	assert.False(t, isHeartbeatObservation(&hashicorpraft.Observation{Data: hashicorpraft.LeaderObservation{}}))
 }
+
+// The leader removes a configured server that is no longer listed, and
+// forgets what it observed of it: here a non-voter that never starts, so
+// the two voters commit the change.
+func TestReconcileRemovesAnUnlistedServer(t *testing.T) {
+	peers := freeAddresses(t, 3)
+	nodes := make([]*Raft, 2)
+	for i, addr := range peers[:2] {
+		node, err := NewFromConfig(Config{Address: addr, Peers: peers, DataDir: filepath.Join(t.TempDir(), "raft"),
+			PromotionQuiet: time.Hour}, nil)
+		require.NoError(t, err)
+		nodes[i] = node
+		t.Cleanup(func() { assert.NoError(t, node.Close()) })
+	}
+	nonVoter := hashicorpraft.ServerID(peers[2])
+
+	// A round of the current leader, once its own rounds added the
+	// non-voter, which they keep adding back: one of these removes it
+	require.Eventually(t, func() bool {
+		for i, node := range nodes {
+			if node.node.State() != hashicorpraft.Leader {
+				continue
+			}
+			m := &membership{
+				node:             node.node,
+				self:             hashicorpraft.ServerID(peers[i]),
+				peers:            peers[:2],
+				promotionQuiet:   time.Hour,
+				heartbeatTimeout: time.Millisecond,
+				logger:           slog.New(slog.NewTextHandler(io.Discard, nil)),
+				seen:             map[hashicorpraft.ServerID]time.Time{nonVoter: time.Now()},
+				failed:           map[hashicorpraft.ServerID]time.Time{nonVoter: time.Now()},
+			}
+			m.reconcile(time.Now())
+			_, seen := m.seen[nonVoter]
+			_, failed := m.failed[nonVoter]
+			return !seen && !failed
+		}
+		return false
+	}, 30*time.Second, 100*time.Millisecond, "the unlisted non-voter is removed")
+}
