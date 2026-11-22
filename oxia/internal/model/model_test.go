@@ -79,6 +79,24 @@ func TestGetCallEmptyPartitionKey(t *testing.T) {
 	assert.Equal(t, partitionKey, call.PartitionKeyOrKey())
 }
 
+func TestPutCallPartitionKey(t *testing.T) {
+	partitionKey := "partition-key"
+	call := PutCall{
+		Key:          "key",
+		PartitionKey: &partitionKey,
+	}
+
+	assert.Equal(t, partitionKey, call.PartitionKeyOrKey())
+	assert.Equal(t, partitionKey, call.ToProto().GetPartitionKey())
+}
+
+func TestPutCallPartitionKeyOrKeyFallback(t *testing.T) {
+	call := PutCall{Key: "key"}
+
+	assert.Equal(t, "key", call.PartitionKeyOrKey())
+	assert.Nil(t, call.ToProto().PartitionKey)
+}
+
 func TestInOpIndexOrder(t *testing.T) {
 	calls := InOpIndexOrder(
 		[]PutCall{{Key: "put-0", OpIndex: 0}, {Key: "put-2", OpIndex: 2}},
