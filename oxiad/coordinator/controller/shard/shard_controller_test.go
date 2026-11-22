@@ -4669,3 +4669,38 @@ func (p *unreachableRpcProvider) GetStatus(ctx context.Context, node *proto.Data
 	}
 	return p.RpcProvider.GetStatus(ctx, node, req)
 }
+
+// A controller whose shard was removed before it started, as the children of a
+// split that is aborted right after it was initiated, stops on its own: it
+// elects nothing, so it doesn't bring the shard back, and it closes.
+func TestControllerOfAShardRemovedBeforeItStartedStops(t *testing.T) {
+	var shard int64 = 3
+	rpc := rpctest.NewRpcProvider()
+	s1 := testDataServer("s1")
+	metadata := newTestMetadata(t, memory.NewProvider(metadatacodec.ClusterStatusCodec, metadatacommon.WatchDisabled, ""),
+		&proto.ClusterConfiguration{})
+	// The status the controller is created with, which the abort removed
+	// from the metadata before the controller read it
+	shardMeta := &proto.ShardMetadata{
+		Status:   proto.ShardStatusUnknown,
+		Ensemble: []*proto.DataServerIdentity{s1},
+	}
+
+	sc := NewController(constant.DefaultNamespace, shard, namespaceConfig, shardMeta, metadata,
+		feature.NoOpSupplier, nil, rpc, DefaultPeriodicTasksInterval).(*controller)
+
+	select {
+	case <-sc.ctx.Done():
+	case <-time.After(10 * time.Second):
+		assert.Fail(t, "the controller of a removed shard kept running")
+	}
+	rpc.GetNode(s1).ExpectNoMoreNewTermRequest(t)
+	_, exists := testShardMetadata(metadata, constant.DefaultNamespace, shard)
+	assert.False(t, exists)
+
+	ac := action.NewChangeEnsembleAction(shard, s1, testDataServer("s2"))
+	sc.Dispatch(ac)
+	assert.NoError(t, sc.Close())
+	_, err := ac.Wait(t.Context())
+	assert.ErrorIs(t, err, constant.ErrResourceUnavailable)
+}

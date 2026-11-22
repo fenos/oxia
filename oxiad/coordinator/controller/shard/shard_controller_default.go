@@ -252,9 +252,17 @@ func (s *controller) run(bo backoff.BackOff) error {
 	if err != nil {
 		return err
 	}
-	initShardMeta := common.Must(borrowedMeta, exists,
-		"bug: shard metadata missing while starting shard controller: namespace=", s.namespace, " shard=",
-		s.shard).UnsafeBorrow()
+	if !exists {
+		// The status of a shard is stored before its controller is created,
+		// so the shard was removed since, e.g. a child of a split that was
+		// aborted right after it was initiated. Its remover closes the
+		// controller; until then, there is nothing to control, and an
+		// election would bring the shard back.
+		s.logger.Info("The shard was removed before its controller started, stopping the controller")
+		s.ctxCancel()
+		return nil
+	}
+	initShardMeta := borrowedMeta.UnsafeBorrow()
 
 	if err := s.start(initShardMeta); err != nil {
 		return err
