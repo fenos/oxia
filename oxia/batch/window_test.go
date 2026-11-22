@@ -206,7 +206,8 @@ func TestBatcherRunWindowCompletesASynchronousBatchWhenItIsSent(t *testing.T) {
 
 // Under load, each call completes once, in the order it was added, and each
 // barrier is done only after every call added before it completed, whichever
-// way the queued calls join the batches.
+// way the queued calls join the batches. The last barrier follows every call,
+// so the calls are all complete once it is done.
 func TestBatcherRunWindowKeepsTheOrderOfCallsAndBarriersUnderLoad(t *testing.T) {
 	const calls = 5000
 	server := &windowServer{autoRelease: true}
@@ -220,8 +221,9 @@ func TestBatcherRunWindowKeepsTheOrderOfCallsAndBarriersUnderLoad(t *testing.T) 
 			batcher.Add(Barrier{Done: func() { barriers <- server.completedCalls() >= addedBefore }})
 		}
 	}
+	batcher.Add(Barrier{Done: func() { barriers <- server.completedCalls() >= calls }})
 
-	for range calls / 3 {
+	for range calls/3 + 1 {
 		select {
 		case inOrder := <-barriers:
 			require.True(t, inOrder, "a barrier was done before the calls added before it completed")
