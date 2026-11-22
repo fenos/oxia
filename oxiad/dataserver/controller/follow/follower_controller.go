@@ -301,10 +301,11 @@ func (fc *followerController) Close() error {
 	if fc.logSynchronizer.IsValid() {
 		fc.logSynchronizer.Close()
 	}
-	err = multierr.Combine(
-		fc.wal.Close(),
-		fc.db.Close(),
-	)
+	err = fc.wal.Close()
+	// A failed install can leave the follower without a database
+	if fc.db != nil {
+		err = multierr.Append(err, fc.db.Close())
+	}
 	return err
 }
 
@@ -749,10 +750,8 @@ func (fc *followerController) InstallSnapshot(stream proto.OxiaLogReplication_Se
 
 	// A follower that replicates refuses the install at once, rather than
 	// once the leader sent the first chunk
-	fc.rwMutex.RLock()
-	err = fc.installConflict()
-	fc.rwMutex.RUnlock()
-	if err != nil {
+	var databaseSize int64
+	if databaseSize, err = fc.prepareInstall(); err != nil {
 		return err
 	}
 
@@ -774,7 +773,7 @@ func (fc *followerController) InstallSnapshot(stream proto.OxiaLogReplication_Se
 	// which a new term and the close of the follower take, and not after
 	// the close
 	var loader kvstore.SnapshotLoader
-	if loader, err = fc.newSnapshotLoader(stream.Context(), firstChunk); err != nil {
+	if loader, err = fc.newSnapshotLoader(stream.Context(), snapshotSize(firstChunk, databaseSize)); err != nil {
 		return errors.Wrapf(multierr.Combine(constant.ErrResourceUnavailable, err), "failed to create snapshot loader")
 	}
 	defer func() {
@@ -880,28 +879,45 @@ func (fc *followerController) installConflict() error {
 // newSnapshotLoader returns the loader of a snapshot, once the installs of the
 // other shards let it start. It stops waiting when ctx is done or the
 // follower closes.
-func (fc *followerController) newSnapshotLoader(ctx context.Context, firstChunk *proto.SnapshotChunk) (
-	kvstore.SnapshotLoader, error) {
+func (fc *followerController) newSnapshotLoader(ctx context.Context, size int64) (kvstore.SnapshotLoader, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	stop := context.AfterFunc(fc.ctx, cancel)
 	defer stop()
-	return fc.kvFactory.NewSnapshotLoader(ctx, fc.namespace, fc.shardId, fc.snapshotSize(firstChunk))
+	return fc.kvFactory.NewSnapshotLoader(ctx, fc.namespace, fc.shardId, size)
 }
+
+// prepareInstall checks that the follower can install a snapshot, and returns
+// the size of its database. A follower that an earlier install left without a
+// database completes that install first, if it got as far as its marker, or
+// reopens its database: the next install must not replace a marked snapshot.
+func (fc *followerController) prepareInstall() (int64, error) {
+	fc.rwMutex.Lock()
+	defer fc.rwMutex.Unlock()
+	if err := fc.installConflict(); err != nil {
+		return 0, err
+	}
+	if fc.db == nil {
+		fc.reopenAfterFailedInstall(errNoDatabase)
+		if fc.db == nil {
+			return 0, errors.Wrap(constant.ErrResourceUnavailable, errNoDatabase.Error())
+		}
+	}
+	return int64(fc.db.RawKV().DiskSpaceUsage()), nil
+}
+
+// errNoDatabase is the state of a follower whose install failed, and then the
+// recovery of its database.
+var errNoDatabase = errors.New("an earlier snapshot install left the follower without a database")
 
 // snapshotSize returns the size of the snapshot that the leader announced on
 // its first chunk. A leader that doesn't announce it sends a snapshot of the
-// shard: the database it replaces gives an estimate, if the follower has one.
-func (fc *followerController) snapshotSize(firstChunk *proto.SnapshotChunk) int64 {
+// shard: the size of the database it replaces gives an estimate.
+func snapshotSize(firstChunk *proto.SnapshotChunk, databaseSize int64) int64 {
 	if manifest := firstChunk.GetManifest(); manifest != nil {
 		return manifest.TotalSize
 	}
-	fc.rwMutex.RLock()
-	defer fc.rwMutex.RUnlock()
-	if fc.db == nil {
-		return 0
-	}
-	return int64(fc.db.RawKV().DiskSpaceUsage())
+	return databaseSize
 }
 
 // checkSnapshot checks the snapshot in dir before it replaces the database: it

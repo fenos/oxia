@@ -1386,6 +1386,15 @@ func newPebbleSnapshotLoader(ctx context.Context, pf *PebbleFactory, namespace s
 		paths:     newInstallPaths(pf.getKVPath(namespace, shard)),
 		release:   sync.OnceFunc(func() { <-pf.installSlot }),
 	}
+	// A marked install completes first, through RecoverSnapshotInstall: its
+	// stage is the snapshot of the shard, which the marker would otherwise
+	// take from the next stage
+	if err := pf.runInstallSteps(
+		installStep{"check-marker", func() error { return refuseMarkedInstall(sl.fs, sl.paths.marker) }},
+	); err != nil {
+		sl.release()
+		return nil, err
+	}
 	// A stage left by a loader that didn't install it holds another snapshot
 	err := pf.runInstallSteps(
 		installStep{"remove-stage", func() error { return sl.fs.RemoveAll(sl.paths.stage) }},
@@ -1396,6 +1405,16 @@ func newPebbleSnapshotLoader(ctx context.Context, pf *PebbleFactory, namespace s
 		return nil, multierr.Append(err, sl.Close())
 	}
 	return sl, nil
+}
+
+// refuseMarkedInstall refuses a new install while the marker of another stands.
+func refuseMarkedInstall(fs vfs.FS, marker string) error {
+	if _, err := fs.Stat(marker); err == nil {
+		return fmt.Errorf("%w: the install of a snapshot is still to complete", errs.ErrFailedPrecondition)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 // checkInstallRoom refuses an install of size bytes that would leave less than

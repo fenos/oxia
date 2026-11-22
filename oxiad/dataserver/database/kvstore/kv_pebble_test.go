@@ -1174,6 +1174,7 @@ func TestPebbleSnapshotLoaderInstallSurvivesACrashAtEveryStep(t *testing.T) {
 		// replaced is whether the snapshot is the database after the crash
 		replaced bool
 	}{
+		{"check-marker", false},
 		{"remove-stage", false},
 		{"create-stage", false},
 		{"check-room", false},
@@ -1318,6 +1319,26 @@ func TestPebbleNewSnapshotLoaderChecksTheRoomOnTheDisk(t *testing.T) {
 			assert.NoError(t, loader.Close())
 		})
 	}
+}
+
+// The install of a snapshot that got as far as its marker completes before
+// another starts: the next one would remove its stage, and the marker would
+// adopt the next one's.
+func TestPebbleNewSnapshotLoaderRefusesWhileAnInstallIsMarked(t *testing.T) {
+	fs := memFSWithRoom()
+	factory := newMemFactory(t, fs, nil)
+	paths := newInstallPaths(factory.getKVPath(constant.DefaultNamespace, 1))
+	writeMemDB(t, fs, paths.stage, "new")
+	require.NoError(t, writeInstallMarker(fs, paths.marker, 1))
+
+	_, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, 0)
+	assert.ErrorIs(t, err, errs.ErrFailedPrecondition)
+	assert.Equal(t, map[string]int{"new": 100}, keysOnFS(t, fs, paths.stage), "the marked snapshot stands")
+
+	require.NoError(t, factory.RecoverSnapshotInstall(constant.DefaultNamespace, 1, noLogClear))
+	loader, err := factory.NewSnapshotLoader(context.Background(), constant.DefaultNamespace, 1, 0)
+	require.NoError(t, err, "the slot is free again")
+	assert.NoError(t, loader.Close())
 }
 
 func TestPebbleNewSnapshotLoaderWaitsForTheInstallInProgress(t *testing.T) {
@@ -2438,6 +2459,7 @@ func TestPebbleSnapshotLoaderFailsOnFilesystemErrors(t *testing.T) {
 		// The step that fails, after the loader got created
 		step func(loader SnapshotLoader) error
 	}{
+		{"stat-marker", opIs(errorfs.OpStat, paths.marker), nil},
 		{"remove-stage", opIs(errorfs.OpRemoveAll, paths.stage), nil},
 		{"create-stage", opIs(errorfs.OpMkdirAll, paths.stage), nil},
 		{"read-disk-usage", opIs(errorfs.OpGetDiskUsage, ""), nil},

@@ -51,6 +51,7 @@ import (
 
 	"github.com/oxia-db/oxia/common/concurrent"
 	"github.com/oxia-db/oxia/common/constant"
+	"github.com/oxia-db/oxia/common/failpoint"
 	time2 "github.com/oxia-db/oxia/common/time"
 	"github.com/oxia-db/oxia/oxiad/common/logging"
 
@@ -4073,6 +4074,64 @@ func TestFollowerControllerInstallSnapshotWaitsForAnotherShardOutsideTheLock(t *
 	}
 }
 
+// A follower whose install got as far as its marker, but failed to complete it
+// and to recover, has no database, and the marked snapshot on disk. The next
+// install completes that one first: its own snapshot, which the check refuses,
+// never replaces it.
+func TestFollowerControllerInstallSnapshotCompletesAMarkedInstallFirst(t *testing.T) {
+	fc, _, kvFactory := newFollowerLeftWithAMarkedInstall(t)
+
+	chunks := withManifest(snapshotChunks(t, 1), &proto.SnapshotManifest{CommitOffset: 7777, CommitTerm: 1})
+	err := fc.InstallSnapshot(newSnapshotStream(chunks))
+	assert.ErrorIs(t, err, errs.ErrDataCorrupted)
+
+	assert.EqualValues(t, 99, fc.CommitOffset(), "the marked snapshot is the database")
+	_, err = os.Stat(kvFactory.DatabaseDir(constant.DefaultNamespace, 0) + ".install")
+	assert.ErrorIs(t, err, os.ErrNotExist)
+	assert.NoError(t, fc.Close())
+}
+
+// A follower left with a marked install keeps that snapshot across a later
+// install that fails, and across a restart.
+func TestFollowerControllerInstallSnapshotKeepsAMarkedSnapshotAcrossAFailedInstall(t *testing.T) {
+	fc, walFactory, kvFactory := newFollowerLeftWithAMarkedInstall(t)
+
+	chunks := snapshotChunks(t, 1)
+	err := fc.InstallSnapshot(&hookSnapshotStream{
+		MockServerSendSnapshotStream: newSnapshotStream(chunks[:1]),
+		recvAfterFirst:               errors.New("the leader is gone"),
+	})
+	assert.Error(t, err)
+	assert.EqualValues(t, 99, fc.CommitOffset())
+	require.NoError(t, fc.Close())
+
+	restarted, err := NewFollowerController(&option.StorageOptions{}, constant.DefaultNamespace, 0, walFactory, kvFactory, nil)
+	require.NoError(t, err)
+	assert.EqualValues(t, 99, restarted.CommitOffset(), "the marked snapshot survives the restart")
+	assert.NoError(t, restarted.Close())
+}
+
+// A follower without a database closes.
+func TestFollowerControllerCloseWithoutADatabase(t *testing.T) {
+	fc, _, _ := newFollowerLeftWithAMarkedInstall(t)
+	assert.NoError(t, fc.Close())
+}
+
+// A follower that can't complete the marked install of an earlier snapshot,
+// nor reopen its database, refuses the next.
+func TestFollowerControllerInstallSnapshotRefusesWithoutADatabase(t *testing.T) {
+	fc, walFactory, _ := newFollowerLeftWithAMarkedInstall(t)
+	walFactory.setHooks(func(h *walHooks) { h.clear = func() error { return errors.New("injected") } })
+
+	err := fc.InstallSnapshot(newSnapshotStream(snapshotChunks(t, 1)))
+	assert.ErrorIs(t, err, constant.ErrResourceUnavailable)
+	assert.ErrorContains(t, err, "without a database")
+	assert.Nil(t, fc.db)
+
+	walFactory.setHooks(func(h *walHooks) { *h = walHooks{} })
+	assert.NoError(t, fc.Close())
+}
+
 // The leader announces the commit entry of the snapshot on its first chunk: a
 // snapshot that doesn't hold it, or that doesn't open, never replaces the
 // database of the follower.
@@ -4373,6 +4432,49 @@ func writerIsWaiting(fc *followerController) func() bool {
 	}
 }
 
+// newFollowerLeftWithAMarkedInstall returns a fenced follower of the shard 0,
+// with the entries 0 to 4 in its WAL, whose install of a snapshot up to the
+// offset 99 got as far as its marker, and then failed to swap it in, in the
+// install and in its recovery: the follower has no database, and the marker
+// and the checked snapshot stand on disk.
+func newFollowerLeftWithAMarkedInstall(t *testing.T) (*followerController, *hookWalFactory, *hookKVFactory) {
+	t.Helper()
+	if !failpoint.Enabled {
+		t.Skip("needs failpoints: disabled by the disable_trap tag")
+	}
+	failSwap := &atomic.Bool{}
+	options := kvstore.NewFactoryOptionsForTest(t)
+	options.Failpoints = failpoint.New(map[string]func() error{"snapshot.install.swap": func() error {
+		if failSwap.Load() {
+			return errors.New("injected")
+		}
+		return nil
+	}})
+	pebbleFactory, err := kvstore.NewPebbleKVFactory(options)
+	require.NoError(t, err)
+	walFactory := &hookWalFactory{Factory: newTestWalFactory(t)}
+	kvFactory := &hookKVFactory{Factory: pebbleFactory}
+	t.Cleanup(func() {
+		assert.NoError(t, kvFactory.Close())
+		assert.NoError(t, walFactory.Close())
+	})
+	w, err := walFactory.NewWal(constant.DefaultNamespace, 0, nil)
+	require.NoError(t, err)
+	for offset := range int64(5) {
+		require.NoError(t, w.Append(&proto.LogEntry{Term: 1, Offset: offset, Value: []byte("v")}))
+	}
+	require.NoError(t, w.Close())
+
+	fc := newFencedFollower(t, walFactory, kvFactory).(*followerController)
+	failSwap.Store(true)
+	require.Error(t, fc.InstallSnapshot(newSnapshotStream(snapshotChunks(t, 1))))
+	failSwap.Store(false)
+	require.Nil(t, fc.db)
+	_, err = os.Stat(kvFactory.DatabaseDir(constant.DefaultNamespace, 0) + ".install")
+	require.NoError(t, err)
+	return fc, walFactory, kvFactory
+}
+
 // withManifest returns copies of the chunks, the first one with the manifest.
 func withManifest(chunks []*proto.SnapshotChunk, manifest *proto.SnapshotManifest) []*proto.SnapshotChunk {
 	copied := make([]*proto.SnapshotChunk, len(chunks))
@@ -4402,17 +4504,23 @@ func newSnapshotStream(chunks []*proto.SnapshotChunk) *rpc.MockServerSendSnapsho
 	return stream
 }
 
-// hookSnapshotStream fails the reception of the chunks with recvErr, and the
-// response with sendErr, when set.
+// hookSnapshotStream fails the reception of the chunks with recvErr, those
+// after the first with recvAfterFirst, and the response with sendErr, when
+// set.
 type hookSnapshotStream struct {
 	*rpc.MockServerSendSnapshotStream
-	recvErr error
-	sendErr error
+	recvErr        error
+	recvAfterFirst error
+	sendErr        error
+	received       int
 }
 
 func (s *hookSnapshotStream) Recv() (*proto.SnapshotChunk, error) {
 	if s.recvErr != nil {
 		return nil, s.recvErr
+	}
+	if s.received++; s.received > 1 && s.recvAfterFirst != nil {
+		return nil, s.recvAfterFirst
 	}
 	return s.MockServerSendSnapshotStream.Recv()
 }
