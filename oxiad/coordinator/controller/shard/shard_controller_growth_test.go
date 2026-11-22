@@ -16,6 +16,7 @@ package shard
 
 import (
 	"context"
+	"log/slog"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -27,6 +28,7 @@ import (
 	commonobject "github.com/oxia-db/oxia/common/object"
 
 	"github.com/oxia-db/oxia/common/constant"
+	"github.com/oxia-db/oxia/common/failpoint"
 	"github.com/oxia-db/oxia/common/proto"
 	"github.com/oxia-db/oxia/oxiad/common/errs"
 	"github.com/oxia-db/oxia/oxiad/common/feature"
@@ -419,62 +421,58 @@ func TestControllerGrowthDeadlineOfAnotherGrowthDoesNothing(t *testing.T) {
 	}
 }
 
-// A growth that gives up after another coordinator recorded it, with the new
-// member in the ensemble, leaves the member's copy alone; a failure to record
-// a copy to delete is only logged.
-func TestControllerGrowthGivingUpKeepsAMembersCopy(t *testing.T) {
-	for _, test := range []struct {
-		name   string
-		record func(current *proto.ShardMetadata, to *proto.DataServerIdentity)
-		fail   bool
-	}{
-		{name: "recorded by another coordinator", record: func(current *proto.ShardMetadata, to *proto.DataServerIdentity) {
-			current.Term = 3
-			current.Ensemble = append(current.Ensemble, to)
-		}},
-		{name: "failed to record the copy", fail: true, record: func(current *proto.ShardMetadata, _ *proto.DataServerIdentity) {
-			current.Term = 3
-		}},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			s1, to := testDataServer("s1"), testDataServer("to")
-			base := newGrowthTestMetadata(t)
-			var failPatches atomic.Bool
-			metadata := &hookedMetadata{Metadata: base}
-			metadata.patchShardStatus = func(namespace string, shard int64, modify func(*proto.ShardMetadata) (bool, error)) error {
-				if failPatches.Load() {
-					return errors.New("store unavailable")
-				}
-				return base.PatchShardStatus(namespace, shard, modify)
-			}
-			rpc := rpctest.NewRpcProvider()
-			rpc.GetNode(s1).GetStatusResponse(2, proto.ServingStatus_LEADER, 100, 100)
-			storeTestShardMetadata(t, base, constant.DefaultNamespace, growthShard, namespaceConfig, steadyShard(s1, s1))
-			sc := NewController(constant.DefaultNamespace, growthShard, namespaceConfig, steadyShard(s1, s1), metadata,
-				feature.NoOpSupplier, nil, rpc, DefaultPeriodicTasksInterval)
-			t.Cleanup(func() { assert.NoError(t, sc.Close()) })
-			rpc.GetNode(to).NewTermResponse(-1, -1, nil)
-			rpc.GetNode(s1).AddFollowerResponse(nil)
+// A growth records the copy of its new member for deletion before the copy
+// exists, and doesn't start when it can't. One that gives up after another
+// coordinator recorded it, with the new member in the ensemble and out of the
+// pending deletions, leaves the member's copy alone.
+func TestControllerGrowthRecordsTheCopyOfItsNewMemberFirst(t *testing.T) {
+	t.Run("not recorded", func(t *testing.T) {
+		s1, to := testDataServer("s1"), testDataServer("to")
+		base := newGrowthTestMetadata(t)
+		metadata := &hookedMetadata{Metadata: base}
+		metadata.patchShardStatus = func(string, int64, func(*proto.ShardMetadata) (bool, error)) error {
+			return errors.New("store unavailable")
+		}
+		rpc := rpctest.NewRpcProvider()
+		rpc.GetNode(s1).GetStatusResponse(2, proto.ServingStatus_LEADER, 100, 100)
+		storeTestShardMetadata(t, base, constant.DefaultNamespace, growthShard, namespaceConfig, steadyShard(s1, s1))
+		sc := NewController(constant.DefaultNamespace, growthShard, namespaceConfig, steadyShard(s1, s1), metadata,
+			feature.NoOpSupplier, nil, rpc, DefaultPeriodicTasksInterval)
+		t.Cleanup(func() { assert.NoError(t, sc.Close()) })
 
-			ac := action.NewChangeEnsembleAction(growthShard, nil, to)
-			sc.Dispatch(ac)
-			rpc.GetNode(s1).ExpectAddFollowerRequest(t, growthShard, 2)
-			require.NoError(t, base.PatchShardStatus(constant.DefaultNamespace, growthShard,
-				func(current *proto.ShardMetadata) (bool, error) {
-					test.record(current, to)
-					return true, nil
-				}))
-			failPatches.Store(test.fail)
-			// The leader moved on: the catch-up gives up
-			rpc.GetNode(s1).GetStatusResponse(3, proto.ServingStatus_LEADER, 100, 100)
-			rpc.GetNode(s1).RemoveObserverResponse(nil)
+		assert.ErrorContains(t, growShard(t, sc, to), "record the copy of the new member")
+		rpc.GetNode(to).ExpectNoMoreNewTermRequest(t)
+	})
 
-			_, err := ac.Wait(t.Context())
-			assert.ErrorContains(t, err, "changed")
-			failPatches.Store(false)
-			assert.Empty(t, requireShardMetadata(t, base, constant.DefaultNamespace, growthShard).GetPendingDeleteShardNodes())
-		})
-	}
+	t.Run("recorded by another coordinator", func(t *testing.T) {
+		s1, to := testDataServer("s1"), testDataServer("to")
+		metadata := newGrowthTestMetadata(t)
+		rpc := rpctest.NewRpcProvider()
+		rpc.GetNode(s1).GetStatusResponse(2, proto.ServingStatus_LEADER, 100, 100)
+		sc := newGrowthController(t, metadata, rpc, steadyShard(s1, s1))
+		rpc.GetNode(to).NewTermResponse(-1, -1, nil)
+		rpc.GetNode(s1).AddFollowerResponse(nil)
+
+		ac := action.NewChangeEnsembleAction(growthShard, nil, to)
+		sc.Dispatch(ac)
+		rpc.GetNode(s1).ExpectAddFollowerRequest(t, growthShard, 2)
+		stored := requireShardMetadata(t, metadata, constant.DefaultNamespace, growthShard)
+		assertShardEnsemble(t, stored.GetPendingDeleteShardNodes(), to)
+		require.NoError(t, metadata.PatchShardStatus(constant.DefaultNamespace, growthShard,
+			func(current *proto.ShardMetadata) (bool, error) {
+				current.Term = 3
+				current.Ensemble = append(current.Ensemble, to)
+				current.PendingDeleteShardNodes = nil
+				return true, nil
+			}))
+		// The leader moved on: the catch-up gives up
+		rpc.GetNode(s1).GetStatusResponse(3, proto.ServingStatus_LEADER, 100, 100)
+		rpc.GetNode(s1).RemoveObserverResponse(nil)
+
+		_, err := ac.Wait(t.Context())
+		assert.ErrorContains(t, err, "changed")
+		assert.Empty(t, requireShardMetadata(t, metadata, constant.DefaultNamespace, growthShard).GetPendingDeleteShardNodes())
+	})
 }
 
 // A growth whose namespace options can't be read fails at once.
@@ -547,4 +545,193 @@ func TestControllerGrowthDeadlineIsArmedOnce(t *testing.T) {
 	sc.BecameUnavailable(other)
 	rpc.GetNode(s1).ExpectNoMoreNewTermRequest(t)
 	require.NotNil(t, requireShardMetadata(t, base, constant.DefaultNamespace, growthShard).GetEnsembleChange())
+}
+
+// catchUpThen has the new member to of a growth catch up at once, and runs
+// meanwhile, once it caught up, before the growth goes on.
+func catchUpThen(t *testing.T, rpc *rpctest.RpcProvider, s1 *proto.DataServerIdentity, to *proto.DataServerIdentity,
+	meanwhile func() error) {
+	t.Helper()
+	rpc.GetNode(to).NewTermResponse(-1, -1, nil)
+	rpc.GetNode(s1).AddFollowerResponse(nil)
+	rpc.GetNode(s1).GetStatusResponse(2, proto.ServingStatus_LEADER, 100, 100)
+	rpc.GetNode(to).GetStatusResponse(2, proto.ServingStatus_FOLLOWER, 100, 100)
+	failpoint.Enable("growth.afterCatchUp", func(context.Context) error { return meanwhile() })
+	t.Cleanup(func() { failpoint.Disable("growth.afterCatchUp") })
+}
+
+// A growth whose new member was removed while it caught up, or whose shard
+// split meanwhile, gives up instead of recording the new member: the
+// observer is removed, and its copy is left to the pending deletions.
+func TestControllerGrowthGivesUpWhenItsTargetLeftOrTheShardSplitMeanwhile(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		meanwhile func(metadata coordmetadata.Metadata, to *proto.DataServerIdentity) error
+		want      error
+		reason    string
+	}{
+		{name: "new member drained", want: errs.ErrFailedPrecondition, reason: "DRAINED", meanwhile: func(metadata coordmetadata.Metadata, to *proto.DataServerIdentity) error {
+			return metadata.PatchDataServerStatus(to.GetNameOrDefault(), func(status *proto.DataServerStatus) (bool, error) {
+				status.State = proto.DataServerState_DATA_SERVER_STATE_DRAINED
+				return true, nil
+			})
+		}},
+		{name: "new member draining", want: errs.ErrFailedPrecondition, reason: "DRAINING", meanwhile: func(metadata coordmetadata.Metadata, to *proto.DataServerIdentity) error {
+			return metadata.PatchDataServerStatus(to.GetNameOrDefault(), func(status *proto.DataServerStatus) (bool, error) {
+				status.State = proto.DataServerState_DATA_SERVER_STATE_DRAINING
+				return true, nil
+			})
+		}},
+		{name: "shard split", want: errs.ErrUnavailable, reason: "split", meanwhile: func(metadata coordmetadata.Metadata, _ *proto.DataServerIdentity) error {
+			return metadata.PatchShardStatus(constant.DefaultNamespace, growthShard, func(current *proto.ShardMetadata) (bool, error) {
+				current.Split = &proto.SplitMetadata{ChildShardIds: []int64{6, 7}}
+				return true, nil
+			})
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s1, to := testDataServer("s1"), testDataServer("to")
+			metadata := newGrowthTestMetadata(t)
+			rpc := rpctest.NewRpcProvider()
+			rpc.GetNode(s1).GetStatusResponse(2, proto.ServingStatus_LEADER, 100, 100)
+			sc := newGrowthController(t, metadata, rpc, steadyShard(s1, s1))
+			catchUpThen(t, rpc, s1, to, func() error { return test.meanwhile(metadata, to) })
+			rpc.GetNode(s1).RemoveObserverResponse(nil)
+
+			err := growShard(t, sc, to)
+
+			assert.ErrorIs(t, err, test.want)
+			assert.ErrorContains(t, err, test.reason)
+			removed := rpc.GetNode(s1).ExpectRemoveObserverRequest(t, growthShard, 2)
+			assert.Equal(t, to.GetInternal(), removed.GetFollowerName())
+			rpc.GetNode(s1).ExpectNoMoreNewTermRequest(t)
+			stored := requireShardMetadata(t, metadata, constant.DefaultNamespace, growthShard)
+			assertShardEnsemble(t, stored.GetEnsemble(), s1)
+			assertShardEnsemble(t, stored.GetPendingDeleteShardNodes(), to)
+		})
+	}
+}
+
+// The copy of the new member of a growth that catches up is kept, though it
+// is among the pending deletions; a coordinator that stops while it catches
+// up leaves it there, and the next deletes it.
+func TestControllerGrowthCopyIsDeletedAfterACoordinatorStoppedDuringTheCatchUp(t *testing.T) {
+	s1, to := testDataServer("s1"), testDataServer("to")
+	metadata := newGrowthTestMetadata(t)
+	rpc := rpctest.NewRpcProvider()
+	rpc.GetNode(s1).GetStatusResponse(2, proto.ServingStatus_LEADER, 100, 100)
+	storeTestShardMetadata(t, metadata, constant.DefaultNamespace, growthShard, namespaceConfig, steadyShard(s1, s1))
+	sc := NewController(constant.DefaultNamespace, growthShard, namespaceConfig, steadyShard(s1, s1), metadata,
+		feature.NoOpSupplier, nil, rpc, 20*time.Millisecond)
+	rpc.GetNode(s1).ExpectGetStatusRequest(t, growthShard)
+	// The catch-up stops, as its coordinator does
+	reached := make(chan struct{})
+	rpc.GetNode(to).NewTermResponse(-1, -1, nil)
+	rpc.GetNode(s1).AddFollowerResponse(nil)
+	rpc.GetNode(s1).GetStatusResponse(2, proto.ServingStatus_LEADER, 100, 100)
+	rpc.GetNode(to).GetStatusResponse(2, proto.ServingStatus_FOLLOWER, 100, 100)
+	failpoint.Enable("growth.afterCatchUp", func(ctx context.Context) error {
+		close(reached)
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	t.Cleanup(func() { failpoint.Disable("growth.afterCatchUp") })
+	sc.Dispatch(action.NewChangeEnsembleAction(growthShard, nil, to))
+	<-reached
+
+	// The periodic tasks keep the copy while it catches up
+	rpc.GetNode(to).ExpectNoMoreDeleteShardRequest(t)
+	require.NoError(t, sc.Close())
+	assertShardEnsemble(t, requireShardMetadata(t, metadata, constant.DefaultNamespace, growthShard).GetPendingDeleteShardNodes(), to)
+
+	// The next coordinator deletes it
+	rpc.GetNode(s1).GetStatusResponse(2, proto.ServingStatus_LEADER, 100, 100)
+	rpc.GetNode(to).DeleteShardResponse(nil)
+	next := NewController(constant.DefaultNamespace, growthShard, namespaceConfig, steadyShard(s1, s1), metadata,
+		feature.NoOpSupplier, nil, rpc, 20*time.Millisecond)
+	t.Cleanup(func() { assert.NoError(t, next.Close()) })
+	rpc.GetNode(to).ExpectDeleteShardRequest(t, growthShard, 2)
+	require.Eventually(t, func() bool {
+		return len(requireShardMetadata(t, metadata, constant.DefaultNamespace, growthShard).GetPendingDeleteShardNodes()) == 0
+	}, 10*time.Second, 10*time.Millisecond)
+}
+
+// A growth onto a data server whose catch-up missed its deadline backs off:
+// the next growth onto it is refused until the wait passed, and the wait
+// doubles at each failure in a row, up to its bound.
+func TestControllerGrowthBacksOffAfterACatchUpPastItsDeadline(t *testing.T) {
+	s1, to := testDataServer("s1"), testDataServer("to")
+	metadata := newGrowthTestMetadata(t)
+	rpc := rpctest.NewRpcProvider()
+	rpc.GetNode(s1).GetStatusResponse(2, proto.ServingStatus_LEADER, 100, 100)
+	sc := newGrowthController(t, metadata, rpc, steadyShard(s1, s1),
+		WithGrowthTimeouts(50*time.Millisecond, 0), WithGrowthBackoff(300*time.Millisecond, 400*time.Millisecond))
+	fail := func() {
+		t.Helper()
+		rpc.GetNode(to).NewTermResponse(-1, -1, nil)
+		rpc.GetNode(s1).AddFollowerResponse(nil)
+		for range 5 {
+			rpc.GetNode(s1).GetStatusResponse(2, proto.ServingStatus_LEADER, 5000, 5000)
+			rpc.GetNode(to).GetStatusResponse(2, proto.ServingStatus_FOLLOWER, 0, 0)
+		}
+		rpc.GetNode(s1).RemoveObserverResponse(nil)
+		assert.ErrorIs(t, growShard(t, sc, to), errCatchUpTimedOut)
+		rpc.GetNode(s1).ExpectRemoveObserverRequest(t, growthShard, 2)
+		// The copy waits for its deletion: out of the way of the next growth
+		require.NoError(t, metadata.PatchShardStatus(constant.DefaultNamespace, growthShard,
+			func(current *proto.ShardMetadata) (bool, error) {
+				current.PendingDeleteShardNodes = nil
+				return true, nil
+			}))
+	}
+
+	fail()
+	start := time.Now()
+	err := growShard(t, sc, to)
+	assert.ErrorIs(t, err, errs.ErrFailedPrecondition)
+	assert.ErrorContains(t, err, "backs off")
+	require.Eventually(t, func() bool {
+		_, backingOff := sc.(*controller).growthBackingOff(to)
+		return !backingOff
+	}, 10*time.Second, 10*time.Millisecond)
+	assert.GreaterOrEqual(t, time.Since(start), 250*time.Millisecond)
+
+	fail()
+	until, backingOff := sc.(*controller).growthBackingOff(to)
+	assert.True(t, backingOff)
+	assert.InDelta(t, 400*time.Millisecond, time.Until(until), float64(150*time.Millisecond), "doubled, up to the bound")
+}
+
+// A growth undone backs off its new member, and a growth finished clears the
+// failures of its new member.
+func TestControllerGrowthSettledAccountsForItsNewMember(t *testing.T) {
+	s1, to := testDataServer("s1"), testDataServer("to")
+	s := &controller{logger: slog.Default(), growthBackoffs: make(map[string]growthBackoff),
+		growthBackoff: time.Minute, growthBackoffCap: time.Hour}
+
+	s.settleGrowthBackoff(steadyShard(s1, s1))
+	assert.Empty(t, s.growthBackoffs, "no growth was pending")
+
+	s.pendingGrowthTo = to
+	s.settleGrowthBackoff(steadyShard(s1, s1))
+	_, backingOff := s.growthBackingOff(to)
+	assert.True(t, backingOff, "undone")
+	assert.Nil(t, s.pendingGrowthTo)
+
+	s.pendingGrowthTo = to
+	s.settleGrowthBackoff(steadyShard(s1, s1, to))
+	assert.Empty(t, s.growthBackoffs, "finished")
+}
+
+// The copy of a member is never recorded for deletion, whatever the growth
+// that asks.
+func TestControllerGrowthNeverRecordsAMembersCopyToDelete(t *testing.T) {
+	s1, to := testDataServer("s1"), testDataServer("to")
+	metadata := newGrowthTestMetadata(t)
+	storeTestShardMetadata(t, metadata, constant.DefaultNamespace, growthShard, namespaceConfig, steadyShard(s1, s1, to))
+	s := &controller{namespace: constant.DefaultNamespace, shard: growthShard, metadataStore: metadata}
+
+	require.NoError(t, s.addPendingDelete(to))
+
+	assert.Empty(t, requireShardMetadata(t, metadata, constant.DefaultNamespace, growthShard).GetPendingDeleteShardNodes())
 }

@@ -182,12 +182,14 @@ func (c *restartableCluster) status() *proto.ShardMetadata {
 
 // grownShard waits for the shard to be steady with its three members caught
 // up, and nothing left pending: no change of the ensemble, and no copy to
-// delete.
+// delete. A growth abandoned leaves the copy of its new member to the
+// periodic deletion of the coordinator, every minute or so, before the shard
+// grows onto it again.
 func (c *restartableCluster) grownShard() *proto.ShardMetadata {
-	return c.awaitShard(0, func(shard *proto.ShardMetadata) bool {
+	return c.awaitShardWithin(0, func(shard *proto.ShardMetadata) bool {
 		return len(shard.GetEnsemble()) == 3 && shard.GetEnsembleChange() == nil &&
 			len(shard.GetPendingDeleteShardNodes()) == 0 && shard.GetEnsembleCaughtUp()
-	})
+	}, 3*time.Minute)
 }
 
 // writeKeys writes count keys named after prefix, and returns them once

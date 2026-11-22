@@ -293,6 +293,11 @@ func (c *restartableCluster) caughtUpShard(minTerm int64) *proto.ShardMetadata {
 }
 
 func (c *restartableCluster) awaitShard(minTerm int64, ready func(*proto.ShardMetadata) bool) *proto.ShardMetadata {
+	return c.awaitShardWithin(minTerm, ready, time.Minute)
+}
+
+func (c *restartableCluster) awaitShardWithin(minTerm int64, ready func(*proto.ShardMetadata) bool,
+	timeout time.Duration) *proto.ShardMetadata {
 	admin, err := oxia.NewAdminClient(c.adminAddr, nil, nil)
 	require.NoError(c.t, err)
 	defer admin.Close()
@@ -307,7 +312,7 @@ func (c *restartableCluster) awaitShard(minTerm int64, ready func(*proto.ShardMe
 		assert.NotNil(t, shard.GetLeader())
 		assert.GreaterOrEqual(t, shard.GetTerm(), minTerm)
 		assert.True(t, ready(shard))
-	}, time.Minute, 50*time.Millisecond)
+	}, timeout, 50*time.Millisecond)
 	return shard
 }
 

@@ -102,17 +102,23 @@ type controller struct {
 	currentElection election.Election
 
 	// The growth of the ensemble, see shard_controller_growth.go. The event
-	// loop owns the fields: growing is set while the new member of a growth
+	// loop owns the fields: catchingUp is the new member of a growth while it
 	// catches up, which reports on growthCatchUpOp; growthDeadline is armed
-	// while a growth is pending, and reports on growthDeadlineOp; once it
-	// passed, growthOverdue has the elections undo the growth.
-	growing              bool
+	// while the growth onto pendingGrowthTo is pending, and reports on
+	// growthDeadlineOp; once it passed, growthOverdue has the elections undo
+	// the growth. growthBackoffs holds, by data server, the growths onto it
+	// that failed in a row.
+	catchingUp           *proto.DataServerIdentity
+	pendingGrowthTo      *proto.DataServerIdentity
 	growthOverdue        bool
 	growthDeadline       *time.Timer
 	growthCatchUpOp      chan growthCatchUp
 	growthDeadlineOp     chan *proto.DataServerIdentity
+	growthBackoffs       map[string]growthBackoff
 	growthCatchUpTimeout time.Duration
 	growthFinishTimeout  time.Duration
+	growthBackoff        time.Duration
+	growthBackoffCap     time.Duration
 
 	leaderElectionLatencyHistogram metric.LatencyHistogram
 	newTermQuorumLatencyHistogram  metric.LatencyHistogram
@@ -181,8 +187,11 @@ func NewController(
 		electionMailbox:       make(chan async.Mail, 1),
 		growthCatchUpOp:       make(chan growthCatchUp, 1),
 		growthDeadlineOp:      make(chan *proto.DataServerIdentity, 1),
+		growthBackoffs:        make(map[string]growthBackoff),
 		growthCatchUpTimeout:  DefaultGrowthCatchUpTimeout,
 		growthFinishTimeout:   DefaultGrowthFinishTimeout,
+		growthBackoff:         DefaultGrowthBackoff,
+		growthBackoffCap:      DefaultGrowthBackoffCap,
 
 		periodicTasksInterval: oxiatime.Jitter(periodTasksInterval, periodTasksInterval/4),
 		logger: slog.With(
@@ -874,7 +883,7 @@ func (s *controller) Close() error {
 }
 
 func (s *controller) onChangeEnsemble(changeEnsembleAction *action.ChangeEnsembleAction) {
-	if s.growing {
+	if s.catchingUp != nil {
 		changeEnsembleAction.Error(errors.Wrap(errs.ErrUnavailable,
 			"shard is not ready for change ensemble: the new member of a growth is catching up"))
 		return
@@ -905,18 +914,11 @@ func (s *controller) onChangeEnsemble(changeEnsembleAction *action.ChangeEnsembl
 			errs.ErrFailedPrecondition, change.GetFrom().GetNameOrDefault(), change.GetTo().GetNameOrDefault()))
 		return
 	}
-	// A data server that left takes no shard: its drain could complete
-	// meanwhile, e.g. for a change planned before it was removed
-	to := changeEnsembleAction.To.GetNameOrDefault()
-	stored, _, err := s.metadataStore.GetDataServerStatus(to)
-	if err != nil {
+	if err := s.refuseRemovedTarget(changeEnsembleAction.To); err != nil {
 		changeEnsembleAction.Error(err)
 		return
 	}
-	if state := stored.UnsafeBorrow().GetState(); dataserver.IsRemoved(state) {
-		changeEnsembleAction.Error(fmt.Errorf("%w: data server %q is %s", errs.ErrFailedPrecondition, to, state))
-		return
-	}
+	to := changeEnsembleAction.To.GetNameOrDefault()
 	// The copy of a data server pending deletion is deleted at the term of
 	// its removal: a change that adds it back before then could see its new
 	// copy deleted by a coordinator that read the status earlier
@@ -934,6 +936,22 @@ func (s *controller) onChangeEnsemble(changeEnsembleAction *action.ChangeEnsembl
 		return
 	}
 	s.runChange(shardMeta, changeEnsembleAction)
+}
+
+// refuseRemovedTarget fails a change onto a data server that left: it takes no
+// shard, as its drain could complete meanwhile, e.g. for a change planned
+// before it was removed, or a growth whose new member was removed while it
+// caught up.
+func (s *controller) refuseRemovedTarget(to *proto.DataServerIdentity) error {
+	name := to.GetNameOrDefault()
+	stored, _, err := s.metadataStore.GetDataServerStatus(name)
+	if err != nil {
+		return err
+	}
+	if state := stored.UnsafeBorrow().GetState(); dataserver.IsRemoved(state) {
+		return fmt.Errorf("%w: data server %q is %s", errs.ErrFailedPrecondition, name, state)
+	}
+	return nil
 }
 
 // runChange runs the election that changes the ensemble, and completes the
@@ -1045,6 +1063,11 @@ func (s *controller) handlePendingDeleteShard(shardMeta *proto.ShardMetadata) er
 	deleted := make(map[string]bool, len(shardMeta.PendingDeleteShardNodes))
 	var err error
 	for _, ds := range shardMeta.PendingDeleteShardNodes {
+		// The copy of the new member of a growth that catches up is deleted
+		// once the growth gives up, unless the growth records it
+		if s.catchingUp != nil && dataserver.MatchDataServer(s.catchingUp)(ds) {
+			continue
+		}
 		s.logger.Info("Deleting shard from removed data server", slog.Any("data-server", ds))
 
 		if _, deleteErr := s.rpc.DeleteShard(s.ctx, ds, &proto.DeleteShardRequest{

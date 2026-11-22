@@ -39,18 +39,27 @@ import (
 //
 // A growth runs in three steps:
 //
-//  1. Catch-up: the new member is fenced at the current term, and follows the
-//     leader as an observer, which counts for nothing, until its head is
-//     within GrowthCatchUpLag entries of the commit offset of the leader. The
-//     controller's event loop keeps running meanwhile.
+//  1. Catch-up: the copy of the new member is recorded among the pending
+//     deletions, so that a growth abandoned, also by a coordinator that stops,
+//     leaves no copy behind. The new member is fenced at the current term,
+//     and follows the leader as an observer, which counts for nothing, until
+//     its head is within GrowthCatchUpLag entries of the commit offset of the
+//     leader. The controller's event loop keeps running meanwhile, and keeps
+//     the copy. The growth gives up if the new member was removed, or the
+//     shard split, meanwhile.
 //  2. Election: the growth is recorded with the new term, the new member
-//     included, and the election fences the ensemble before and after the
-//     growth (see the election package).
+//     included and out of the pending deletions, and the election fences the
+//     ensemble before and after the growth (see the election package).
 //  3. Finish: the growth stays pending until the election finishes it, or
 //     the leader's tick once a majority of the ensemble caught up. A growth
 //     still pending after GrowthFinishTimeout, or whose new member fails, is
 //     settled by an election, which undoes it if the new member isn't among
 //     the highest heads.
+//
+// A growth onto a data server that failed, its catch-up past its deadline or
+// the growth undone, backs off before the next growth onto it: by
+// DefaultGrowthBackoff, doubled at each failure in a row up to
+// DefaultGrowthBackoffCap. A growth finished onto it clears its failures.
 
 const (
 	// GrowthCatchUpLag is how many entries the new member of a growth can be
@@ -67,10 +76,20 @@ const (
 	// DefaultGrowthFinishTimeout is how long a growth can stay pending before
 	// an election settles it.
 	DefaultGrowthFinishTimeout = 2 * time.Minute
+	// DefaultGrowthBackoff is how long the growth onto a data server waits
+	// after one failed.
+	DefaultGrowthBackoff = time.Minute
+	// DefaultGrowthBackoffCap bounds the wait of the growth onto a data server
+	// whose growths failed in a row.
+	DefaultGrowthBackoffCap = 30 * time.Minute
 	// growthCatchUpPollInterval is how often the catch-up compares the new
 	// member with the leader.
 	growthCatchUpPollInterval = 200 * time.Millisecond
 )
+
+// errCatchUpTimedOut ends the catch-up of a new member that didn't get within
+// GrowthCatchUpLag entries of the leader before its deadline.
+var errCatchUpTimedOut = errors.Wrap(errs.ErrUnavailable, "the new member didn't catch up in time")
 
 // Option configures a shard controller.
 type Option func(*controller)
@@ -89,13 +108,36 @@ func WithGrowthTimeouts(catchUp time.Duration, finish time.Duration) Option {
 	}
 }
 
+// WithGrowthBackoff sets how long the growth onto a data server waits after
+// one failed, and the bound of the wait after failures in a row; zero keeps
+// the default.
+func WithGrowthBackoff(backoff time.Duration, backoffCap time.Duration) Option {
+	return func(s *controller) {
+		if backoff > 0 {
+			s.growthBackoff = backoff
+		}
+		if backoffCap > 0 {
+			s.growthBackoffCap = backoffCap
+		}
+	}
+}
+
 // growthCatchUp is the outcome of the catch-up of the new member of a growth,
 // for the event loop.
 type growthCatchUp struct {
 	action *action.ChangeEnsembleAction
-	// term is the term of the shard that the catch-up followed
-	term int64
-	err  error
+	// leader and term are the leader and the term of the shard that the
+	// catch-up followed
+	leader *proto.DataServerIdentity
+	term   int64
+	err    error
+}
+
+// growthBackoff is the failures in a row of the growths onto a data server,
+// and until when the next one waits.
+type growthBackoff struct {
+	failures int
+	until    time.Time
 }
 
 // isGrowth reports whether the pending change of the shard is a growth.
@@ -112,13 +154,22 @@ func (s *controller) startGrowth(shardMeta *proto.ShardMetadata, ac *action.Chan
 		ac.Error(errors.Wrap(errs.ErrUnavailable, "the shard has no leader to grow its ensemble from"))
 		return
 	}
+	if until, backingOff := s.growthBackingOff(ac.To); backingOff {
+		ac.Error(fmt.Errorf("%w: the growth onto data server %q backs off until %s", errs.ErrFailedPrecondition,
+			ac.To.GetNameOrDefault(), until.Format(time.RFC3339)))
+		return
+	}
 	termOptions, err := s.metadataStore.GetNamespaceTermOptions(s.namespace)
 	if err != nil {
 		ac.Error(err)
 		return
 	}
+	if err := s.addPendingDelete(ac.To); err != nil {
+		ac.Error(errors.Wrap(err, "record the copy of the new member to delete"))
+		return
+	}
 	leader, term := shardMeta.Leader, shardMeta.Term
-	s.growing = true
+	s.catchingUp = ac.To
 	s.logger.Info("Catching up the new member of the ensemble", slog.Any("to", ac.To), slog.Int64("term", term))
 	s.wg.Go(func() {
 		process.DoWithLabels(s.ctx, map[string]string{
@@ -131,7 +182,7 @@ func (s *controller) startGrowth(shardMeta *proto.ShardMetadata, ac *action.Chan
 			err := s.catchUpGrowth(ctx, leader, term, termOptions, ac.To)
 			// The event loop is the only reader, and handles one catch-up at
 			// a time: the slot is always free
-			channel.PushNoBlock(s.growthCatchUpOp, growthCatchUp{action: ac, term: term, err: err})
+			channel.PushNoBlock(s.growthCatchUpOp, growthCatchUp{action: ac, leader: leader, term: term, err: err})
 		})
 	})
 }
@@ -164,23 +215,8 @@ func (s *controller) catchUpGrowth(ctx context.Context, leader *proto.DataServer
 		return errors.Wrap(err, "add the new member as an observer")
 	}
 	defer func() { //nolint:contextcheck // the removal runs past the deadline of the catch-up context
-		if err == nil {
-			return
-		}
-		// Best effort: the next term of the leader drops it anyway. The
-		// catch-up context may have expired, at the deadline: the removal
-		// runs with the controller's
-		removeCtx, cancel := context.WithTimeout(s.ctx, time.Second)
-		defer cancel()
-		if _, removeErr := s.rpc.RemoveObserver(removeCtx, leader, &proto.RemoveObserverRequest{
-			Namespace:    s.namespace,
-			Shard:        s.shard,
-			Term:         term,
-			FollowerName: to.GetInternal(),
-			TargetShard:  s.shard,
-		}); removeErr != nil {
-			s.logger.Warn("Failed to remove the observer of a growth that gave up", slog.Any("to", to),
-				slog.Any("error", removeErr))
+		if err != nil {
+			s.removeGrowthObserver(leader, term, to)
 		}
 	}()
 	ticker := time.NewTicker(growthCatchUpPollInterval)
@@ -196,7 +232,7 @@ func (s *controller) catchUpGrowth(ctx context.Context, leader *proto.DataServer
 		select {
 		case <-ticker.C:
 		case <-ctx.Done():
-			return errors.Wrap(errs.ErrUnavailable, "the new member didn't catch up in time")
+			return errCatchUpTimedOut
 		}
 	}
 }
@@ -221,11 +257,13 @@ func (s *controller) growthCaughtUp(ctx context.Context, leader *proto.DataServe
 }
 
 // onGrowthCaughtUp runs the election that records the growth, once its new
-// member caught up, unless the shard was elected since: the observer then
-// followed a leader that is gone. A growth that doesn't run leaves the copy of
-// its new member to the pending deletions.
+// member caught up, unless the shard was elected since, as the observer then
+// followed a leader that is gone, the new member was removed, or the shard
+// split, meanwhile. A growth that doesn't run leaves the copy of its new
+// member to the pending deletions, and one whose catch-up missed its deadline
+// backs off.
 func (s *controller) onGrowthCaughtUp(result growthCatchUp) {
-	s.growing = false
+	s.catchingUp = nil
 	ac := result.action
 	err := result.err
 	var shardMeta *proto.ShardMetadata
@@ -235,29 +273,98 @@ func (s *controller) onGrowthCaughtUp(result growthCatchUp) {
 	if err == nil && (shardMeta.Term != result.term || shardMeta.GetEnsembleChange() != nil) {
 		err = errors.Wrapf(errs.ErrUnavailable, "the shard moved past term %d while its new member caught up", result.term)
 	}
+	if err == nil {
+		err = s.refuseRemovedTarget(ac.To)
+	}
+	if err == nil {
+		err = s.validateChangeEnsembleFeatures(shardMeta, ac)
+	}
 	if err != nil {
-		s.logger.Warn("The growth of the ensemble gave up", slog.Any("to", ac.To), slog.Any("error", err))
-		s.addPendingDelete(ac.To)
+		s.logger.Warn("The growth of the ensemble gave up, its new member's copy is to delete", slog.Any("to", ac.To),
+			slog.Any("error", err))
+		if result.err == nil {
+			// The catch-up left the leader streaming to the observer
+			s.wg.Go(func() { s.removeGrowthObserver(result.leader, result.term, ac.To) })
+		}
+		if errors.Is(result.err, errCatchUpTimedOut) {
+			s.backOffGrowth(ac.To)
+		}
 		ac.Error(err)
 		return
 	}
 	s.runChange(shardMeta, ac)
 }
 
+// removeGrowthObserver removes the observer of a growth that gave up from the
+// leader it followed, best effort: the next term of the leader drops it
+// anyway. It runs with the controller's context, which outlives the deadline
+// of the catch-up.
+func (s *controller) removeGrowthObserver(leader *proto.DataServerIdentity, term int64, to *proto.DataServerIdentity) {
+	ctx, cancel := context.WithTimeout(s.ctx, time.Second)
+	defer cancel()
+	if _, err := s.rpc.RemoveObserver(ctx, leader, &proto.RemoveObserverRequest{
+		Namespace:    s.namespace,
+		Shard:        s.shard,
+		Term:         term,
+		FollowerName: to.GetInternal(),
+		TargetShard:  s.shard,
+	}); err != nil {
+		s.logger.Warn("Failed to remove the observer of a growth that gave up", slog.Any("to", to),
+			slog.Any("error", err))
+	}
+}
+
 // addPendingDelete adds the data server to the pending deletions of the shard,
 // unless it is a member: it holds a copy that no member reads.
-func (s *controller) addPendingDelete(server *proto.DataServerIdentity) {
-	if err := s.metadataStore.PatchShardStatus(s.namespace, s.shard, func(current *proto.ShardMetadata) (bool, error) {
+func (s *controller) addPendingDelete(server *proto.DataServerIdentity) error {
+	return s.metadataStore.PatchShardStatus(s.namespace, s.shard, func(current *proto.ShardMetadata) (bool, error) {
 		if slices.ContainsFunc(current.Ensemble, dataserver.MatchDataServer(server)) {
 			return false, nil
 		}
 		pending := len(current.PendingDeleteShardNodes)
 		current.PendingDeleteShardNodes = dataserver.AddDataServer(current.PendingDeleteShardNodes, server)
 		return len(current.PendingDeleteShardNodes) > pending, nil
-	}); err != nil {
-		s.logger.Warn("Failed to record the copy of a data server to delete", slog.Any("data-server", server),
-			slog.Any("error", err))
+	})
+}
+
+// growthBackingOff reports until when the next growth onto the data server
+// waits, and whether it still does.
+func (s *controller) growthBackingOff(to *proto.DataServerIdentity) (time.Time, bool) {
+	backoff, found := s.growthBackoffs[to.GetNameOrDefault()]
+	return backoff.until, found && time.Now().Before(backoff.until)
+}
+
+// backOffGrowth records a failed growth onto the data server: the next one
+// waits growthBackoff, doubled at each failure in a row, up to
+// growthBackoffCap.
+func (s *controller) backOffGrowth(to *proto.DataServerIdentity) {
+	name := to.GetNameOrDefault()
+	backoff := s.growthBackoffs[name]
+	backoff.failures++
+	wait := min(s.growthBackoff, s.growthBackoffCap)
+	for range backoff.failures - 1 {
+		wait = min(wait*2, s.growthBackoffCap)
 	}
+	backoff.until = time.Now().Add(wait)
+	s.growthBackoffs[name] = backoff
+	s.logger.Info("The growth onto a data server backs off", slog.Any("to", to),
+		slog.Int("failures", backoff.failures), slog.Duration("wait", wait))
+}
+
+// settleGrowthBackoff accounts for the growth onto pendingGrowthTo once it is
+// settled: finished, it clears the failures of its new member, and undone, it
+// backs it off.
+func (s *controller) settleGrowthBackoff(shardMeta *proto.ShardMetadata) {
+	to := s.pendingGrowthTo
+	if to == nil {
+		return
+	}
+	s.pendingGrowthTo = nil
+	if slices.ContainsFunc(shardMeta.Ensemble, dataserver.MatchDataServer(to)) {
+		delete(s.growthBackoffs, to.GetNameOrDefault())
+		return
+	}
+	s.backOffGrowth(to)
 }
 
 // syncGrowthDeadline arms the deadline of a pending growth, unless it is armed
@@ -270,10 +377,12 @@ func (s *controller) syncGrowthDeadline() {
 		return
 	}
 	if !isGrowth(shardMeta) {
+		s.settleGrowthBackoff(shardMeta)
 		s.stopGrowthDeadline()
 		s.growthOverdue = false
 		return
 	}
+	s.pendingGrowthTo = shardMeta.EnsembleChange.To
 	if s.growthDeadline != nil || s.growthOverdue {
 		return
 	}

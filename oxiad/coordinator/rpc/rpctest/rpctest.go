@@ -268,6 +268,17 @@ func (m *PerNodeChannels) ExpectNoMoreNewTermRequest(t *testing.T) {
 	}
 }
 
+func (m *PerNodeChannels) ExpectNoMoreDeleteShardRequest(t *testing.T) {
+	t.Helper()
+
+	select {
+	case <-m.deleteShardRequests:
+		assert.Fail(t, "should not have received any delete shard request")
+	case <-time.After(defaultNegativeTimeout):
+		// expected
+	}
+}
+
 func (m *PerNodeChannels) ExpectDeleteShardRequest(t *testing.T, shard int64, term int64) {
 	t.Helper()
 
