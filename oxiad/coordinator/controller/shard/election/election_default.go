@@ -15,6 +15,7 @@
 package election
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"log/slog"
@@ -308,14 +309,17 @@ func (e *election) chooseLeader(ensembleHeads sharding.Candidates, retainedHeads
 	var highest *proto.EntryId
 	for i, candidates := range []sharding.Candidates{ensembleHeads, retainedHeads} {
 		for server, candidate := range candidates {
-			if highest == nil || entry.Compare(candidate.HeadEntryId, highest) > 0 {
+			if highest == nil || compareHeads(candidate.HeadEntryId, highest) > 0 {
 				highest, mostUpToDate = candidate.HeadEntryId, []*proto.DataServerIdentity{server}
-			} else if i == 0 && entry.Compare(candidate.HeadEntryId, highest) == 0 {
+			} else if i == 0 && compareHeads(candidate.HeadEntryId, highest) == 0 {
 				// Visited first, the ensemble wins a tie
 				mostUpToDate = append(mostUpToDate, server)
 			}
 		}
 	}
+	slices.SortStableFunc(mostUpToDate, func(a, b *proto.DataServerIdentity) int {
+		return cmp.Compare(rankTie(ensembleHeads[a]), rankTie(ensembleHeads[b]))
+	})
 	if _, retained := retainedHeads[mostUpToDate[0]]; retained {
 		e.undoEnsembleChange(mostUpToDate[0], ensembleHeads, retainedHeads)
 	} else if change := e.meta.EnsembleChange; change != nil &&
@@ -805,6 +809,66 @@ func (e *election) fence(termOptions *proto.NewTermOptions, negotiatedFeatures [
 	return ensembleHeads, retainedHeads, nil
 }
 
+// unknownTerm is the term of the head that a data server reports when its WAL
+// holds no entry: the commit offset of its database, e.g. once it installed a
+// snapshot, whose entry's term it doesn't know.
+const unknownTerm = -1
+
+// isSnapshotHead reports whether head is the commit offset of a database
+// with an empty WAL, rather than the last entry of a WAL.
+func isSnapshotHead(head *proto.EntryId) bool {
+	return head.GetTerm() == unknownTerm && head.GetOffset() >= 0
+}
+
+// compareHeads ranks the heads of two fenced data servers by how up to date
+// they are.
+//
+// Two heads of WAL entries rank by term, then by offset, as entry.Compare
+// does: an entry of a higher term overrides one of a lower term at the same
+// offset, so the higher term holds every entry the other could have committed.
+//
+// A data server whose WAL is empty, e.g. one seeded by a snapshot with
+// nothing appended since, reports the commit offset of its database with an
+// unknown term. Its database applies only committed entries, and a committed
+// entry is never overwritten, so its head holds exactly the committed entries
+// up to its offset, whatever their terms. Against the head of a WAL entry it
+// therefore ranks by offset alone: a head at a higher offset may hold
+// committed entries beyond it, so it is ahead; one at a lower offset lacks a
+// committed entry the snapshot holds, so it is behind; and at the same offset
+// both hold every committed entry, so they tie. Ranked term first instead,
+// the snapshot's head would always lose: an idle shard couldn't elect a
+// member seeded by a snapshot over its old leader, and so never remove that
+// leader.
+func compareHeads(a *proto.EntryId, b *proto.EntryId) int {
+	if isSnapshotHead(a) != isSnapshotHead(b) {
+		return cmp.Compare(a.GetOffset(), b.GetOffset())
+	}
+	return entry.Compare(a, b)
+}
+
+// rankTie orders the candidates tied at the highest head, the first to lead.
+// A head of a snapshot ties with the head of a WAL entry at the same offset
+// (see compareHeads), but they aren't as good a leader:
+//   - a WAL whose entries are all committed, its commit offset at its head,
+//     goes first: it holds every committed entry, and as the leader it can
+//     match the entries of its followers against its own;
+//   - a snapshot goes next: it holds every committed entry too, but its
+//     followers with WAL entries start over from a snapshot of it, as it can't
+//     match their entries;
+//   - a WAL whose head isn't known to be committed goes last: its last
+//     entries could be of a stale term that a committed entry at the same
+//     offset replaced.
+func rankTie(candidate sharding.Candidate) int {
+	switch head := candidate.HeadEntryId; {
+	case isSnapshotHead(head):
+		return 1
+	case candidate.CommitOffset != nil && *candidate.CommitOffset >= head.GetOffset():
+		return 0
+	default:
+		return 2
+	}
+}
+
 // isGrowth reports whether change adds a member to the ensemble without
 // removing one.
 func isGrowth(change *proto.EnsembleChangeMetadata) bool {
@@ -850,7 +914,7 @@ func (e *election) settleGrowth(ensembleHeads sharding.Candidates) error {
 			highest, toIsHighest = candidate.HeadEntryId, isTo(server)
 			continue
 		}
-		switch c := entry.Compare(candidate.HeadEntryId, highest); {
+		switch c := compareHeads(candidate.HeadEntryId, highest); {
 		case c > 0:
 			highest, toIsHighest = candidate.HeadEntryId, isTo(server)
 		case c == 0:

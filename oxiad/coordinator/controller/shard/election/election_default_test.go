@@ -1622,3 +1622,68 @@ func TestElectionWritesCompareTheTerm(t *testing.T) {
 		})
 	}
 }
+
+// A member seeded by a snapshot reports its head with an unknown term, at the
+// commit offset of its database: it holds every entry up to there, all of them
+// committed. The leader of an idle shard, removed by a change, isn't ahead of
+// such members at the same offset: the change finishes, one of them leads, and
+// the removed leader is deleted.
+func TestElectionSnapshotHeadsTieTheRemovedLeader(t *testing.T) {
+	var shard int64 = 5
+	s1, s2, s3, s4 := testDataServer("s1"), testDataServer("s2"), testDataServer("s3"), testDataServer("s4")
+	metadata := newTestMetadata(t, memory.NewProvider(metadatacodec.ClusterStatusCodec, metadatacommon.WatchDisabled, ""),
+		&proto.ClusterConfiguration{})
+	shardMeta := &proto.ShardMetadata{Status: proto.ShardStatusSteadyState, Term: 2, Leader: s1,
+		Ensemble: []*proto.DataServerIdentity{s1, s2, s3}}
+	storeTestShardMetadata(t, metadata, constant.DefaultNamespace, shard, namespaceConfig, shardMeta)
+	rpc := rpctest.NewRpcProvider()
+	rpc.GetNode(s1).NewTermResponse(0, 0, nil)
+	rpc.GetNode(s2).NewTermResponse(-1, 0, nil)
+	rpc.GetNode(s3).NewTermResponse(-1, 0, nil)
+	rpc.GetNode(s4).NewTermResponse(-1, -1, nil)
+	rpc.GetNode(s2).BecomeLeaderResponse(nil)
+	rpc.GetNode(s3).BecomeLeaderResponse(nil)
+	e := New(t.Context(), slog.Default(), nil, nil, metadata, feature.NoOpSupplier, rpc, constant.DefaultNamespace, shard,
+		shardMeta, action.NewChangeEnsembleAction(shard, s1, s4), "", false, nil,
+		metric.NewLatencyHistogram("oxia_coordinator_leader_election_latency", "", nil),
+		metric.NewLatencyHistogram("oxia_coordinator_new_term_quorum_latency", "", nil),
+		metric.NewLatencyHistogram("oxia_coordinator_become_leader_latency", "", nil))
+
+	leader, err := e.Start()
+	require.NoError(t, err)
+	e.Cancel()
+	assert.Contains(t, []string{"s2", "s3"}, leader.GetPublic())
+	stored := requireShardMetadata(t, metadata, constant.DefaultNamespace, shard)
+	members := make([]string, 0, len(stored.GetEnsemble()))
+	for _, member := range stored.GetEnsemble() {
+		members = append(members, member.GetPublic())
+	}
+	assert.ElementsMatch(t, []string{"s2", "s3", "s4"}, members, "the change isn't undone")
+}
+
+// Heads at the same offset tie when one of them is a snapshot's, whose entries
+// are all committed. The tie goes to a WAL whose entries are all committed,
+// then to the snapshot, then to a WAL whose last entries could be of a stale
+// term. A snapshot's head is behind any head at a higher offset.
+func TestElectionSnapshotHeadsRankByOffset(t *testing.T) {
+	s1, s2, s3 := testDataServer("s1"), testDataServer("s2"), testDataServer("s3")
+	head := func(term, offset int64) sharding.Candidate {
+		return sharding.Candidate{HeadEntryId: &proto.EntryId{Term: term, Offset: offset}}
+	}
+	committed := func(term, offset, commitOffset int64) sharding.Candidate {
+		return sharding.Candidate{HeadEntryId: &proto.EntryId{Term: term, Offset: offset}, CommitOffset: &commitOffset}
+	}
+	e := &election{logger: slog.Default(), meta: &proto.ShardMetadata{}}
+
+	leader, _ := e.chooseLeader(sharding.Candidates{s1: head(1, 5), s2: head(-1, 5)}, nil)
+	assert.Equal(t, s2, leader, "the snapshot's head wins the tie over a head not known to be committed")
+
+	leader, _ = e.chooseLeader(sharding.Candidates{s1: committed(1, 5, 5), s2: head(-1, 5), s3: committed(1, 5, 4)}, nil)
+	assert.Equal(t, s1, leader, "a committed head wins the tie over the snapshot's")
+
+	leader, _ = e.chooseLeader(sharding.Candidates{s1: head(1, 6), s2: head(-1, 5)}, nil)
+	assert.Equal(t, s1, leader, "a higher offset is ahead")
+
+	leader, _ = e.chooseLeader(sharding.Candidates{s1: head(2, 5), s2: head(1, 5), s3: head(-1, 4)}, nil)
+	assert.Equal(t, s1, leader, "known terms rank by term first")
+}

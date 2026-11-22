@@ -142,7 +142,9 @@ type leaderController struct {
 
 	// This represents the last entry in the WAL at the time this node
 	// became leader. It's used in the logic for deciding where to
-	// truncate the followers.
+	// truncate the followers. A node seeded from a snapshot, with an empty
+	// WAL, became leader at the snapshot's commit offset, with an invalid
+	// term, as GetLogState reported its head to the election.
 	leaderElectionHeadEntryId *proto.EntryId
 
 	// The database commit offset: the last entry applied to the database. It's
@@ -467,6 +469,9 @@ func (lc *leaderController) becomeLeader(ctx context.Context, req *proto.BecomeL
 	// take the ones at or below it as committed without any ack, and the
 	// followers seeded from the same snapshot drop them as duplicates.
 	headOffset := max(lc.leaderElectionHeadEntryId.Offset, leaderCommitOffset)
+	if lc.leaderElectionHeadEntryId.Term == wal.InvalidTerm {
+		lc.leaderElectionHeadEntryId = &proto.EntryId{Term: wal.InvalidTerm, Offset: headOffset}
+	}
 	lc.quorumAckTracker = NewQuorumAckTracker(req.GetReplicationFactor(), headOffset, leaderCommitOffset)
 	lc.registerOffsetGauges(lc.quorumAckTracker)
 	lc.termCtx, lc.termCancel = context.WithCancel(lc.ctx)
@@ -950,6 +955,21 @@ func (lc *leaderController) truncateFollowerIfNeeded(follower string, shardId in
 		if lc.canStreamAfter(followerHeadEntryId.Offset) {
 			return followerHeadEntryId, nil
 		}
+		return constant2.InvalidEntryId, nil
+	}
+	if lc.leaderElectionHeadEntryId.Term == wal.InvalidTerm &&
+		followerHeadEntryId.Offset <= lc.leaderElectionHeadEntryId.Offset {
+		// The leader was seeded from a snapshot and had no entry in its wal
+		// when it became leader: its entries up to the snapshot's commit
+		// offset are in its database only, and it can't match the entries of
+		// the follower against them. A follower that isn't ahead of the
+		// snapshot starts over from a snapshot of the leader, whose
+		// installation wipes the data it has. That loses nothing: all the
+		// entries up to the snapshot's offset are committed, so each entry of
+		// the follower is either the committed one at its offset, which the
+		// snapshot holds, or one that never got committed. A follower ahead
+		// of the snapshot could hold entries of this term, committed ones
+		// included: it isn't reset, and fails the check below
 		return constant2.InvalidEntryId, nil
 	}
 

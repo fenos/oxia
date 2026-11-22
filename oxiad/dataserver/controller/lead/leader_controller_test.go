@@ -5369,3 +5369,109 @@ func writeError(t *testing.T, lc LeaderController, shard int64) error {
 	}, concurrent.NewOnce(func(*proto.WriteResponse) { result <- nil }, func(err error) { result <- err }))
 	return <-result
 }
+
+// newSnapshotSeededLeader fences, as term 2, a leader seeded from a snapshot:
+// its database holds the entries 0 to 9, of term 1, and its wal none.
+func newSnapshotSeededLeader(t *testing.T, rpcClient *rpc.MockRpcClient) (LeaderController, func()) {
+	t.Helper()
+	var shard int64 = 1
+	kvFactory, err := kvstore.NewPebbleKVFactory(kvstore.NewFactoryOptionsForTest(t))
+	require.NoError(t, err)
+	walFactory := newTestWalFactory(t)
+
+	db, err := database.NewDB(constant.DefaultNamespace, shard, kvFactory, proto.KeySortingType_HIERARCHICAL,
+		1*time.Hour, time2.SystemClock)
+	require.NoError(t, err)
+	for i := int64(0); i < 10; i++ {
+		wr := &proto.WriteRequest{Puts: []*proto.PutRequest{{Key: "my-key", Value: []byte("")}}}
+		_, err = db.ProcessWrite(wr, i, 0, database.NoOpCallback)
+		require.NoError(t, err)
+	}
+	require.NoError(t, db.UpdateTerm(1, database.TermOptions{}))
+	require.NoError(t, db.Close())
+
+	lc, err := NewLeaderController(&option.StorageOptions{}, constant.DefaultNamespace, shard, rpcClient,
+		walFactory, kvFactory, nil)
+	require.NoError(t, err)
+	res, err := lc.NewTerm(&proto.NewTermRequest{Shard: shard, Term: 2})
+	require.NoError(t, err)
+	AssertProtoEqual(t, &proto.EntryId{Term: wal.InvalidTerm, Offset: 9}, res.HeadEntryId)
+	return lc, func() {
+		assert.NoError(t, lc.Close())
+		assert.NoError(t, kvFactory.Close())
+		assert.NoError(t, walFactory.Close())
+	}
+}
+
+// A leader seeded from a snapshot, with an empty wal, can't match the entries
+// of a follower whose wal has some against its own, which are in its database
+// only. A follower that isn't ahead of the snapshot starts over from a
+// snapshot of the leader instead of failing the election: each of its entries
+// is at an offset the snapshot holds committed, so it is either that committed
+// entry or one that never got committed.
+func TestLeaderController_BecomeLeaderSeededFromSnapshotWithAFollowerWithEntries(t *testing.T) {
+	for _, followerOffset := range []int64{5, 9} {
+		t.Run(fmt.Sprintf("follower at %d", followerOffset), func(t *testing.T) {
+			rpcClient := rpc.NewMockRpcClient()
+			lc, closeAll := newSnapshotSeededLeader(t, rpcClient)
+
+			_, err := lc.BecomeLeader(context.Background(), &proto.BecomeLeaderRequest{
+				Shard:             1,
+				Term:              2,
+				ReplicationFactor: 2,
+				FollowerMaps: map[string]*proto.EntryId{
+					"f1": {Term: 1, Offset: followerOffset},
+				},
+			})
+			require.NoError(t, err)
+
+			assert.Eventually(t, func() bool { return len(rpcClient.SendSnapshotStream.Requests) > 0 },
+				10*time.Second, 10*time.Millisecond, "the follower got no snapshot")
+			assert.Empty(t, rpcClient.TruncateReqs, "the follower got truncated")
+
+			// Complete the snapshot in progress: the leader waits for it to close
+			rpcClient.SendSnapshotStream.Response <- &proto.SnapshotResponse{AckOffset: 9}
+			closeAll()
+		})
+	}
+}
+
+// A follower ahead of the snapshot a leader was seeded from isn't reset: its
+// entries past the snapshot could be the leader's own entries of the term,
+// committed ones included, which the follower must keep. The leader refuses
+// it, as it can't match them, like a leader with entries in its wal refuses a
+// follower with entries of a later term than its own.
+func TestLeaderController_SeededFromSnapshotRefusesAFollowerAheadOfTheSnapshot(t *testing.T) {
+	rpcClient := rpc.NewMockRpcClient()
+	// A snapshot sent by mistake completes, so that the leader can close
+	rpcClient.SendSnapshotStream.Response <- &proto.SnapshotResponse{AckOffset: 9}
+	lc, closeAll := newSnapshotSeededLeader(t, rpcClient)
+	defer closeAll()
+	_, err := lc.BecomeLeader(context.Background(), &proto.BecomeLeaderRequest{
+		Shard:             1,
+		Term:              2,
+		ReplicationFactor: 3,
+		FollowerMaps:      map[string]*proto.EntryId{},
+	})
+	require.NoError(t, err)
+	// The leader appends the entry 10, of the term
+	shard := int64(1)
+	lc.Write(context.Background(), &proto.WriteRequest{
+		Shard: &shard,
+		Puts:  []*proto.PutRequest{{Key: "other-key", Value: []byte("")}},
+	}, concurrent.NewOnce(func(*proto.WriteResponse) {}, func(error) {}))
+	require.Eventually(t, func() bool { return lc.(*leaderController).quorumAckTracker.HeadOffset() == 10 },
+		10*time.Second, 10*time.Millisecond)
+
+	for _, head := range []*proto.EntryId{{Term: 2, Offset: 10}, {Term: 1, Offset: 10}} {
+		_, err = lc.AddFollower(&proto.AddFollowerRequest{
+			Shard:               1,
+			Term:                2,
+			FollowerName:        "f1",
+			FollowerHeadEntryId: head,
+		})
+		assert.ErrorIs(t, err, constant.ErrInvalidTerm, "follower at %v", head)
+	}
+	assert.Empty(t, rpcClient.SendSnapshotStream.Requests, "the follower got a snapshot")
+	assert.Empty(t, rpcClient.TruncateReqs, "the follower got truncated")
+}

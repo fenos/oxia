@@ -30,6 +30,7 @@ import (
 	"github.com/oxia-db/oxia/common/proto"
 	"github.com/oxia-db/oxia/oxia"
 	"github.com/oxia-db/oxia/oxiad/common/dataserver"
+	shardcontroller "github.com/oxia-db/oxia/oxiad/coordinator/controller/shard"
 )
 
 // Raising the replication factor of a namespace grows the ensemble of its
@@ -286,4 +287,33 @@ func (w *leaderWatch) assertNoTermLedTwice() {
 	defer w.mu.Unlock()
 	assert.NotEmpty(w.t, w.leaders, "no leader was seen")
 	assert.Empty(w.t, w.twice, "a term was led by two data servers")
+}
+
+// A growth seeds its new member with a snapshot: on an idle shard, the member
+// then reports the commit offset of its database, with no term. When the
+// data server of the leader is removed, the swap off it elects such a member,
+// which holds every committed entry, instead of undoing itself for good; the
+// member, with nothing in its WAL, seeds the next one by a snapshot in turn.
+func TestGrowthSeededMembersTakeOverFromARemovedIdleLeader(t *testing.T) {
+	c := newGrowingCluster(t)
+	// More entries than a new member can lag behind: it catches up by the
+	// snapshot before its growth is recorded
+	keys := c.writeKeys("before", shardcontroller.GrowthCatchUpLag+100)
+
+	c.raiseReplicationFactor(2)
+	grown := c.awaitShardWithin(0, func(shard *proto.ShardMetadata) bool {
+		return len(shard.GetEnsemble()) == 2 && shard.GetEnsembleChange() == nil &&
+			len(shard.GetPendingDeleteShardNodes()) == 0 && shard.GetEnsembleCaughtUp()
+	}, 3*time.Minute)
+
+	// The shard stays idle from now on
+	leader := grown.GetLeader()
+	_, err := c.admin().DeleteDataServer(c.t.Context(), leader.GetNameOrDefault())
+	require.NoError(t, err)
+	moved := c.awaitShardWithin(0, func(shard *proto.ShardMetadata) bool {
+		return len(shard.GetEnsemble()) == 2 && shard.GetEnsembleChange() == nil &&
+			!slices.ContainsFunc(shard.GetEnsemble(), dataserver.MatchDataServer(leader)) && shard.GetEnsembleCaughtUp()
+	}, 2*time.Minute)
+
+	c.assertMembersHold(moved, keys)
 }
