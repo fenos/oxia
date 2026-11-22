@@ -26,6 +26,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/oxia-db/oxia/oxiad/common/async"
 	"github.com/oxia-db/oxia/oxiad/common/errs"
 
 	metadatacommon "github.com/oxia-db/oxia/oxiad/common/metadata"
@@ -4877,4 +4878,14 @@ func TestControllerElectionIsDispatchedAgainWhenTheStatusCantBeRead(t *testing.T
 	case <-time.After(10 * time.Second):
 		assert.Fail(t, "the election was not dispatched again")
 	}
+}
+
+// The mail of an election that is gone, e.g. canceled by the deletion of the
+// shard, is dropped.
+func TestControllerDropsTheMailOfAnElectionThatIsGone(t *testing.T) {
+	s := &controller{ctx: t.Context(), logger: slog.Default(), electionMailbox: make(chan async.Mail, 1)}
+
+	s.tickElection()
+
+	assert.Empty(t, s.electionMailbox)
 }

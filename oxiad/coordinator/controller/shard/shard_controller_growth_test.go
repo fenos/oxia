@@ -735,3 +735,32 @@ func TestControllerGrowthNeverRecordsAMembersCopyToDelete(t *testing.T) {
 
 	assert.Empty(t, requireShardMetadata(t, metadata, constant.DefaultNamespace, growthShard).GetPendingDeleteShardNodes())
 }
+
+// A pending growth that the tick of its election finishes is settled then, as
+// finished: a later change that removes its new member doesn't count as the
+// growth undone.
+func TestControllerGrowthFinishedByTheTickIsSettled(t *testing.T) {
+	s1, to := testDataServer("s1"), testDataServer("to")
+	metadata := newGrowthTestMetadata(t)
+	rpc := rpctest.NewRpcProvider()
+	// The election that a pending growth starts with keeps it pending: to is
+	// behind
+	rpc.GetNode(s1).NewTermResponse(2, 10, nil)
+	rpc.GetNode(to).NewTermResponse(2, 5, nil)
+	rpc.GetNode(s1).BecomeLeaderResponse(nil)
+	// Then to catches up, and the tick finishes the growth
+	rpc.GetNode(to).GetStatusResponse(3, proto.ServingStatus_FOLLOWER, 10, 10)
+	shardMeta := steadyShard(s1, s1, to)
+	shardMeta.EnsembleChange = &proto.EnsembleChangeMetadata{To: to}
+	storeTestShardMetadata(t, metadata, constant.DefaultNamespace, growthShard, namespaceConfig, shardMeta)
+	sc := NewController(constant.DefaultNamespace, growthShard, namespaceConfig, shardMeta, metadata,
+		feature.NoOpSupplier, nil, rpc, DefaultPeriodicTasksInterval).(*controller)
+
+	require.Eventually(t, func() bool {
+		return requireShardMetadata(t, metadata, constant.DefaultNamespace, growthShard).GetEnsembleChange() == nil
+	}, 10*time.Second, 10*time.Millisecond)
+	require.NoError(t, sc.Close())
+
+	assert.Nil(t, sc.pendingGrowthTo)
+	assert.Empty(t, sc.growthBackoffs)
+}

@@ -333,13 +333,7 @@ func (s *controller) run(bo backoff.BackOff) error {
 		case to := <-s.growthDeadlineOp:
 			s.onGrowthDeadline(to)
 		case <-s.electionMailbox:
-			// A failed tick posts to the mailbox again a second later
-			if s.currentElection != nil {
-				if err := s.currentElection.Tick(); err != nil {
-					s.logger.Warn("Failed to tick the election, retrying later", slog.Any("error", err))
-					time.AfterFunc(time.Second, async.Mailbox(s.electionMailbox).Post)
-				}
-			}
+			s.tickElection()
 		case <-periodicTasksTimer.C:
 			s.handlePeriodicTasks()
 			periodicTasksTimer.Reset(s.periodicTasksInterval)
@@ -349,6 +343,23 @@ func (s *controller) run(bo backoff.BackOff) error {
 	}
 	s.logger.Info("Shard controller is stopped, stopping event loop")
 	return nil
+}
+
+// tickElection ticks the current election on its mail. A failed tick posts to
+// the mailbox again a second later.
+func (s *controller) tickElection() {
+	if s.currentElection == nil {
+		return
+	}
+	if err := s.currentElection.Tick(); err != nil {
+		s.logger.Warn("Failed to tick the election, retrying later", slog.Any("error", err))
+		time.AfterFunc(time.Second, async.Mailbox(s.electionMailbox).Post)
+		return
+	}
+	if s.pendingGrowthTo != nil {
+		// The tick may have finished the pending growth
+		s.syncGrowthDeadline()
+	}
 }
 
 // start does the initial check or leader election of the shard, when the
