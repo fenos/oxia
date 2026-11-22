@@ -176,9 +176,7 @@ func (c *restartableCluster) raiseReplicationFactor(replicationFactor uint32) {
 
 // status is the status of the shard that the coordinator stores.
 func (c *restartableCluster) status() *proto.ShardMetadata {
-	namespace, err := c.admin().GetNamespace(c.t.Context(), constant.DefaultNamespace)
-	require.NoError(c.t, err)
-	return namespace.GetNamespaceStatus().GetShards()[0]
+	return c.statusVia(c.admin())
 }
 
 // grownShard waits for the shard to be steady with its three members caught
@@ -316,4 +314,72 @@ func TestGrowthSeededMembersTakeOverFromARemovedIdleLeader(t *testing.T) {
 	}, 2*time.Minute)
 
 	c.assertMembersHold(moved, keys)
+}
+
+// A removed data server that holds the only replica of a shard has nowhere
+// to move it while the namespace's replication factor is 1: it stays
+// draining, and the shard keeps it as its member, round after round of the
+// scheduler, so nothing committed is lost.
+func TestRemovedDataServerWithTheOnlyReplicaStaysDraining(t *testing.T) {
+	c := newGrowingCluster(t)
+	keys := c.writeKeys("before", 10)
+	founder := c.shard(0).GetLeader()
+	admin := c.admin()
+
+	_, err := admin.DeleteDataServer(t.Context(), founder.GetNameOrDefault())
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		return c.dataServerState(admin, founder) == proto.DataServerState_DATA_SERVER_STATE_DRAINING
+	}, 10*time.Second, 10*time.Millisecond)
+
+	// Thirty rounds of the scheduler
+	require.Never(t, func() bool {
+		shard := c.statusVia(admin)
+		return c.dataServerState(admin, founder) != proto.DataServerState_DATA_SERVER_STATE_DRAINING ||
+			len(shard.GetEnsemble()) != 1 || !dataserver.MatchDataServer(founder)(shard.GetEnsemble()[0]) ||
+			shard.GetEnsembleChange() != nil
+	}, 3*time.Second, 50*time.Millisecond, "the only replica left the removed data server")
+
+	c.assertMembersHold(c.shard(0), keys)
+}
+
+// A move to other data servers removes the one that holds the only replica
+// of a shard and raises the replication factor to the servers left, in one
+// change of the configuration: the shard grows onto them, then swaps the
+// removed server out, which drains. Its copy of the shard is deleted later,
+// by the periodic deletion of the coordinator.
+func TestRemovedDataServerWithTheOnlyReplicaDrainsOnceTheShardGrows(t *testing.T) {
+	c := newGrowingCluster(t)
+	keys := c.writeKeys("before", 10)
+	founder := c.shard(0).GetLeader()
+	admin := c.admin()
+
+	_, err := admin.DeleteDataServer(t.Context(), founder.GetNameOrDefault())
+	require.NoError(t, err)
+	c.raiseReplicationFactor(2)
+
+	moved := c.awaitShardWithin(0, func(shard *proto.ShardMetadata) bool {
+		return len(shard.GetEnsemble()) == 2 && shard.GetEnsembleChange() == nil && shard.GetEnsembleCaughtUp() &&
+			!slices.ContainsFunc(shard.GetEnsemble(), dataserver.MatchDataServer(founder))
+	}, 3*time.Minute)
+	require.Eventually(t, func() bool {
+		return c.dataServerState(admin, founder) == proto.DataServerState_DATA_SERVER_STATE_DRAINED
+	}, 30*time.Second, 10*time.Millisecond)
+
+	c.assertMembersHold(moved, keys)
+}
+
+// statusVia is the status of the shard that the coordinator stores, read
+// through admin.
+func (c *restartableCluster) statusVia(admin oxia.AdminClient) *proto.ShardMetadata {
+	namespace, err := admin.GetNamespace(c.t.Context(), constant.DefaultNamespace)
+	require.NoError(c.t, err)
+	return namespace.GetNamespaceStatus().GetShards()[0]
+}
+
+// dataServerState is the state the coordinator reports for the data server.
+func (c *restartableCluster) dataServerState(admin oxia.AdminClient, identity *proto.DataServerIdentity) proto.DataServerState {
+	view, err := admin.GetDataServer(c.t.Context(), identity.GetNameOrDefault())
+	require.NoError(c.t, err)
+	return view.GetDataServerStatus().GetState()
 }
