@@ -84,7 +84,7 @@ func TestAggregateAndSortRangeScanAcrossShardsKeySorting(t *testing.T) {
 			}
 
 			outCh := make(chan GetResult, 100)
-			aggregateAndSortRangeScanAcrossShards(newKeyOrder(test.keySorting), channels, outCh)
+			aggregateAndSortRangeScanAcrossShards(newKeyOrder(test.keySorting), channels, 0, outCh)
 
 			var merged []string
 			for result := range outCh {
@@ -148,7 +148,7 @@ func TestAggregateAndSortRangeScanAcrossShardsSecondaryKeys(t *testing.T) {
 			}
 
 			outCh := make(chan GetResult, 100)
-			aggregateAndSortRangeScanAcrossShards(newKeyOrder(test.keySorting), channels, outCh)
+			aggregateAndSortRangeScanAcrossShards(newKeyOrder(test.keySorting), channels, 0, outCh)
 
 			var merged []string
 			for result := range outCh {

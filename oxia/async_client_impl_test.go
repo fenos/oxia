@@ -16,6 +16,7 @@ package oxia
 
 import (
 	"context"
+	"maps"
 	"runtime/pprof"
 	"strings"
 	"sync"
@@ -682,6 +683,39 @@ func TestAsyncClientRangeScanEndInclusive(t *testing.T) {
 	}
 }
 
+// A range scan with a limit returns the first records across the shards, that
+// many at most. Each shard is asked for the limit, but an older server ignores
+// it and sends the rest of the range: the merge stops at the limit, and the
+// scans of the shards end with it.
+func TestAsyncClientRangeScanLimit(t *testing.T) {
+	executor := &staticExecutor{keys: map[int64][]string{1: {"a", "c", "e"}, 2: {"b", "d", "f"}}}
+	client := newScanTestClient(executor, 1, 2)
+
+	var keys []string
+	for result := range client.RangeScan(context.Background(), "a", "z", Limit(3)) {
+		require.NoError(t, result.Err)
+		keys = append(keys, result.Key)
+	}
+	assert.Equal(t, []string{"a", "b", "c"}, keys)
+	assert.Equal(t, map[int64]uint32{1: 3, 2: 3}, executor.requestedLimits())
+	assertGoroutinesEnd(t, "(*clientImpl).RangeScan")
+}
+
+// A range scan of one partition stops at the limit within a response of an
+// older server, which sends the whole range in it.
+func TestAsyncClientRangeScanLimitOnPartition(t *testing.T) {
+	executor := &staticExecutor{keys: map[int64][]string{1: {"a", "b", "c"}}, batched: map[int64]bool{1: true}}
+	client := newScanTestClient(executor, 1)
+
+	var keys []string
+	for result := range client.RangeScan(context.Background(), "a", "z", PartitionKey("x"), Limit(2)) {
+		require.NoError(t, result.Err)
+		keys = append(keys, result.Key)
+	}
+	assert.Equal(t, []string{"a", "b"}, keys)
+	assertGoroutinesEnd(t, "(*clientImpl).RangeScan")
+}
+
 // An older server ignores include_values and sends the values: the client drops them.
 func TestAsyncClientRangeScanWithoutValuesDropsValues(t *testing.T) {
 	executor := &staticExecutor{keys: map[int64][]string{1: {"a"}, 2: {"b"}}}
@@ -770,6 +804,13 @@ type staticExecutor struct {
 	// for it, like a server with FEATURE_RANGE_END_INCLUSIVE: their responses
 	// say so, and they send one without keys if they have none
 	endInclusive map[int64]bool
+	// The shards that send all their keys in one response, like a batch
+	batched map[int64]bool
+
+	// The limit of the range scan requests, by shard, which it records and
+	// ignores, like an older server
+	mu     sync.Mutex
+	limits map[int64]uint32
 }
 
 func (e *staticExecutor) ExecuteList(ctx context.Context, request *proto.ListRequest,
@@ -785,6 +826,13 @@ func (e *staticExecutor) ExecuteList(ctx context.Context, request *proto.ListReq
 
 func (e *staticExecutor) ExecuteRangeScan(ctx context.Context, request *proto.RangeScanRequest,
 	rangeScanResponseConsumer func(*proto.RangeScanResponse) error) error {
+	e.mu.Lock()
+	if e.limits == nil {
+		e.limits = map[int64]uint32{}
+	}
+	e.limits[request.GetShard()] = request.GetLimit()
+	e.mu.Unlock()
+
 	responses, endInclusive := e.responses(request)
 	for _, keys := range responses {
 		var records []*proto.GetResponse
@@ -810,6 +858,9 @@ func (e *staticExecutor) responses(request interface {
 	if len(keys) == 0 && endInclusive {
 		return [][]string{nil}, true
 	}
+	if e.batched[request.GetShard()] {
+		return [][]string{keys}, endInclusive
+	}
 	for _, key := range keys {
 		responses = append(responses, []string{key})
 	}
@@ -822,6 +873,13 @@ func (e *staticExecutor) end(ctx context.Context, shardId int64) error {
 		return ctx.Err()
 	}
 	return e.errs[shardId]
+}
+
+// requestedLimits returns the limit of the range scan requests, by shard.
+func (e *staticExecutor) requestedLimits() map[int64]uint32 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return maps.Clone(e.limits)
 }
 
 func newScanTestClient(executor *staticExecutor, shards ...int64) *clientImpl {

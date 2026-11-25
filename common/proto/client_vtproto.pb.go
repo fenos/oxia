@@ -560,6 +560,7 @@ func (m *RangeScanRequest) CloneVT() *RangeScanRequest {
 	r.EndExclusive = m.EndExclusive
 	r.IncludeInternalKeys = m.IncludeInternalKeys
 	r.EndInclusive = m.EndInclusive
+	r.Limit = m.Limit
 	if rhs := m.Shard; rhs != nil {
 		tmpVal := *rhs
 		r.Shard = &tmpVal
@@ -1610,6 +1611,9 @@ func (this *RangeScanRequest) EqualVT(that *RangeScanRequest) bool {
 		return false
 	}
 	if p, q := this.IncludeValues, that.IncludeValues; (p == nil && q != nil) || (p != nil && (q == nil || *p != *q)) {
+		return false
+	}
+	if this.Limit != that.Limit {
 		return false
 	}
 	return string(this.unknownFields) == string(that.unknownFields)
@@ -3176,6 +3180,11 @@ func (m *RangeScanRequest) MarshalToSizedBufferVT(dAtA []byte) (int, error) {
 		i -= len(m.unknownFields)
 		copy(dAtA[i:], m.unknownFields)
 	}
+	if m.Limit != 0 {
+		i = protohelpers.EncodeVarint(dAtA, i, uint64(m.Limit))
+		i--
+		dAtA[i] = 0x40
+	}
 	if m.IncludeValues != nil {
 		i--
 		if *m.IncludeValues {
@@ -4389,6 +4398,9 @@ func (m *RangeScanRequest) SizeVT() (n int) {
 	}
 	if m.IncludeValues != nil {
 		n += 2
+	}
+	if m.Limit != 0 {
+		n += 1 + protohelpers.SizeOfVarint(uint64(m.Limit))
 	}
 	n += len(m.unknownFields)
 	return n
@@ -7739,6 +7751,25 @@ func (m *RangeScanRequest) UnmarshalVT(dAtA []byte) error {
 			}
 			b := bool(v != 0)
 			m.IncludeValues = &b
+		case 8:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Limit", wireType)
+			}
+			m.Limit = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return protohelpers.ErrIntOverflow
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.Limit |= uint32(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
 		default:
 			iNdEx = preIndex
 			skippy, err := protohelpers.Skip(dAtA[iNdEx:])
@@ -12346,6 +12377,25 @@ func (m *RangeScanRequest) UnmarshalVTUnsafe(dAtA []byte) error {
 			}
 			b := bool(v != 0)
 			m.IncludeValues = &b
+		case 8:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Limit", wireType)
+			}
+			m.Limit = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return protohelpers.ErrIntOverflow
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.Limit |= uint32(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
 		default:
 			iNdEx = preIndex
 			skippy, err := protohelpers.Skip(dAtA[iNdEx:])

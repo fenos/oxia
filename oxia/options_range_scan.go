@@ -17,6 +17,7 @@ package oxia
 type rangeScanOptions struct {
 	listOptions
 	includeValue bool
+	limit        uint32
 }
 
 // RangeScanOption represents an option for the [SyncClient.RangeScan] operation.
@@ -30,4 +31,18 @@ func newRangeScanOptions(opts []RangeScanOption) *rangeScanOptions {
 		opt.applyRangeScan(rangeScanOpts)
 	}
 	return rangeScanOpts
+}
+
+type limit uint32
+
+func (l limit) applyRangeScan(opts *rangeScanOptions) {
+	opts.limit = uint32(l)
+}
+
+// Limit ends a RangeScan after n records: the first n in the order it returns
+// them, by key, or by secondary key with UseIndex. The servers stop each shard's
+// scan at n records; older servers send the whole range, and the client stops
+// reading at n. Zero, the default, returns every record of the range.
+func Limit(n uint32) RangeScanOption {
+	return limit(n)
 }

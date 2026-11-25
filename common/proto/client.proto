@@ -485,6 +485,11 @@ message RangeScanRequest {
   // Whether to return the value of each record, or only its key and version.
   // Unset is true. Older servers ignore it and send the values.
   optional bool include_values = 7;
+
+  // The most records to return: the leader ends the scan after this many.
+  // Zero returns every record of the range. Older servers ignore it and send
+  // the whole range, so the client stops reading at its own limit.
+  uint32 limit = 8;
 }
 
 /**

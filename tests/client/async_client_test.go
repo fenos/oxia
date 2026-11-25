@@ -1098,6 +1098,56 @@ func TestSyncClientImpl_RangeScan(t *testing.T) {
 	assert.NoError(t, standaloneServer.Close())
 }
 
+// A range scan with a limit returns the first records of the range across the
+// shards, in the order of their keys, or of their secondary keys with an index.
+// Without a limit it returns them all.
+func TestSyncClientImplRangeScanLimit(t *testing.T) {
+	config := dataserver.NewTestConfig(t.TempDir())
+	config.NumShards = 4
+	standaloneServer, err := dataserver.NewStandalone(config)
+	require.NoError(t, err)
+	defer func() {
+		assert.NoError(t, standaloneServer.Close())
+	}()
+
+	client, err := oxia.NewSyncClient(standaloneServer.ServiceAddr(), oxia.WithBatchLinger(0))
+	require.NoError(t, err)
+	defer func() {
+		assert.NoError(t, client.Close())
+	}()
+
+	ctx := context.Background()
+	var all []string
+	for i := range 20 {
+		// The secondary keys sort in the opposite order of the keys
+		key := fmt.Sprintf("k%02d", i)
+		_, _, err := client.Put(ctx, key, []byte(key), oxia.SecondaryIndex("idx", fmt.Sprintf("s%02d", 19-i)))
+		require.NoError(t, err)
+		all = append(all, key)
+	}
+
+	for _, test := range []struct {
+		name     string
+		start    string
+		end      string
+		options  []oxia.RangeScanOption
+		expected []string
+	}{
+		{"keys", "k", "l", []oxia.RangeScanOption{oxia.Limit(5)}, all[:5]},
+		{"index", "s", "t", []oxia.RangeScanOption{oxia.UseIndex("idx"), oxia.Limit(3)}, []string{"k19", "k18", "k17"}},
+		{"no limit", "k", "l", []oxia.RangeScanOption{oxia.Limit(0)}, all},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var keys []string
+			for result := range client.RangeScan(ctx, test.start, test.end, test.options...) {
+				require.NoError(t, result.Err)
+				keys = append(keys, result.Key)
+			}
+			assert.Equal(t, test.expected, keys)
+		})
+	}
+}
+
 func TestSyncClientImplRangeScanWithoutValues(t *testing.T) {
 	config := dataserver.NewTestConfig(t.TempDir())
 	config.NumShards = 3

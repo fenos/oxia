@@ -4673,6 +4673,66 @@ func TestLeaderControllerListStopsOnError(t *testing.T) {
 	})
 }
 
+// A range scan with a limit ends after that many records. Without a limit, or
+// with one past the records of the range, it returns them all.
+func TestLeaderControllerRangeScanLimit(t *testing.T) {
+	lc := newHookedLeaderController(t, rpc.NewMockRpcClient(), &hookKVFactory{}, &hookWalFactory{})
+	becomeTestLeader(t, lc, 1, 1, nil)
+	writeTestKeys(t, lc, "a", "b", "c", "d")
+	var shard int64 = 1
+
+	for _, test := range []struct {
+		limit    uint32
+		expected []string
+	}{
+		{limit: 0, expected: []string{"a", "b", "c", "d"}},
+		{limit: 2, expected: []string{"a", "b"}},
+		{limit: 10, expected: []string{"a", "b", "c", "d"}},
+	} {
+		t.Run(fmt.Sprint(test.limit), func(t *testing.T) {
+			records, err := scanAll(context.Background(), lc, &proto.RangeScanRequest{
+				Shard: &shard, StartInclusive: "a", EndExclusive: "z", Limit: test.limit,
+			})
+			require.NoError(t, err)
+			var keys []string
+			for _, record := range records {
+				keys = append(keys, record.GetKey())
+			}
+			assert.Equal(t, test.expected, keys)
+		})
+	}
+}
+
+// A range scan of an index with a limit reads the records of no more entries
+// than it returns: it ends before it moves to the next entry, whose record the
+// iterator reads as it moves.
+func TestRangeScanIterateReadsNoRecordPastTheLimit(t *testing.T) {
+	child, _ := newReadErrorsTestDB(t)
+	var puts []*proto.PutRequest
+	for _, key := range []string{"a", "b", "c", "d"} {
+		puts = append(puts, &proto.PutRequest{Key: "/" + key, Value: []byte("v"),
+			SecondaryIndexes: []*proto.SecondaryIndex{{IndexName: "idx", SecondaryKey: "s" + key}}})
+	}
+	_, err := child.ProcessWrite(&proto.WriteRequest{Puts: puts}, 0, 0, 0, WrapperUpdateOperationCallback)
+	require.NoError(t, err)
+	db := &hookedPrefixDB{DB: child}
+
+	idx := "idx"
+	it, err := newSecondaryIndexRangeScanIterator(&proto.RangeScanRequest{
+		SecondaryIndexName: &idx, StartInclusive: "s", EndExclusive: "t",
+	}, db)
+	require.NoError(t, err)
+	var keys []string
+	err = rangeScanIterate(context.Background(), it, 2, func(record *proto.GetResponse) error {
+		keys = append(keys, record.GetKey())
+		return nil
+	})
+	require.NoError(t, err)
+	require.NoError(t, it.Close())
+	assert.Equal(t, []string{"/a", "/b"}, keys)
+	assert.Equal(t, 2, db.recordCalls)
+}
+
 func TestLeaderControllerRangeScanStopsOnError(t *testing.T) {
 	scanHook := &atomic.Pointer[func(kvstore.KeyValueIterator) (kvstore.KeyValueIterator, error)]{}
 	kvFactory := &hookKVFactory{rangeScan: func(kv kvstore.KV, lowerBound, upperBound string,

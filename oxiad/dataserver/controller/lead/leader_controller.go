@@ -1320,11 +1320,16 @@ func (lc *leaderController) RangeScan(ctx context.Context, request *proto.RangeS
 		return err
 	}
 
-	err = rangeScanIterate(ctx, it, onNext)
+	err = rangeScanIterate(ctx, it, request.Limit, onNext)
 	return multierr.Combine(err, it.Close())
 }
 
-func rangeScanIterate(ctx context.Context, it database.RangeScanIterator, onNext func(*proto.GetResponse) error) error {
+// rangeScanIterate passes the records of it to onNext, up to limit records
+// when it's not zero. It ends right after the last one, before the iterator
+// moves on: an index iterator reads the record of the next entry as it moves.
+func rangeScanIterate(ctx context.Context, it database.RangeScanIterator, limit uint32,
+	onNext func(*proto.GetResponse) error) error {
+	var sent uint32
 	for ; it.Valid(); it.Next() {
 		gr, err := it.Value()
 		if err != nil {
@@ -1335,6 +1340,9 @@ func rangeScanIterate(ctx context.Context, it database.RangeScanIterator, onNext
 		}
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		if sent++; limit != 0 && sent == limit {
+			return nil
 		}
 	}
 	return nil

@@ -680,6 +680,7 @@ type hookedPrefixDB struct {
 	afterPrefixIterator  func()
 	nextCalls            int
 	keepsIndexEntryCalls int
+	recordCalls          int
 
 	prefixIteratorErr  error
 	keepsIndexEntryErr error
@@ -743,6 +744,7 @@ func (it *hookedPrefixIterator) KeepsIndexEntry(filter *database.DeferredSplitFi
 }
 
 func (it *hookedPrefixIterator) Record(key string, includeValue bool) (*proto.GetResponse, error) {
+	it.db.recordCalls++
 	if it.db.recordErr != nil {
 		return nil, it.db.recordErr
 	}

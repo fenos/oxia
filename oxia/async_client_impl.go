@@ -605,6 +605,9 @@ func (c *clientImpl) List(ctx context.Context, minKeyInclusive string, maxKeyExc
 	return ch
 }
 
+// errRangeScanLimitReached stops reading a shard's range scan at its limit.
+var errRangeScanLimitReached = errors.New("range scan limit reached")
+
 // rangeScanFromShard passes each record of the shard to onResult, with its
 // secondary key when the scan uses an index, or the error of the scan.
 func (c *clientImpl) rangeScanFromShard(ctx context.Context, minKeyInclusive string, maxKeyExclusive string,
@@ -616,6 +619,7 @@ func (c *clientImpl) rangeScanFromShard(ctx context.Context, minKeyInclusive str
 		SecondaryIndexName:  opts.secondaryIndexName,
 		IncludeInternalKeys: opts.showInternalKeys,
 		EndInclusive:        opts.endInclusive,
+		Limit:               opts.limit,
 	}
 	if !opts.includeValue {
 		request.IncludeValues = new(false)
@@ -626,19 +630,31 @@ func (c *clientImpl) rangeScanFromShard(ctx context.Context, minKeyInclusive str
 
 	// As for a list, the responses say whether the leader included the end
 	responded := false
+	var received uint32
 	err := c.executor.ExecuteRangeScan(retryCtx, request, func(response *proto.RangeScanResponse) error {
 		if request.EndInclusive && !response.EndInclusive {
 			return ErrEndInclusiveUnsupported
 		}
 		responded = true
-		for _, record := range response.Records {
+		records := response.Records
+		if opts.limit != 0 {
+			// An older server ignores the limit and sends the rest of the range
+			records = records[:min(len(records), int(opts.limit-received))]
+		}
+		for _, record := range records {
 			if !opts.includeValue {
 				record.Value = nil
 			}
 			onResult(toGetResult(record, "", nil), record.SecondaryIndexKey)
 		}
+		if received += uint32(len(records)); opts.limit != 0 && received == opts.limit {
+			return errRangeScanLimitReached
+		}
 		return nil
 	})
+	if errors.Is(err, errRangeScanLimitReached) {
+		err = nil
+	}
 	if err == nil && request.EndInclusive && !responded {
 		err = ErrEndInclusiveUnsupported
 	}
@@ -679,10 +695,11 @@ func (c *clientImpl) RangeScan(ctx context.Context, minKeyInclusive string, maxK
 		}
 
 		go func() {
-			aggregateAndSortRangeScanAcrossShards(c.keyOrder(), channels, outCh)
+			aggregateAndSortRangeScanAcrossShards(c.keyOrder(), channels, opts.limit, outCh)
 
-			// The merge stops at the first error: cancel the scans of the other
-			// shards, and drain the results they wait to send until they end
+			// The merge stops at the first error, or at the limit: cancel the
+			// scans of the shards, and drain the results they wait to send until
+			// they end
 			cancel()
 			for _, ch := range channels {
 				for range ch {
@@ -705,8 +722,10 @@ func (c *clientImpl) GetSequenceUpdates(ctx context.Context, prefixKey string, o
 
 // We do range scan on all the shards, and we need to always pick the lowest key
 // across all the shards. With an index, the shards return the records in the
-// order of their secondary keys, so we pick the lowest secondary key first.
-func aggregateAndSortRangeScanAcrossShards(order keyOrder, channels []chan rangeScanResult, outCh chan GetResult) {
+// order of their secondary keys, so we pick the lowest secondary key first. With
+// a limit, the merge ends after that many records.
+func aggregateAndSortRangeScanAcrossShards(order keyOrder, channels []chan rangeScanResult, limit uint32,
+	outCh chan GetResult) {
 	h := &ResultHeap{order: order}
 	heap.Init(h)
 
@@ -720,12 +739,13 @@ func aggregateAndSortRangeScanAcrossShards(order keyOrder, channels []chan range
 	// Now that we have something from each channel, iterate by picking the
 	// result with the lowest key and then reading again from that same
 	// channel
+	var sent uint32
 	for h.Len() > 0 {
 		r := h.results[0]
 
 		outCh <- r.gr
 
-		if r.gr.Err != nil {
+		if sent++; r.gr.Err != nil || limit != 0 && sent == limit {
 			close(outCh)
 			return
 		}
